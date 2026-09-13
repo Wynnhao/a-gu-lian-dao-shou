@@ -1,0 +1,198 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------------------------------------------------------------
+   设计 tokens —— 浅色为默认（纸白终端），.dark 为深色。
+   颜色以 RGB 三元组存储，tailwind 里以 rgb(var(--x) / <alpha>) 消费。
+---------------------------------------------------------------- */
+@layer base {
+  :root {
+    --background: 247 247 245;        /* 纸白底 #f7f7f5 */
+    --foreground: 28 28 26;           /* 近黑 */
+    --card: 255 255 255;              /* 面板 #ffffff */
+    --card-foreground: 28 28 26;
+    --popover: 255 255 255;
+    --popover-foreground: 28 28 26;
+    --primary: 31 58 95;              /* 藏青 #1f3a5f */
+    --primary-foreground: 255 255 255;
+    --secondary: 243 243 241;
+    --secondary-foreground: 28 28 26;
+    --muted: 243 243 241;
+    --muted-foreground: 92 92 87;     /* 次级灰 */
+    --accent: 236 240 245;            /* 藏青弱底（hover） */
+    --accent-foreground: 31 58 95;
+    --destructive: 194 49 46;         /* 红涨族 #c2312e */
+    --destructive-foreground: 255 255 255;
+    --border: 228 228 224;            /* 发丝线 #e4e4e0 */
+    --input: 212 212 207;
+    --ring: 31 58 95;
+    --radius: 4px;
+    --track: 236 236 234;             /* 横条底 */
+
+    --up: 194 49 46;                  /* 红涨 #c2312e */
+    --down: 26 127 75;                /* 绿跌 #1a7f4b */
+    --ok: 26 127 75;
+    --warn: 161 98 7;                 /* 克制的琥珀 */
+    --idle: 138 138 133;
+  }
+
+  .dark {
+    --background: 20 22 25;
+    --foreground: 226 226 222;
+    --card: 28 30 34;
+    --card-foreground: 226 226 222;
+    --popover: 32 34 38;
+    --popover-foreground: 226 226 222;
+    --primary: 143 176 217;           /* 亮藏青，保证深底可读 */
+    --primary-foreground: 20 22 25;
+    --secondary: 38 41 46;
+    --secondary-foreground: 226 226 222;
+    --muted: 38 41 46;
+    --muted-foreground: 154 154 148;
+    --accent: 40 46 56;
+    --accent-foreground: 190 208 230;
+    --destructive: 224 82 78;
+    --destructive-foreground: 20 22 25;
+    --border: 46 49 54;
+    --input: 58 62 68;
+    --ring: 143 176 217;
+    --track: 44 47 52;
+
+    --up: 224 82 78;
+    --down: 76 175 125;
+    --ok: 76 175 125;
+    --warn: 217 164 65;
+    --idle: 122 122 118;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    @apply bg-background;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans text-base antialiased;
+    font-feature-settings: "tnum" 1;
+  }
+
+  ::selection {
+    background: rgb(var(--primary) / 0.18);
+  }
+
+  /* 细滚动条，终端味 */
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: rgb(var(--idle) / 0.35);
+    border-radius: 4px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer components {
+  /* 数字统一等宽 + tabular-nums */
+  .num {
+    font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas,
+      "Liberation Mono", monospace;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0;
+  }
+
+  /* 面板：1px 发丝线 + 白底，无阴影或极浅 */
+  .panel {
+    @apply border bg-card shadow-panel;
+  }
+
+  .panel-head {
+    @apply flex h-8 items-center justify-between border-b px-3;
+  }
+
+  .panel-title {
+    @apply text-[13px] font-semibold leading-none;
+  }
+
+  /* 口径注：小节标题右侧的来源/口径说明 */
+  .caliber {
+    @apply text-tiny text-muted-foreground;
+  }
+}
+
+@layer utilities {
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* ---------------------------------------------------------------
+   Markdown 渲染（决策说明 / 报告 / 输入包）：终端文档密度
+---------------------------------------------------------------- */
+.md {
+  @apply text-[13px] leading-[1.65] text-foreground;
+}
+.md > :first-child {
+  margin-top: 0;
+}
+.md h1 {
+  @apply mb-2 mt-4 border-b pb-1 text-[17px] font-semibold;
+}
+.md h2 {
+  @apply mb-2 mt-4 text-[15px] font-semibold;
+}
+.md h3 {
+  @apply mb-1.5 mt-3 text-[13px] font-semibold;
+}
+.md h4,
+.md h5,
+.md h6 {
+  @apply mb-1.5 mt-3 text-[13px] font-semibold text-muted-foreground;
+}
+.md p {
+  @apply my-1.5;
+}
+.md ul {
+  @apply my-1.5 list-disc pl-5;
+}
+.md ol {
+  @apply my-1.5 list-decimal pl-5;
+}
+.md li {
+  @apply my-0.5;
+}
+.md blockquote {
+  @apply my-2 border-l-2 border-border pl-3 text-muted-foreground;
+}
+.md hr {
+  @apply my-3 border-border;
+}
+.md a {
+  @apply text-primary underline underline-offset-2;
+}
+.md code {
+  @apply rounded-sm bg-muted px-1 py-0.5 font-mono text-[12px];
+}
+.md pre {
+  @apply my-2 overflow-x-auto rounded-sm border bg-muted/60 p-2.5;
+}
+.md pre code {
+  @apply bg-transparent p-0 text-[12px] leading-[1.5];
+}
+.md table {
+  @apply my-2 w-full border-collapse text-table;
+}
+.md th {
+  @apply border border-border bg-muted/70 px-2 py-1 text-left font-semibold whitespace-nowrap;
+}
+.md td {
+  @apply border border-border px-2 py-1 align-top;
+}
+.md img {
+  @apply max-w-full;
+}

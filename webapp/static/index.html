@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A股镰刀手 · AI交易员看板</title>
+<link rel="stylesheet" href="style.css">
+<!-- 第三方库本地化优先；加载失败自动回退 CDN（需联网） -->
+<script src="echarts.min.js"
+        onerror="window.__echartsLocalFailed=1"></script>
+<script>window.echarts || document.write('<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"><\/script><!-- CDN兜底：echarts（本地加载失败，此兜底需联网）-->');</script>
+<script src="marked.min.js"
+        onerror="window.__markedLocalFailed=1"></script>
+<script>window.marked || document.write('<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"><\/script><!-- CDN兜底：marked（本地加载失败，此兜底需联网）-->');</script>
+</head>
+<body>
+
+<!-- ═══════════ 顶部：系统名 + as_of + 状态灯 + 自动刷新倒计时 ═══════════ -->
+<header id="topbar">
+  <div class="brand">
+    <span class="logo">镰</span>
+    <span class="title">A股镰刀手 · AI交易员看板</span>
+    <span class="sub">paper 模拟盘</span>
+  </div>
+  <div class="top-right">
+    <span id="light" class="light light-gray" title="状态未知">
+      <i></i><b id="light-text">初始化…</b>
+    </span>
+    <span class="asof">数据日 <b id="as-of">—</b></span>
+    <span class="clock">自动刷新 <b id="countdown">30</b>s</span>
+    <button id="btn-refresh-all" class="btn btn-sm" title="刷新当前页全部数据">⟳ 全部刷新</button>
+  </div>
+</header>
+
+<!-- ═══════════ 总览栏（常驻）：五张卡 ═══════════ -->
+<section id="overview-cards" class="cards">
+  <div class="card kv"><div class="k">总资产</div><div class="v" id="ov-total">—</div><div class="s" id="ov-start">期初 —</div></div>
+  <div class="card kv"><div class="k">现金</div><div class="v" id="ov-cash">—</div><div class="s" id="ov-cash-pct">—</div></div>
+  <div class="card kv"><div class="k">持仓市值</div><div class="v" id="ov-mv">—</div><div class="s" id="ov-mv-count">无持仓</div></div>
+  <div class="card kv"><div class="k">累计收益率</div><div class="v" id="ov-ret">—</div><div class="s" id="ov-excess">vs 沪深300 —</div></div>
+  <div class="card kv"><div class="k">当前回撤</div><div class="v" id="ov-dd">—</div><div class="s" id="ov-kill">kill switch: —</div></div>
+</section>
+<div id="ov-error" class="err hidden"></div>
+
+<!-- ═══════════ 标签页导航 ═══════════ -->
+<nav id="tabs">
+  <button class="tab active" data-tab="equity">持仓与权益</button>
+  <button class="tab" data-tab="signals">信号看板</button>
+  <button class="tab" data-tab="decisions">决策流水</button>
+  <button class="tab" data-tab="risk">成交与风控</button>
+  <button class="tab" data-tab="macro">新闻与宏观</button>
+  <button class="tab" data-tab="reports">报告与日志</button>
+</nav>
+
+<main>
+
+<!-- ═══════════ 1. 持仓与权益 ═══════════ -->
+<section id="tab-equity" class="tab-page active">
+  <div class="panel">
+    <div class="panel-head">
+      <h2>权益曲线 <span class="hint">组合 vs 沪深300（同起点归一）+ 回撤副图</span></h2>
+      <button class="btn btn-sm refresh-btn" data-refresh="equity">⟳ 刷新</button>
+    </div>
+    <div id="equity-err" class="err hidden"></div>
+    <div id="equity-chart" class="chart chart-lg"></div>
+    <div id="equity-empty" class="empty hidden">暂无数据 —— portfolio_state 为空（P6 执行阶段未开始）</div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">
+      <h2>持仓明细</h2>
+      <span class="hint" id="pos-summary"></span>
+    </div>
+    <div id="pos-error" class="err hidden"></div>
+    <div id="pos-wrap"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><h2>黑名单 / 数据健康</h2></div>
+    <div id="blacklist-wrap" class="two-col"></div>
+  </div>
+</section>
+
+<!-- ═══════════ 2. 信号看板 ═══════════ -->
+<section id="tab-signals" class="tab-page">
+  <div class="panel">
+    <div class="panel-head">
+      <h2>技术信号 <span class="hint">每票最新 as_of，按 score 降序 · 点击卡片查看 K线+MA</span></h2>
+      <button class="btn btn-sm refresh-btn" data-refresh="signals">⟳ 刷新</button>
+    </div>
+    <div id="signals-err" class="err hidden"></div>
+    <div id="signal-cards" class="cards-signal"></div>
+    <div id="signals-empty" class="empty hidden">暂无数据 —— signal 表为空（P4 信号阶段未开始）</div>
+  </div>
+  <div class="panel hidden" id="candle-panel">
+    <div class="panel-head">
+      <h2 id="candle-title">K线</h2>
+      <span class="hint">近 120 个交易日 · MA5/MA20/MA60</span>
+    </div>
+    <div id="candle-err" class="err hidden"></div>
+    <div id="candle-chart" class="chart chart-lg"></div>
+  </div>
+</section>
+
+<!-- ═══════════ 3. 决策流水 ═══════════ -->
+<section id="tab-decisions" class="tab-page">
+  <div class="panel">
+    <div class="panel-head">
+      <h2>决策流水 <span class="hint">最近 50 条 · 点击行首 ▶ 展开 reasons / risk_notes</span></h2>
+      <button class="btn btn-sm refresh-btn" data-refresh="decisions">⟳ 刷新</button>
+    </div>
+    <div id="decisions-err" class="err hidden"></div>
+    <div id="decisions-wrap"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">
+      <h2>决策输入包 <span class="hint">session/&lt;日期&gt;/bundle.md</span></h2>
+      <div>
+        <select id="session-select" class="sel"><option value="">加载中…</option></select>
+        <button id="btn-session" class="btn btn-sm" disabled>查看</button>
+      </div>
+    </div>
+    <div id="session-err" class="err hidden"></div>
+    <div id="session-view" class="md-view empty-view">暂无数据 —— logs/session 为空（P5 决策阶段未开始）</div>
+  </div>
+</section>
+
+<!-- ═══════════ 4. 成交与风控 ═══════════ -->
+<section id="tab-risk" class="tab-page">
+  <div class="panel">
+    <div class="panel-head">
+      <h2>人工闸门 · 待确认单 <span class="hint">logs/orders/*/pending_*.json · 确认/否决调用 execution/runner.py</span></h2>
+      <button class="btn btn-sm refresh-btn" data-refresh="pending">⟳ 刷新</button>
+    </div>
+    <div id="pending-err" class="err hidden"></div>
+    <div id="gate-out" class="cli-out hidden">
+      <div class="cap">CLI 输出（execution/runner.py）</div>
+      <pre class="log-view" id="gate-out-pre"></pre>
+    </div>
+    <div id="pending-wrap"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">
+      <h2>成交流水</h2>
+      <button class="btn btn-sm refresh-btn" data-refresh="trades">⟳ 刷新</button>
+    </div>
+    <div id="trades-err" class="err hidden"></div>
+    <div id="trades-wrap"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">
+      <h2>风控事件</h2>
+      <button class="btn btn-sm refresh-btn" data-refresh="risk_events">⟳ 刷新</button>
+    </div>
+    <div id="risk-err" class="err hidden"></div>
+    <div id="risk-wrap"></div>
+  </div>
+</section>
+
+<!-- ═══════════ 5. 新闻与宏观 ═══════════ -->
+<section id="tab-macro" class="tab-page">
+  <div class="panel">
+    <div class="panel-head">
+      <h2>指数估值 <span class="hint">PE / PB 及历史分位（0~100%）</span></h2>
+      <button class="btn btn-sm refresh-btn" data-refresh="macro">⟳ 刷新</button>
+    </div>
+    <div id="macro-err" class="err hidden"></div>
+    <div id="macro-cards" class="cards"></div>
+    <div id="macro-empty" class="empty hidden">暂无数据 —— index_valuation 为空（P3 宏观阶段未开始）</div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">
+      <h2>PE 历史与分位带
+        <select id="macro-index-sel" class="sel">
+          <option value="000300">沪深300</option>
+          <option value="000905">中证500</option>
+          <option value="000001">上证指数</option>
+        </select>
+        <select id="macro-years-sel" class="sel">
+          <option value="3">近3年</option>
+          <option value="5" selected>近5年</option>
+          <option value="10">近10年</option>
+        </select>
+      </h2>
+      <button class="btn btn-sm refresh-btn" data-refresh="macro_history">⟳ 刷新</button>
+    </div>
+    <div id="macro-history-err" class="err hidden"></div>
+    <div id="macro-chart" class="chart chart-md"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">
+      <h2>新闻流
+        <span class="seg">
+          <button id="news-mkt-btn" class="btn btn-sm seg-on">市场新闻</button>
+          <button id="news-code-btn" class="btn btn-sm">个股新闻</button>
+        </span>
+      </h2>
+      <button class="btn btn-sm refresh-btn" data-refresh="news">⟳ 刷新</button>
+    </div>
+    <div id="news-err" class="err hidden"></div>
+    <div id="news-wrap"></div>
+  </div>
+</section>
+
+<!-- ═══════════ 6. 报告与日志 ═══════════ -->
+<section id="tab-reports" class="tab-page">
+  <div class="panel">
+    <div class="panel-head">
+      <h2>复盘报告 <span class="hint">logs/reports/*.md · 点击查看（Markdown 渲染）</span></h2>
+      <button class="btn btn-sm refresh-btn" data-refresh="reports">⟳ 刷新</button>
+    </div>
+    <div id="reports-err" class="err hidden"></div>
+    <div class="split">
+      <ul id="report-list" class="report-list"></ul>
+      <div id="report-view" class="md-view empty-view">← 从左侧选择报告查看</div>
+    </div>
+    <div id="reports-empty" class="empty hidden">暂无数据 —— reports 为空（P6 复盘阶段未开始）</div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">
+      <h2>日志查看器
+        <select id="log-name-sel" class="sel">
+          <option value="exec">exec.log</option>
+          <option value="pipeline">pipeline.log</option>
+          <option value="fetch">fetch.log</option>
+          <option value="news">news.log</option>
+          <option value="macro">macro.log</option>
+          <option value="signal">signal.log</option>
+          <option value="ai">ai.log</option>
+        </select>
+        <select id="log-lines-sel" class="sel">
+          <option>100</option><option selected>200</option><option>500</option><option>1000</option>
+        </select>
+        <label class="chk"><input type="checkbox" id="log-autoscroll" checked> 自动滚底</label>
+      </h2>
+      <button id="btn-log" class="btn btn-sm">⟳ 加载</button>
+    </div>
+    <div id="log-err" class="err hidden"></div>
+    <pre id="log-view" class="log-view">选择日志后点击「加载」。</pre>
+  </div>
+  <div class="panel">
+    <div class="panel-head">
+      <h2>回测结果 <span class="hint">logs/backtest_result.json</span></h2>
+      <button class="btn btn-sm refresh-btn" data-refresh="backtest">⟳ 刷新</button>
+    </div>
+    <div id="backtest-err" class="err hidden"></div>
+    <div id="backtest-wrap"><pre id="backtest-view" class="log-view">未加载。</pre></div>
+  </div>
+</section>
+
+</main>
+
+<footer id="foot">
+  A股镰刀手 · AI模拟交易系统 v1（paper 模拟盘） · 本地仪表盘 · 数据来源 data/market.db 与 logs/
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

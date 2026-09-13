@@ -1,0 +1,48 @@
+# ---------- Python ----------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+
+# ---------- Node / Frontend ----------
+node_modules/
+dist/
+build/
+.vite/
+*.tsbuildinfo
+storybook-static/
+coverage/
+
+# ---------- Runtime data (运行时生成，不入仓) ----------
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+logs/*.log
+logs/*.json
+logs/orders/
+logs/reports/
+logs/session/
+
+# ---------- OS ----------
+.DS_Store
+Thumbs.db
+
+# ---------- IDE ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---------- WorkBuddy 本地工作记忆 ----------
+.workbuddy/memory/
+.workbuddy/cache/
+
+# ---------- Misc ----------
+*.bak
+*.tmp
+*.pid

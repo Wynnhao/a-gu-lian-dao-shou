@@ -1,0 +1,77 @@
+{
+  "db_path": "data/market.db",
+  "watchlist": [
+    {"code": "600519", "name": "贵州茅台", "concepts": ["消费"]},
+    {"code": "000001", "name": "平安银行", "concepts": []},
+    {"code": "601318", "name": "中国平安", "concepts": []},
+    {"code": "300750", "name": "宁德时代", "concepts": ["新能源"]},
+    {"code": "688801", "name": "N燧原-U", "concepts": ["AI"]},
+    {"code": "002230", "name": "科大讯飞", "concepts": ["AI"]},
+    {"code": "000977", "name": "浪潮信息", "concepts": ["AI"]},
+    {"code": "603019", "name": "中科曙光", "concepts": ["AI"]},
+    {"code": "688111", "name": "金山办公", "concepts": ["AI"]},
+    {"code": "300418", "name": "昆仑万维", "concepts": ["AI"]},
+    {"code": "601952", "name": "苏垦农发", "concepts": ["厄尔尼诺"]},
+    {"code": "000998", "name": "隆平高科", "concepts": ["厄尔尼诺"]},
+    {"code": "600096", "name": "云天化", "concepts": ["厄尔尼诺"]},
+    {"code": "600467", "name": "好当家", "concepts": ["厄尔尼诺"]},
+    {"code": "300094", "name": "国联水产", "concepts": ["厄尔尼诺"]},
+    {"code": "002475", "name": "立讯精密", "concepts": ["苹果"]},
+    {"code": "002241", "name": "歌尔股份", "concepts": ["苹果"]},
+    {"code": "300433", "name": "蓝思科技", "concepts": ["苹果"]},
+    {"code": "002384", "name": "东山精密", "concepts": ["苹果"]},
+    {"code": "002600", "name": "领益智造", "concepts": ["苹果"]},
+    {"code": "000858", "name": "五粮液", "concepts": ["消费"]},
+    {"code": "600887", "name": "伊利股份", "concepts": ["消费"]},
+    {"code": "603288", "name": "海天味业", "concepts": ["消费"]},
+    {"code": "601888", "name": "中国中免", "concepts": ["消费"]},
+    {"code": "000651", "name": "格力电器", "concepts": ["消费"]},
+    {"code": "601012", "name": "隆基绿能", "concepts": ["新能源"]},
+    {"code": "002594", "name": "比亚迪", "concepts": ["新能源"]},
+    {"code": "300274", "name": "阳光电源", "concepts": ["新能源"]},
+    {"code": "600438", "name": "通威股份", "concepts": ["新能源"]},
+    {"code": "300014", "name": "亿纬锂能", "concepts": ["新能源"]}
+  ],
+  "blacklist_rules": {
+    "min_listed_days": 60,
+    "exclude_st": true,
+    "exclude_new_high_price_stocks": true
+  },
+  "pools": {
+    "movers": {
+      "pct_chg": 5.0,
+      "volume_ratio": 2.5,
+      "amplitude": 7.0,
+      "mom5_up": 12.0,
+      "mom5_down": -10.0,
+      "amount_floor": 50000000,
+      "top_n": 20
+    },
+    "hot": {
+      "theme_min_hits": 5,
+      "stock_min_news": 3,
+      "stock_vs_avg": 2.0
+    }
+  },
+  "risk": {
+    "max_single_weight": 0.20,
+    "max_total_weight": 0.80,
+    "max_positions": 5,
+    "price_guard_pct": 0.02,
+    "max_daily_trades": 3,
+    "max_weekly_turnover": 2.0,
+    "max_drawdown_kill": 0.08,
+    "kill_stop_hours": 72,
+    "min_confidence": 0.60,
+    "lot_size": 100
+  },
+  "execution": {
+    "mode": "paper",
+    "manual_gate": true,
+    "use_live_prices": true,
+    "paper_start_cash": 1000000,
+    "commission_rate": 0.00025,
+    "min_commission": 5.0,
+    "stamp_tax_rate": 0.0005
+  }
+}
