@@ -194,6 +194,8 @@ function BacktestCard() {
       return String(bt.data);
     }
   }, [bt.data]);
+  const profiles = bt.data?.profiles ?? {};
+  const profileNames = Object.keys(profiles);
 
   if (bt.err) return <ErrorBar msg={bt.err} onRetry={bt.refetch} />;
 
@@ -222,15 +224,56 @@ function BacktestCard() {
         <EmptyState msg="暂无回测结果" reason="signals/backtest.py 尚未产出 backtest_result.json" />
       ) : (
         <>
-          {/* 关键指标行 */}
-          <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 px-3 py-2.5 text-table sm:grid-cols-3">
-            <Metric label="策略年化" value={fmtRate(bt.data?.strategy?.annual_return)} />
-            <Metric label="策略累计" value={fmtRate(bt.data?.strategy?.total_return)} />
-            <Metric label="最大回撤" value={fmtRate(bt.data?.strategy?.max_drawdown)} tone="down" />
-            <Metric label="基准年化" value={fmtRate(bt.data?.benchmark_hs300?.annual_return)} />
-            <Metric label="基准累计" value={fmtRate(bt.data?.benchmark_hs300?.total_return)} />
-            <Metric label="调仓次数" value={String(bt.data?.rebalance_count ?? "—")} />
-          </div>
+          {/* 宇宙警示：本池回测仅作流程验证，不作选型依据（notes[0]） */}
+          {(bt.data?.notes?.length ?? 0) > 0 && (
+            <div className="border-b bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-600 dark:text-amber-400">
+              ⚠️ {bt.data?.notes?.[0]}
+              {bt.data?.universe?.codes != null && (
+                <span className="num">
+                  {" "}
+                  （宇宙 {bt.data.universe.codes} 只，其中 {bt.data.universe.codes_with_qfq ?? 0} 只有复权价）
+                </span>
+              )}
+            </div>
+          )}
+          {profileNames.length > 0 ? (
+            profileNames.map((name) => {
+              const p = profiles[name];
+              const perf = p.strategy_perf ?? {};
+              const bench = p.benchmark_hs300 ?? {};
+              const selected = bt.data?.selected_profile === name;
+              return (
+                <div key={name} className={cn("border-b px-3 py-2.5 last:border-b-0", selected && "bg-accent/40")}>
+                  <div className="mb-1.5 flex items-center gap-2">
+                    <span className="num text-[12px] font-medium">{name}</span>
+                    {selected && (
+                      <span className="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] text-primary">
+                        当前 profile
+                      </span>
+                    )}
+                    <span className={cn("rounded px-1.5 py-0.5 text-[10px]", p.pass ? "bg-emerald-500/15 text-emerald-600" : "bg-red-500/15 text-red-600")}>
+                      {p.pass ? "达标" : "未达标"}
+                    </span>
+                    <span className="num ml-auto text-[10px] text-muted-foreground">
+                      {p.window?.start} ~ {p.window?.end} · 调仓 {p.rebalance_count ?? "—"} 次
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-table sm:grid-cols-3">
+                    <Metric label="策略年化" value={fmtRate(perf.annual_return)} />
+                    <Metric label="策略累计" value={fmtRate(perf.total_return)} />
+                    <Metric label="最大回撤" value={fmtRate(perf.max_drawdown)} tone="down" />
+                    <Metric label="基准年化" value={fmtRate(bench.annual_return)} />
+                    <Metric label="基准累计" value={fmtRate(bench.total_return)} />
+                    <Metric
+                      label="基准回撤"
+                      value={fmtRate(bench.max_drawdown)}
+                      tone="down"
+                    />
+                  </div>
+                </div>
+              );
+            })
+          ) : null}
           {open && (
             <pre className="num max-h-[260px] overflow-auto border-t whitespace-pre px-3 py-2 text-[11px] leading-[1.6] text-muted-foreground">
               {pretty}

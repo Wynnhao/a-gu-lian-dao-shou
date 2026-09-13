@@ -330,12 +330,12 @@ export interface BacktestStrategy {
   [k: string]: unknown;
 }
 
-export interface BacktestData {
-  missing?: boolean;
+export interface BacktestProfile {
+  strategy?: string;
   params?: Record<string, unknown>;
   window?: { start?: string; end?: string; trading_days?: number; [k: string]: unknown };
-  strategy?: BacktestStrategy;
-  benchmark_hs300?: BacktestStrategy;
+  strategy_perf?: BacktestStrategy & { per_year?: Record<string, number> };
+  benchmark_hs300?: BacktestStrategy & { per_year?: Record<string, number> };
   rebalance_count?: number;
   final_holdings?: {
     as_of?: string;
@@ -345,7 +345,17 @@ export interface BacktestData {
     [k: string]: unknown;
   };
   pass?: boolean;
-  tried_params?: unknown[];
+  slippage_sensitivity_annual?: Record<string, number>;
+  [k: string]: unknown;
+}
+
+export interface BacktestData {
+  missing?: boolean;
+  generated_at?: string;
+  universe?: { codes?: number; codes_with_qfq?: number; [k: string]: unknown };
+  profiles?: Record<string, BacktestProfile>;
+  notes?: string[];
+  selected_profile?: string;
   [k: string]: unknown;
 }
 
