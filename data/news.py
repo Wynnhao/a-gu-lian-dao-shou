@@ -109,21 +109,22 @@ def _baidu_rows(df: pd.DataFrame) -> list:
 
 
 def _save_news(conn: sqlite3.Connection, rows: list, since=None) -> int:
-    """INSERT OR IGNORE 入库，返回真实新增行数；since 时早于该日/无时间的旧闻不入库。"""
+    """INSERT OR IGNORE 入库，返回真实新增行数（rowcount 累加，并发安全）。"""
     now = datetime.now().isoformat(timespec="seconds")
-    before = conn.execute("SELECT COUNT(*) FROM news").fetchone()[0]
+    added = 0
     for r in rows:
         pub = r.get("published_at") or ""
         if since and (not pub or pub < since):  # ISO 字符串可直接比较
             continue
-        conn.execute(
+        cur = conn.execute(
             "INSERT OR IGNORE INTO news "
             "(code, title, content, source, url, published_at, fetched_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (r.get("code", ""), r.get("title", ""), r.get("content", ""),
              r.get("source", ""), r.get("url", ""), pub, now))
+        added += max(cur.rowcount, 0)
     conn.commit()
-    return conn.execute("SELECT COUNT(*) FROM news").fetchone()[0] - before
+    return added
 
 
 def _latest(rows: list, limit: int) -> list:
@@ -133,10 +134,16 @@ def _latest(rows: list, limit: int) -> list:
 
 
 def fetch_stock_news(code: str, conn=None, since=None, limit: int = 10) -> int:
-    """单票最新新闻（ak.stock_news_em），取最新 limit=10 条，返回新增行数。"""
+    """单票最新新闻（ak.stock_news_em），取最新 limit 条，返回新增行数。
+
+    带 since（补跑场景）时自动放大 limit 到 30：stock_news_em 只回最新 N 条，
+    停机期间某票发布 >10 条会漏采，靠增量游标+放大窗口缓解。
+    """
     own = conn is None
     if own:
         conn = get_conn()
+    if since:
+        limit = max(limit, 30)
     n = 0
     try:
         df = ak.stock_news_em(symbol=code)
@@ -155,13 +162,73 @@ def fetch_stock_news(code: str, conn=None, since=None, limit: int = 10) -> int:
     return n
 
 
+_NOTICE_COL_CANDIDATES = {
+    "code": ["代码", "证券代码"],
+    "title": ["公告标题", "标题"],
+    "date": ["公告日期", "日期", "发布日期"],
+    "url": ["网址", "链接", "公告网址"],
+}
+
+
+def fetch_notices(conn=None, since=None, days: int = 5, limit: int = 8) -> int:
+    """公告采集（ak.stock_notice_report）：减持/停复牌/业绩预告等对风控最关键，
+    此前完全缺失。逐日拉全市场公告后按 watchlist 代码过滤，公告标题打【公告】前缀。
+    """
+    own = conn is None
+    if own:
+        conn = get_conn()
+    codes = {item["code"] for item in CFG["watchlist"]}
+    total = 0
+    for offset in range(days):
+        d = (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
+        try:
+            df = ak.stock_notice_report(symbol="全部", date=d.replace("-", ""))
+            time.sleep(0.8)
+        except Exception as e:  # noqa: BLE001
+            log.warning("公告 %s FAIL: %s", d, repr(e)[:120])
+            continue
+        if df is None or df.empty:
+            continue
+        c_col = _pick_col(df, _NOTICE_COL_CANDIDATES["code"])
+        t_col = _pick_col(df, _NOTICE_COL_CANDIDATES["title"])
+        d_col = _pick_col(df, _NOTICE_COL_CANDIDATES["date"])
+        u_col = _pick_col(df, _NOTICE_COL_CANDIDATES["url"])
+        if not c_col or not t_col:
+            log.warning("公告接口列名不识别: %s", list(df.columns)[:8])
+            break
+        rows = []
+        for _, r in df.iterrows():
+            code = _clean(r.get(c_col))
+            if code not in codes:
+                continue
+            title = _clean(r.get(t_col))
+            if not title:
+                continue
+            rows.append({
+                "code": code, "title": f"【公告】{title}",
+                "content": title, "source": "notice_report",
+                "url": _clean(r.get(u_col)) if u_col else "",
+                "published_at": _fmt_dt(r.get(d_col)) if d_col else "",
+            })
+        rows = _latest(rows, limit)
+        total += _save_news(conn, rows, since=since)
+    log.info("公告采集: 新增 %d 条（近 %d 日）", total, days)
+    if own:
+        conn.close()
+    return total
+
+
 def fetch_market_news(conn=None, since=None, limit: int = 15) -> int:
-    """市场级新闻（code=''），依次尝试东财全球财经快讯/新浪/百度，用第一个跑通的源。"""
+    """市场级新闻（code=''）：快讯链（东财→新浪）与百度财经日历**并行采集**。
+
+    此前"用第一个跑通的源 + break"导致东财正常时宏观日历永远不被采集；
+    两类信息互补（快讯=事件流，日历=宏观数据发布表），都拿。
+    """
     own = conn is None
     if own:
         conn = get_conn()
     n = 0
-    for name in ("stock_info_global_em", "stock_info_global_sina", "news_economic_baidu"):
+    for name in ("stock_info_global_em", "stock_info_global_sina"):
         try:
             df = getattr(ak, name)()
             time.sleep(0.8)
@@ -171,23 +238,34 @@ def fetch_market_news(conn=None, since=None, limit: int = 15) -> int:
         if df is None or df.empty:
             log.warning("市场新闻 %s 返回空, 尝试下一源", name)
             continue
-        rows = _baidu_rows(df) if name == "news_economic_baidu" else _df_to_rows(df, "")
+        rows = _df_to_rows(df, "")
         if not rows:
             log.warning("市场新闻 %s 无有效行, 尝试下一源", name)
             continue
         for r in rows:
             r["source"] = name  # source 记实际接口名
         rows = _latest(rows, limit)
-        n = _save_news(conn, rows, since=since)
+        n += _save_news(conn, rows, since=since)
         log.info("市场新闻 %s: 取 %d 条, 新增 %d", name, len(rows), n)
-        break  # 用第一个能跑通的源
+        break  # 快讯链内仍是互斥降级（两源内容同类）
+    # 宏观日历独立采集，不受快讯链是否成功影响
+    try:
+        df = ak.news_economic_baidu()
+        time.sleep(0.8)
+        if df is not None and not df.empty:
+            rows = _latest(_baidu_rows(df), limit)
+            n += _save_news(conn, rows, since=since)
+            log.info("市场新闻 news_economic_baidu: 取 %d 条, 累计新增 %d",
+                     len(rows), n)
+    except Exception as e:  # noqa: BLE001
+        log.warning("市场新闻 news_economic_baidu FAIL: %s", repr(e)[:160])
     if own:
         conn.close()
     return n
 
 
 def fetch_all(since=None) -> dict:
-    """watchlist 全部 code + 市场级，逐个 try/except 降级，返回 {code: 新增条数}。"""
+    """watchlist 全部 code + 市场级 + 公告，逐个 try/except 降级，返回 {来源: 新增条数}。"""
     conn = get_conn()
     result = {}
     for item in CFG["watchlist"]:
@@ -203,20 +281,61 @@ def fetch_all(since=None) -> dict:
     except Exception as e:
         log.error("fetch_all market FAIL: %s", repr(e)[:160])
         result["market"] = 0
+    try:
+        result["notices"] = fetch_notices(conn=conn, since=since)
+    except Exception as e:
+        log.error("fetch_all notices FAIL: %s", repr(e)[:160])
+        result["notices"] = 0
     conn.close()
     return result
 
 
-def get_recent_news(conn: sqlite3.Connection, code: str = "", days: int = 3) -> list:
-    """近 N 天新闻（按发布时间倒序），供 AI 决策层读取。"""
+def _title_similar(a: str, b: str) -> float:
+    """标题 Jaccard 相似度（字符 bigram），用于同事件刷屏去重。"""
+    if not a or not b:
+        return 0.0
+    ga = {a[i:i + 2] for i in range(len(a) - 1)}
+    gb = {b[i:i + 2] for i in range(len(b) - 1)}
+    if not ga or not gb:
+        return 0.0
+    return len(ga & gb) / len(ga | gb)
+
+
+def dedup_news(rows: list, threshold: float = 0.5) -> list:
+    """同事件去重：输入须按时间倒序，标题相似度超阈值的保留最新一条。"""
+    kept = []
+    for r in rows:
+        if any(_title_similar(r["title"], k["title"]) >= threshold for k in kept):
+            continue
+        kept.append(r)
+    return kept
+
+
+def get_recent_news(conn: sqlite3.Connection, code: str = "", days: int = 3,
+                    name: str = "") -> list:
+    """近 N 天新闻，供 AI 决策层读取。
+
+    - 同事件去重（标题 bigram 相似度 ≥0.5 保留最新一条），此前同一回购公告
+      5 条刷屏消耗决策包 token 与注意力；
+    - relevance 标注：标题/正文是否命中本票简称（榜单类新闻往往是文中顺带
+      提及，相关性低）；
+    - 榜单类标题（含"N只/榜/排行"且正文含多票表格特征）降权排后。
+    """
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     rows = conn.execute(
         "SELECT title, content, source, published_at FROM news "
         "WHERE code = ? AND published_at != '' AND published_at >= ? "
         "ORDER BY published_at DESC",
         (code, cutoff)).fetchall()
-    return [{"title": t, "content": c, "source": s, "published_at": p}
-            for t, c, s, p in rows]
+    out = [{"title": t, "content": c, "source": s, "published_at": p}
+           for t, c, s, p in rows]
+    out = dedup_news(out)
+    if name:
+        for r in out:
+            r["relevance"] = "high" if (name in r["title"] or name in r["content"]) \
+                else "low"
+        out.sort(key=lambda r: (r.get("relevance") != "high",))  # high 优先，稳定排序
+    return out
 
 
 def main():

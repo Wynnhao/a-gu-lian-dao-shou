@@ -64,7 +64,8 @@ def seed_market(conn: sqlite3.Connection, prices: Optional[Dict[str, tuple]] = N
                      (code, NAMES[code], first, datetime.now().isoformat(timespec="seconds")))
         for td, close in ((yest, prev), (today, latest)):
             conn.execute(
-                "INSERT INTO daily_bar VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
+                " volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (code, td, close, close, close, close, 1000, close * 1000, 0.0, 1.0))
     conn.commit()
 

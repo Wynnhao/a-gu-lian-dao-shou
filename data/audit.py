@@ -1,0 +1,161 @@
+"""数据质量审计与修复：入库校验规则 + 存量修复 + 库备份。
+
+用法：
+    python3 -m data.audit            # 只体检，输出问题清单
+    python3 -m data.audit --fix      # 修复可自动处理的量纲混杂，再体检
+    python3 -m data.audit --backup   # 体检 + VACUUM INTO 备份（保留 30 份）
+
+背景（2026-09 实测发现）：东财封禁期间全量走腾讯兜底，daily_bar 混入「股」口径
+volume（与「手」差 100 倍）、首行 pct_chg 丢真值——fetch_log 全记 ok，无校验器
+则完全不可见。本模块是发现 1/2/3 类问题的系统性兜底：
+- 逐行体检：OHLC 关系 / 涨跌幅超边界（按板块判断停板幅度）/ 量纲自检；
+- --fix：量纲可疑行按 amount/close 隐含股数归一为「手」；
+- --backup：VACUUM INTO 到 logs/backup/，SQLite 文件级损坏时唯一可恢复来源。
+"""
+import argparse
+import logging
+import sqlite3
+import time
+from datetime import datetime
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent.parent
+
+log = logging.getLogger("audit")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    log.addHandler(logging.FileHandler(BASE / "logs" / "audit.log", encoding="utf-8"))
+    log.addHandler(logging.StreamHandler())
+log.propagate = False
+
+BACKUP_DIR = BASE / "logs" / "backup"
+BACKUP_KEEP = 30
+
+# 停板幅度按代码前缀：创业/科创 ±20%，北交所 ±30%，其余主板 ±10%（ST 不区分，
+# 超 ±5% 会被主板规则误报——用 10% 上限 + audit 报告人工确认，不做静默修正）
+def _limit_pct(code: str) -> float:
+    if code.startswith(("300", "301", "688", "689")):
+        return 20.5
+    if code.startswith(("83", "87", "88", "43", "92")):
+        return 30.5
+    return 10.5
+
+
+def _norm_volume(volume, amount, close):
+    """与 fetcher 同款判定：返回归一为「手」的 volume；无法判定返回 None。"""
+    try:
+        v, amt, c = float(volume), float(amount), float(close)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0 or amt <= 0 or c <= 0:
+        return None
+    implied = amt / c
+    if abs(v - implied) <= abs(v * 100 - implied):
+        return round(v / 100.0, 2)  # 原值是「股」
+    return v                         # 原值已是「手」
+
+
+def check_db(conn: sqlite3.Connection, limit: int = 200) -> list:
+    """全表逐行体检，返回问题清单 [{kind, code, date, detail}]（最多 limit 条）。"""
+    issues = []
+    rows = conn.execute(
+        "SELECT code, trade_date, open, high, low, close, volume, amount, pct_chg "
+        "FROM daily_bar ORDER BY code, trade_date").fetchall()
+    first_date = {}
+    for code, td, o, h, l, c, v, amt, pct in rows:
+        first_date.setdefault(code, td)
+        ctx = {"kind": "", "code": code, "date": td, "detail": ""}
+        def flag(kind, detail):
+            ctx2 = dict(ctx)
+            ctx2.update(kind=kind, detail=detail)
+            issues.append(ctx2)
+        if c is None or c <= 0:
+            flag("bad_close", f"close={c}")
+            continue
+        if o is not None and h is not None and l is not None:
+            if h < max(o, c) - 1e-9 or l > min(o, c) + 1e-9 or h < l:
+                flag("ohlc_broken", f"o={o} h={h} l={l} c={c}")
+        if pct is not None and td != first_date[code]:
+            lp = _limit_pct(code)
+            if abs(pct) > lp:
+                flag("pct_out_of_range", f"pct_chg={pct} 超过停板幅度±{lp}%")
+        if amt and amt > 0 and v is not None and v > 0:
+            implied = amt / c
+            shares = v * 100  # 假定库内已是「手」
+            if not (0.5 < shares / implied < 2.0):
+                flag("volume_unit_suspect",
+                     f"volume={v}(手?) amount/close={implied:.0f}股, "
+                     f"偏差 {shares / implied:.2f}x")
+    return issues[:limit], issues and len(issues) or 0
+
+
+def fix_volume_units(conn: sqlite3.Connection) -> int:
+    """把量纲可疑行归一为「手」，返回修复行数。只在显式 --fix 时调用。"""
+    rows = conn.execute(
+        "SELECT code, trade_date, volume, amount, close FROM daily_bar "
+        "WHERE volume IS NOT NULL AND volume > 0 AND amount IS NOT NULL "
+        "AND amount > 0 AND close IS NOT NULL AND close > 0").fetchall()
+    fixed = 0
+    for code, td, v, amt, c in rows:
+        implied = amt / c
+        if 0.5 < (v * 100) / implied < 2.0:
+            continue  # 已是「手」，正常
+        nv = _norm_volume(v, amt, c)
+        if nv is not None and abs(nv - v) > 1e-9:
+            conn.execute("UPDATE daily_bar SET volume=? WHERE code=? AND trade_date=?",
+                         (nv, code, td))
+            fixed += 1
+    conn.commit()
+    log.info("量纲修复: %d 行（volume 归一为「手」）", fixed)
+    return fixed
+
+
+def backup_db(conn: sqlite3.Connection) -> Path:
+    """VACUUM INTO 快照备份，保留最近 BACKUP_KEEP 份；失败不阻塞主流程。"""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    path = BACKUP_DIR / (
+        "market-" + datetime.now().strftime("%Y%m%d-%H%M") + ".db")
+    conn.execute("VACUUM INTO ?", (str(path),))
+    backups = sorted(BACKUP_DIR.glob("market-*.db"))
+    for old in backups[:-BACKUP_KEEP]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    log.info("库已备份: %s（保留 %d 份）", path.name,
+             min(len(backups), BACKUP_KEEP))
+    return path
+
+
+def run(fix: bool = False, backup: bool = False) -> dict:
+    from data.fetcher import get_conn
+    conn = get_conn()
+    try:
+        if fix:
+            fix_volume_units(conn)
+        issues, total = check_db(conn)
+        by_kind = {}
+        for it in issues:
+            by_kind[it["kind"]] = by_kind.get(it["kind"], 0) + 1
+        if backup:
+            backup_db(conn)
+        return {"total": total, "by_kind": by_kind, "issues": issues}
+    finally:
+        conn.close()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="数据质量审计与修复")
+    ap.add_argument("--fix", action="store_true", help="修复量纲混杂（归一为手）")
+    ap.add_argument("--backup", action="store_true", help="VACUUM INTO 备份")
+    args = ap.parse_args()
+    r = run(fix=args.fix, backup=args.backup)
+    print(f"== 数据体检: {r['total']} 个问题 {r['by_kind']} ==")
+    for it in r["issues"][:30]:
+        print(f"  [{it['kind']}] {it['code']} {it['date']}: {it['detail']}")
+    if r["total"] > 30:
+        print(f"  ... 共 {r['total']} 条，详见 logs/audit.log")
+
+
+if __name__ == "__main__":
+    main()

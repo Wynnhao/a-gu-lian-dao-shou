@@ -123,8 +123,9 @@ def test_network_failure_returns_empty():
 def test_latest_price_falls_back_to_close_when_disabled():
     conn = sqlite3.connect(":memory:")
     conn.executescript(DDL)
-    conn.execute("INSERT INTO daily_bar VALUES ('600519','2026-09-11',1280,1290,1270,"
-                 "1275.16,100,1000,-0.77,0.5)")
+    conn.execute("INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
+                 " volume, amount, pct_chg, turnover) VALUES "
+                 "('600519','2026-09-11',1280,1290,1270,1275.16,100,1000,-0.77,0.5)")
     conn.commit()
     broker = PaperBroker()
     # 环境变量已禁用实时价 → 应返回日线收盘

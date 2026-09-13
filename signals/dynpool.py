@@ -15,25 +15,31 @@ POOLS = ("movers", "hot_theme", "hot_stock")
 
 
 def upsert_pool_rows(conn: sqlite3.Connection, pool: str,
-                     rows: List[dict], as_of: str) -> int:
+                     rows: List[dict], as_of: str, mode: str = "") -> int:
     """写入一次刷新结果（INSERT OR REPLACE，按 pool+code+added_date 幂等）。
 
     rows: [{code, name, reason, strength}, ...]
+    mode 记录本次刷新口径（all=全市场快照 / watchlist=自选池兜底）——两种口径的
+    strength 不可比（全市场仅 2 规则上限 3.5，自选池五规则上限 ~7.2），落库留痕
+    供 bundle/看板区分展示。
     """
     now = datetime.now().isoformat(timespec="seconds")
     conn.executemany(
-        "INSERT OR REPLACE INTO dynamic_pool VALUES (?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO dynamic_pool "
+        "(pool, code, name, reason, strength, added_date, updated_at, mode) "
+        "VALUES (?,?,?,?,?,?,?,?)",
         [(pool, str(r["code"]), str(r.get("name") or ""),
           json.dumps(r.get("reason") or [], ensure_ascii=False) if not isinstance(
               r.get("reason"), str) else r["reason"],
-          float(r.get("strength") or 0.0), as_of, now) for r in rows])
+          float(r.get("strength") or 0.0), as_of, now,
+          r.get("pool_mode") or mode) for r in rows])
     conn.commit()
     return len(rows)
 
 
 def current_pool(conn: sqlite3.Connection, pool: str,
                  as_of: Optional[str] = None) -> List[dict]:
-    """当前池内成员（含 reason JSON 数组、strength），按 strength 降序。"""
+    """当前池内成员（含 reason JSON 数组、strength、mode），按 strength 降序。"""
     if as_of is None:
         row = conn.execute(
             "SELECT MAX(added_date) FROM dynamic_pool WHERE pool=?", (pool,)).fetchone()
@@ -41,17 +47,24 @@ def current_pool(conn: sqlite3.Connection, pool: str,
     if not as_of:
         return []
     rows = conn.execute(
-        "SELECT code, name, reason, strength, added_date FROM dynamic_pool "
+        "SELECT code, name, reason, strength, added_date, mode FROM dynamic_pool "
         "WHERE pool=? AND added_date=?", (pool, as_of)).fetchall()
     out = []
-    for code, name, reason, strength, added in rows:
+    for code, name, reason, strength, added, mode in rows:
         try:
             reasons = json.loads(reason) if reason else []
         except (TypeError, ValueError):
             reasons = [reason] if reason else []
         out.append({"code": code, "name": name, "reasons": reasons,
-                    "strength": strength, "added_date": added})
+                    "strength": strength, "added_date": added, "mode": mode or ""})
     return sorted(out, key=lambda r: -float(r.get("strength") or 0.0))
+
+
+def pool_as_of(conn: sqlite3.Connection, pool: str) -> Optional[str]:
+    """池子最新刷新日期（供 bundle 标注陈旧性：超过 2 个交易日的池要显式告警）。"""
+    row = conn.execute(
+        "SELECT MAX(added_date) FROM dynamic_pool WHERE pool=?", (pool,)).fetchone()
+    return row[0] if row and row[0] else None
 
 
 def pool_dates(conn: sqlite3.Connection, pool: str) -> List[str]:

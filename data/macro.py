@@ -24,6 +24,16 @@ log.propagate = False
 
 INDEX_CODES = ["000300", "000905", "000001"]  # 6位码，无后缀
 
+# 指数交易所前缀显式映射（此前 startswith(("000","8")) 的推断对深市指数 399xxx 会错判）
+_INDEX_SYMBOL_PREFIX = {
+    "000300": "sh", "000905": "sh", "000001": "sh",
+    "399001": "sz", "399005": "sz", "399006": "sz", "399330": "sz",
+}
+
+
+def _index_symbol(code: str) -> str:
+    return _INDEX_SYMBOL_PREFIX.get(code, "sh") + code
+
 # 估值源按序尝试：(akshare函数名, symbol, 数值列)。legu 指数PE/PB 无"上证"，
 # 上证指数(000001) 用 stock_market_pe_lg 的市场平均市盈率做备选，再不行走价格分位兜底。
 _PE_CHAINS = {
@@ -76,7 +86,7 @@ def _daily_src(src: str, code: str, start: str, end: str) -> list:
         rows = [(code, pd.Timestamp(d).strftime("%Y-%m-%d"), float(c))
                 for d, c in zip(df["日期"], df["收盘"])]
     else:  # 新浪/腾讯兜底，symbol 需带交易所前缀
-        sym = ("sh" if code.startswith(("000", "8")) else "sz") + code
+        sym = _index_symbol(code)
         df = (ak.stock_zh_index_daily(symbol=sym) if src == "stock_zh_index_daily"
               else ak.stock_zh_index_daily_tx(symbol=sym))
         if df is None or df.empty:

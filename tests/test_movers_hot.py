@@ -64,7 +64,9 @@ def _seed_stock(conn, code="600519", name="贵州茅台", days=70,
         p = last_pct if is_last else pct[i]
         rows.append((code, (d0 + timedelta(days=i)).isoformat(),
                      c * 0.999, hi, lo, c, v, 1e6, p, 1.0))
-    conn.executemany("INSERT INTO daily_bar VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+    conn.executemany("INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
+                     " volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     rows)
     conn.execute("INSERT INTO stock_info VALUES (?,?,?,?)",
                  (code, name, (d0).isoformat(), "x"))
     conn.commit()
@@ -102,7 +104,9 @@ def test_movers_new_low_and_crash():
         code, td, o, h, l, c, v, a, _, t = rows[-5 + j]
         c2 = rows[-6 + j][5] * (1 + p / 100)
         rows[-5 + j] = (code, td, c2 * 0.999, c2 * 1.005, c2 * 0.985, c2, 2000, a, p, t)
-    conn2.executemany("INSERT INTO daily_bar VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+    conn2.executemany("INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
+                      " volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                      rows)
     conn2.execute("INSERT INTO stock_info VALUES (?,?,?,?)",
                   ("000001", "平安银行", d0.isoformat(), "x"))
     hits = [r for r in mv.compute_watchlist_movers(conn2) if r["code"] == "000001"]

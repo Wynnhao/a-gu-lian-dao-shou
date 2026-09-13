@@ -206,7 +206,9 @@ def test_build_bundle_empty_tables_degrades():
 
 def test_build_bundle_with_data():
     conn = make_conn()
-    conn.execute("INSERT INTO daily_bar VALUES ('600519','2026-09-11',1,1,1,1,1,1,0,0)")
+    conn.execute("INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
+                 " volume, amount, pct_chg, turnover) VALUES "
+                 "('600519','2026-09-11',1,1,1,1,1,1,0,0)")
     conn.execute("INSERT INTO signal VALUES ('600519','2026-09-11','{\"ma_trend\":\"up\"}',0.7)")
     conn.execute("INSERT INTO index_valuation VALUES ('000300','2026-09-11',12,0.5,1.3,0.6,4000)")
     conn.execute("INSERT INTO portfolio_state VALUES ('2026-09-11',900000,100000,1000000,0,0,'t')")

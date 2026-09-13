@@ -33,7 +33,8 @@ def make_conn() -> sqlite3.Connection:
 
 def add_bar(conn, code, d, close, pct=0.0, prev_close=None):
     conn.execute(
-        "INSERT OR REPLACE INTO daily_bar VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO daily_bar (code, trade_date, open, high, low, close,"
+        " volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (code, d, prev_close if prev_close is not None else close,
          close, close, close, 10000, close * 10000, pct, 1.0),
     )

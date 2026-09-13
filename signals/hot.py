@@ -61,13 +61,24 @@ def _concept_map(conn: sqlite3.Connection) -> Dict[str, List[str]]:
 
 
 def compute_hot_themes(conn: sqlite3.Connection, window_days: int = 2) -> List[dict]:
-    """市场级新闻关键词计数 → 热门题材（含代表票与样例标题）。"""
+    """市场级新闻关键词计数 → 热门题材（含代表票与样例标题）。
+
+    判热条件（与 docstring 承诺一致）：近 window_days 天命中 ≥min_hits 且
+    明显高于基线——≥theme_vs_avg × 此前 5 日日均（突增而非常态热度）；
+    此前窗口无数据时只按 min_hits 判定。
+    """
     cfg = _cfg()
     min_hits = int(cfg.get("theme_min_hits", 5))
+    vs_avg = float(cfg.get("theme_vs_avg", 2.0))
     since = (datetime.now() - timedelta(days=window_days)).strftime("%Y-%m-%d")
+    base_since = (datetime.now() - timedelta(days=window_days + 5)).strftime("%Y-%m-%d")
     rows = conn.execute(
         "SELECT title, content, published_at FROM news WHERE code='' "
         "AND COALESCE(published_at,'') >= ? ORDER BY published_at DESC", (since,)).fetchall()
+    base_rows = conn.execute(
+        "SELECT title, content FROM news WHERE code='' "
+        "AND COALESCE(published_at,'') >= ? "
+        "AND COALESCE(published_at,'') < ?", (base_since, since)).fetchall()
     cmap = _concept_map(conn)
     info = conn.execute("SELECT code, name FROM stock_info").fetchall()
     name_of = {c: n for c, n in info}
@@ -76,18 +87,24 @@ def compute_hot_themes(conn: sqlite3.Connection, window_days: int = 2) -> List[d
         hits, samples = 0, []
         for title, content, pub in rows:
             text = (title or "") + " " + (content or "")
-            for kw in keywords:
-                if re.search(re.escape(kw), text, re.IGNORECASE):
-                    hits += 1
-                    if len(samples) < 3:
-                        samples.append((title or "")[:60])
-                    break
+            if any(re.search(re.escape(kw), text, re.IGNORECASE) for kw in keywords):
+                hits += 1
+                if len(samples) < 3:
+                    samples.append((title or "")[:60])
         if hits < min_hits:
             continue
+        base_hits = sum(
+            1 for title, content in base_rows
+            if any(re.search(re.escape(kw), (title or "") + " " + (content or ""),
+                             re.IGNORECASE) for kw in keywords))
+        baseline = base_hits / 5.0  # 此前 5 日日均
+        surge = baseline <= 0 or hits >= vs_avg * baseline
+        if not surge:
+            continue
         related = [f"{c} {name_of.get(c, '')}" for c in cmap.get(concept_tag or "", [])]
-        out.append({"theme": theme, "hits": hits, "hot": hits >= min_hits,
-                    "samples": samples, "concept_tag": concept_tag,
-                    "related_stocks": related})
+        out.append({"theme": theme, "hits": hits, "hot": True,
+                    "baseline": round(baseline, 2), "samples": samples,
+                    "concept_tag": concept_tag, "related_stocks": related})
     out.sort(key=lambda r: -r["hits"])
     return out
 
@@ -186,9 +203,10 @@ def refresh(conn: sqlite3.Connection, as_of: Optional[str] = None) -> dict:
     window_days = 2
     n1 = dynpool.upsert_pool_rows(conn, "hot_theme", [
         {"code": "THEME:%s" % t["theme"], "name": t["theme"],
-         "reason": ["近%d天命中 %d 次" % (window_days, t["hits"])] + t["samples"],
-         "strength": t["hits"]} for t in themes], day)
-    n2 = dynpool.upsert_pool_rows(conn, "hot_stock", stocks, day)
+         "reason": ["近%d天命中 %d 次（基线 %.1f/日）" % (window_days, t["hits"],
+                                                       t.get("baseline", 0.0))] + t["samples"],
+         "strength": t["hits"]} for t in themes], day, mode="watchlist")
+    n2 = dynpool.upsert_pool_rows(conn, "hot_stock", stocks, day, mode="watchlist")
     log.info("热门池刷新：题材 %d、个股 %d（as_of=%s）", n1, n2, day)
     boards = board_hot()
     return {"themes": themes, "stocks": stocks, "boards": boards,
