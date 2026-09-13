@@ -20,6 +20,7 @@ if str(BASE) not in sys.path:
 import argparse
 import json
 import logging
+import logging.handlers
 import sqlite3
 from datetime import date, datetime
 from typing import Optional, Tuple
@@ -42,7 +43,7 @@ log = logging.getLogger("ai.bundle")
 log.setLevel(logging.INFO)
 if not log.handlers:
     _fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    _fh = logging.FileHandler(BASE / "logs" / "ai.log", encoding="utf-8")
+    _fh = logging.handlers.RotatingFileHandler(BASE / "logs" / "ai.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3)
     _fh.setFormatter(_fmt)
     _sh = logging.StreamHandler()
     _sh.setFormatter(_fmt)

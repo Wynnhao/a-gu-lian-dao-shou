@@ -7,6 +7,7 @@ if str(BASE) not in sys.path:
 
 import argparse
 import logging
+import logging.handlers
 from datetime import date, datetime
 
 from data import fetcher, news
@@ -21,7 +22,7 @@ log = logging.getLogger("pipeline.premarket")
 log.setLevel(logging.INFO)
 if not log.handlers:
     _fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    _fh = logging.FileHandler(BASE / "logs" / "pipeline.log", encoding="utf-8")
+    _fh = logging.handlers.RotatingFileHandler(BASE / "logs" / "pipeline.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3)
     _fh.setFormatter(_fmt)
     _sh = logging.StreamHandler()
     _sh.setFormatter(_fmt)

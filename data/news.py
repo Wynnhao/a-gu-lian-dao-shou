@@ -2,6 +2,7 @@
 import argparse
 import json
 import logging
+import logging.handlers
 import math
 import sqlite3
 import sys
@@ -23,7 +24,7 @@ CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
 log = logging.getLogger("news")
 log.setLevel(logging.INFO)
 if not log.handlers:  # 避免与 fetcher 的 basicConfig 重复挂 handler
-    log.addHandler(logging.FileHandler(BASE / "logs" / "news.log", encoding="utf-8"))
+    log.addHandler(logging.handlers.RotatingFileHandler(BASE / "logs" / "news.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3))
     log.addHandler(logging.StreamHandler())
 log.propagate = False
 

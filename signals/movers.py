@@ -10,6 +10,7 @@ buy/sell 仍限自选池 30 只——晋升自选池必须人工改 config。
 """
 import json
 import logging
+import logging.handlers
 import sqlite3
 import sys
 from datetime import datetime
@@ -25,7 +26,7 @@ from signals import dynpool  # noqa: E402
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler(BASE / "logs" / "signal.log", encoding="utf-8"),
+    handlers=[logging.handlers.RotatingFileHandler(BASE / "logs" / "signal.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3),
               logging.StreamHandler()],
 )
 log = logging.getLogger("movers")

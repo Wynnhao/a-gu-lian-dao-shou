@@ -71,7 +71,13 @@ export function DecisionsPage() {
             <ErrorBar msg={decisions.err} onRetry={decisions.refetch} />
           </div>
         ) : (
-          <DecisionTable rows={decisions.data ?? []} />
+          <DecisionTable
+            rows={decisions.data ?? []}
+            onViewBundle={(d) => {
+              setPicked(d);
+              window.scrollTo({ top: 0, behavior: "smooth" });
+            }}
+          />
         )}
       </Panel>
     </div>

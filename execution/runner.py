@@ -19,6 +19,7 @@ import contextlib
 import fcntl
 import json
 import logging
+import logging.handlers
 import os
 import sqlite3
 from dataclasses import asdict
@@ -41,7 +42,7 @@ log = logging.getLogger("exec.runner")
 log.setLevel(logging.INFO)
 log.propagate = False
 if not log.handlers:
-    _fh = logging.FileHandler(BASE / "logs" / "exec.log", encoding="utf-8")
+    _fh = logging.handlers.RotatingFileHandler(BASE / "logs" / "exec.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3)
     _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     log.addHandler(_fh)
 

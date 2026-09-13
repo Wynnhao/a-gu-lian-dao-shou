@@ -21,6 +21,7 @@ if str(BASE) not in sys.path:
 
 import json
 import logging
+import logging.handlers
 import math
 import time
 from typing import List, Tuple
@@ -32,7 +33,7 @@ from data.fetcher import get_conn
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("backtest")
-log.addHandler(logging.FileHandler(BASE / "logs" / "signal.log", encoding="utf-8"))
+log.addHandler(logging.handlers.RotatingFileHandler(BASE / "logs" / "signal.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3))
 log.propagate = False
 
 START = "2024-01-02"

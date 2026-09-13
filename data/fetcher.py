@@ -12,6 +12,7 @@
 """
 import json
 import logging
+import logging.handlers
 import sqlite3
 import time
 from datetime import datetime, date, timedelta
@@ -26,7 +27,7 @@ CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler(BASE / "logs" / "fetch.log", encoding="utf-8"),
+    handlers=[logging.handlers.RotatingFileHandler(BASE / "logs" / "fetch.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3),
               logging.StreamHandler()],
 )
 log = logging.getLogger("fetcher")

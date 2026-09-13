@@ -41,6 +41,7 @@ API 契约（全部 JSON）：
   POST /api/reject  {decision_id, reason, by}  跑 runner.py reject
 """
 import argparse
+import bisect
 import json
 import mimetypes
 import os
@@ -48,6 +49,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import traceback
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -85,11 +87,22 @@ MIME_OVERRIDE = {
 
 # ---------------------------------------------------------------- 基础工具
 
+_CONFIG_CACHE: Dict[str, Any] = {"mtime": None, "cfg": {}}
+
+
 def load_config() -> dict:
+    """读 config.json（按 mtime 缓存——此前每个请求多次读盘）。"""
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
+        mtime = CONFIG_PATH.stat().st_mtime
+    except OSError:
         return {}
+    if _CONFIG_CACHE["mtime"] != mtime:
+        try:
+            _CONFIG_CACHE["cfg"] = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            _CONFIG_CACHE["mtime"] = mtime
+        except Exception:
+            return {}
+    return _CONFIG_CACHE["cfg"]
 
 
 def db_file() -> Path:
@@ -101,8 +114,10 @@ def db_file() -> Path:
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_file()))
+    conn = sqlite3.connect(str(db_file()), timeout=15)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 
@@ -152,54 +167,21 @@ def fnum(val: Any, default: float = 0.0) -> float:
         return default
 
 
-# ---------------------------------------------------------------- 风控快照（复刻 risk/blacklist.py 口径，避免 import 项目模块）
+# ---------------------------------------------------------------- 风控快照（复用 risk/blacklist.py，单一事实源——此前双维护存在口径漂移风险）
 
 def health_issues_of(conn: sqlite3.Connection) -> List[str]:
-    issues: List[str] = []
-    latest = q_one(conn, "SELECT MAX(trade_date) AS d FROM daily_bar")
-    latest_date = latest["d"] if latest else None
-    if not latest_date:
-        return ["daily_bar 为空"]
-    try:
-        lag = (datetime.today() - datetime.fromisoformat(str(latest_date))).days
-    except ValueError:
-        lag = 0
-    if lag > 3:
-        issues.append("数据滞后 %d 天（最新 %s）" % (lag, latest_date))
-    missing = q_all(conn,
-                    "SELECT code, name FROM stock_info WHERE code NOT IN "
-                    "(SELECT code FROM daily_bar WHERE trade_date=?)", (latest_date,))
-    for r in missing:
-        issues.append("%s %s 缺少 %s 的数据" % (r["code"], r["name"], latest_date))
-    return issues
+    from risk.blacklist import health_check
+    return health_check(conn)
 
 
 def blacklist_of(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
-    cfg = load_config()
-    rules = cfg.get("blacklist_rules", {}) or {}
-    min_days = int(rules.get("min_listed_days", 60))
-    exclude_st = bool(rules.get("exclude_st", True))
-    exclude_new = bool(rules.get("exclude_new_high_price_stocks", True))
-    today = datetime.today().date()
+    from risk.blacklist import check_blacklist
+    names = {r["code"]: r["name"] for r in
+             q_all(conn, "SELECT code, name FROM stock_info")}
     out: List[Dict[str, Any]] = []
-    for r in q_all(conn, "SELECT code, name, first_trade_date FROM stock_info ORDER BY code"):
-        name = str(r.get("name") or "")
-        first = r.get("first_trade_date")
-        reasons: List[str] = []
-        if first:
-            try:
-                days = (today - datetime.fromisoformat(str(first)).date()).days
-                if days < min_days:
-                    reasons.append("上市仅%d天 < %d天" % (days, min_days))
-            except ValueError:
-                pass
-        if exclude_st and ("ST" in name or "st" in name):
-            reasons.append("ST标的")
-        if exclude_new and name.startswith("N"):
-            reasons.append("次新股(首日/无涨跌幅限制)")
-        out.append({"code": r["code"], "name": name,
-                    "ok": len(reasons) == 0,
-                    "reason": "; ".join(reasons) if reasons else "-"})
+    for code, (ok, reason) in sorted(check_blacklist(conn).items()):
+        out.append({"code": code, "name": names.get(code, code),
+                    "ok": bool(ok), "reason": reason or "-"})
     return out
 
 
@@ -285,9 +267,22 @@ def api_equity_curve(conn: sqlite3.Connection, qs: dict) -> dict:
     drawdown: List[float] = [fnum(r["drawdown"]) * 100.0 for r in rows]  # 0~1 → %
     benchmark: List[Optional[float]] = []
     if dates:
+        # 一次性载入基准收盘（此前逐日单查是 N+1，窗口拉长后明显变慢）
+        bench_rows = q_all(conn, "SELECT trade_date, close FROM index_daily "
+                                 "WHERE index_code='000300' ORDER BY trade_date ASC")
+        bdates: List[str] = []
+        bvals: List[float] = []
+        last = None
+        for r in bench_rows:
+            if r["close"] is not None:
+                last = fnum(r["close"])
+            if last is not None:
+                bdates.append(str(r["trade_date"]))
+                bvals.append(last)
         closes: List[Optional[float]] = []
         for d in dates:
-            closes.append(bench_close_at(conn, d))
+            i = bisect.bisect_right(bdates, d) - 1
+            closes.append(bvals[i] if i >= 0 else None)
         first = next((c for c in closes if c), None)
         for c in closes:
             if c and first:
@@ -519,9 +514,6 @@ def api_pending(qs: dict) -> List[dict]:
         return out
     files = sorted(ORDERS_DIR.glob("*/pending_*.json"))
     for p in files:
-        rp = safe_join(BASE, os.path.relpath(str(p), str(BASE)))
-        if rp is None:
-            continue
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -589,7 +581,7 @@ def api_backtest(qs: dict) -> dict:
 _BY_RE = re.compile(r"[^0-9A-Za-z_\u4e00-\u9fff]+")
 
 # 审查 P2-2：串行化 runner 子进程调用，防并发 confirm 同一决策双重成交
-_RUNNER_LOCK = __import__("threading").Lock()
+_RUNNER_LOCK = threading.Lock()
 
 
 def run_runner(args: List[str], timeout: int = 60) -> Tuple[int, str]:
@@ -924,8 +916,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send_bytes(200, target.read_bytes(), ctype)
 
     # ---- 路由
+    _ALLOWED_HOSTS = ("127.0.0.1", "localhost")
+
+    def _host_ok(self) -> bool:
+        """Host 白名单：GET/POST 统一校验，防 DNS rebinding 读走组合数据。"""
+        host = (self.headers.get("Host") or "").lower()
+        return any(host == h or host.startswith(h + ":") for h in self._ALLOWED_HOSTS)
+
     def do_GET(self) -> None:  # noqa: N802
         try:
+            if not self._host_ok():
+                self._err(403, "仅允许本地 Host 访问（got Host=%r）"
+                          % (self.headers.get("Host"),))
+                return
             parts = urlsplit(self.path)
             qs = parse_qs(parts.query)
             route = GET_ROUTES.get(parts.path)
@@ -940,7 +943,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._err(404, "未知接口 %s" % parts.path)
                 return
             self._serve_static(parts.path)
-        except (FileNotFoundError, ValueError) as e:
+        except FileNotFoundError as e:
+            self._err(404, str(e))
+        except (ValueError,) as e:
             self._err(400, str(e))
         except Exception:
             traceback.print_exc()
@@ -953,16 +958,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._err(404, "未知写接口 %s" % parts.path)
                 return
             # 写操作来源防护（审查 P1-1）：防 CSRF / DNS-rebinding 触发下单动作
-            host = (self.headers.get("Host") or "").lower()
-            allowed_hosts = ("127.0.0.1", "localhost")  # 端口任意（本地多端口可用）
-            if not any(host == h or host.startswith(h + ":") for h in allowed_hosts):
-                self._err(403, "写接口仅允许本地 Host 访问（got Host=%r）" % host)
+            if not self._host_ok():
+                self._err(403, "写接口仅允许本地 Host 访问（got Host=%r）"
+                          % (self.headers.get("Host"),))
                 return
             origin = self.headers.get("Origin")
-            if origin and not origin.lower().startswith(
-                    ("http://127.0.0.1", "http://localhost")):
-                self._err(403, "跨源写请求已拒绝（Origin=%r）" % origin)
-                return
+            if origin:
+                # 精确 hostname 比对（此前 startswith 前缀校验可被
+                # http://127.0.0.1.evil.com 绕过）
+                try:
+                    oh = (urlsplit(origin).hostname or "").lower()
+                except ValueError:
+                    oh = ""
+                if oh not in self._ALLOWED_HOSTS:
+                    self._err(403, "跨源写请求已拒绝（Origin=%r）" % origin)
+                    return
             ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if ctype != "application/json":
                 self._err(415, "Content-Type 须为 application/json（got %r）" % ctype)
@@ -987,7 +997,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(api_reject(body))
         except subprocess.TimeoutExpired:
             self._err(504, "runner.py 执行超时（60s）")
-        except (ValueError, FileNotFoundError) as e:
+        except FileNotFoundError as e:
+            self._err(404, str(e))
+        except (ValueError,) as e:
             self._err(400, str(e))
         except Exception:
             traceback.print_exc()

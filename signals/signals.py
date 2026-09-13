@@ -25,6 +25,7 @@ if str(BASE) not in sys.path:
 import argparse
 import json
 import logging
+import logging.handlers
 import math
 import time
 from typing import Optional
@@ -37,7 +38,7 @@ from signals.factors import atr, ma, mom, rsi, turnover_pct  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("signals")
-log.addHandler(logging.FileHandler(BASE / "logs" / "signal.log", encoding="utf-8"))
+log.addHandler(logging.handlers.RotatingFileHandler(BASE / "logs" / "signal.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3))
 log.propagate = False  # 只写 signal.log，不串到 fetcher 的 root handler
 
 PROFILES = ("reversal_lowvol", "momentum")

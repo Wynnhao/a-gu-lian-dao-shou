@@ -17,6 +17,7 @@ if str(BASE) not in sys.path:
 
 import json
 import logging
+import logging.handlers
 import sqlite3
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -44,7 +45,7 @@ def _exec_logger(name: str) -> logging.Logger:
     lg.setLevel(logging.INFO)
     lg.propagate = False
     if not lg.handlers:
-        fh = logging.FileHandler(BASE / "logs" / "exec.log", encoding="utf-8")
+        fh = logging.handlers.RotatingFileHandler(BASE / "logs" / "exec.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3)
         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         lg.addHandler(fh)
     return lg

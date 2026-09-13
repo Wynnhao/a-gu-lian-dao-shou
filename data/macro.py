@@ -1,6 +1,7 @@
 """P1.5 指数日线 + PE/PB 历史分位入库（幂等：日线 OR IGNORE，估值 OR REPLACE）。"""
 import argparse
 import logging
+import logging.handlers
 import sys
 import time
 from datetime import date
@@ -18,7 +19,7 @@ from data.fetcher import get_conn  # noqa: E402
 log = logging.getLogger("macro")
 log.setLevel(logging.INFO)
 if not log.handlers:  # 避免与 fetcher 的 basicConfig 重复挂 handler
-    log.addHandler(logging.FileHandler(BASE / "logs" / "macro.log", encoding="utf-8"))
+    log.addHandler(logging.handlers.RotatingFileHandler(BASE / "logs" / "macro.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3))
     log.addHandler(logging.StreamHandler())
 log.propagate = False
 

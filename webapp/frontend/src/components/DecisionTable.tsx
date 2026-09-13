@@ -88,10 +88,13 @@ export function DecisionTable({
   rows,
   showRunDate = true,
   extraColumns,
+  onViewBundle,
 }: {
   rows: DecisionRow[];
   showRunDate?: boolean;
   extraColumns?: { head: ReactNode; cell: (r: DecisionRow) => ReactNode }[];
+  /** 传入时展开区显示"查看当时输入包"跳转（决策→证据归因） */
+  onViewBundle?: (date: string) => void;
 }) {
   const [open, setOpen] = useState<Set<number>>(new Set());
   const toggle = (id: number) =>
@@ -209,6 +212,17 @@ export function DecisionTable({
                         <div>
                           <div className="mb-1 text-[11px] font-semibold text-muted-foreground">执行结果（trade）</div>
                           <TradeMiniCard trade={r.trade} />
+                        </div>
+                      )}
+                      {onViewBundle && r.run_date && (
+                        <div className="lg:col-span-2">
+                          <button
+                            type="button"
+                            onClick={() => onViewBundle(r.run_date)}
+                            className="text-[11px] text-primary underline-offset-2 hover:underline"
+                          >
+                            查看 {r.run_date} 决策时的完整输入包（bundle）→
+                          </button>
                         </div>
                       )}
                     </div>

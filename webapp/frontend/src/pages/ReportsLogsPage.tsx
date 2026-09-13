@@ -94,6 +94,10 @@ export function ReportsLogsPage() {
         <LogViewer />
         <BacktestCard />
       </div>
+
+      <Panel title="数据健康" caliber="/api/health · fetch_log 与各票行数" bodyClassName="p-3">
+        <HealthPanel />
+      </Panel>
     </div>
   );
 }
@@ -253,7 +257,7 @@ function fmtRate(v: unknown): string {
   return (n * 100).toFixed(2) + "%";
 }
 
-/** 数据健康面板（报告页底部补充：fetch_log 与各票行数） */
+/** 数据健康面板（报告页底部：数据源各票行数——此前自递归 bug 且从未挂载） */
 export function HealthPanel() {
   const health = useApi(() => apiGet<HealthData>("/api/health"), []);
   if (health.err) return <ErrorBar msg={health.err} onRetry={health.refetch} />;
@@ -262,7 +266,6 @@ export function HealthPanel() {
   return (
     <div className="text-table text-muted-foreground">
       数据源各票行数：{d.codes.map((c) => `${c.code}=${c.rows}`).join(" · ")}
-    <HealthPanel />
-  </div>
+    </div>
   );
 }

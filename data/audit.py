@@ -14,6 +14,7 @@ volume（与「手」差 100 倍）、首行 pct_chg 丢真值——fetch_log �
 """
 import argparse
 import logging
+import logging.handlers
 import sqlite3
 import time
 from datetime import datetime
@@ -24,7 +25,7 @@ BASE = Path(__file__).resolve().parent.parent
 log = logging.getLogger("audit")
 log.setLevel(logging.INFO)
 if not log.handlers:
-    log.addHandler(logging.FileHandler(BASE / "logs" / "audit.log", encoding="utf-8"))
+    log.addHandler(logging.handlers.RotatingFileHandler(BASE / "logs" / "audit.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3))
     log.addHandler(logging.StreamHandler())
 log.propagate = False
 
