@@ -228,8 +228,8 @@ def test_daily_report_content_and_numbers():
          '["理由A: MA5上穿MA20", "理由B: 放量突破"]', '["风险: 短线追高"]', "executed",
          "2099-01-07T09:31:00"),
     )
-    conn.execute("INSERT OR REPLACE INTO index_daily VALUES ('000300','2099-01-06',4000.0)")
-    conn.execute("INSERT OR REPLACE INTO index_daily VALUES ('000300','2099-01-07',4040.0)")  # +1%
+    conn.execute("INSERT OR REPLACE INTO index_daily (index_code, trade_date, close) VALUES ('000300','2099-01-06',4000.0)")
+    conn.execute("INSERT OR REPLACE INTO index_daily (index_code, trade_date, close) VALUES ('000300','2099-01-07',4040.0)")  # +1%
     conn.commit()
 
     out = _Path(tempfile.mkdtemp())
@@ -273,8 +273,8 @@ def test_daily_report_benchmark_missing_then_present():
     out = _Path(tempfile.mkdtemp())
     t1 = daily.generate_daily_report("2099-01-07", conn, out_dir=out).read_text(encoding="utf-8")
     assert "基准数据缺失" in t1
-    conn.execute("INSERT OR REPLACE INTO index_daily VALUES ('000300','2099-01-06',4000.0)")
-    conn.execute("INSERT OR REPLACE INTO index_daily VALUES ('000300','2099-01-07',4000.0)")
+    conn.execute("INSERT OR REPLACE INTO index_daily (index_code, trade_date, close) VALUES ('000300','2099-01-06',4000.0)")
+    conn.execute("INSERT OR REPLACE INTO index_daily (index_code, trade_date, close) VALUES ('000300','2099-01-07',4000.0)")
     conn.commit()
     t2 = daily.generate_daily_report("2099-01-07", conn, out_dir=out).read_text(encoding="utf-8")
     assert "基准数据缺失" not in t2
@@ -288,8 +288,8 @@ def seed_week(conn, end_close, week_ret_target_total):
     """2024-01-08(周一)~2024-01-12(周五)；基准日 2024-01-05(上周五)。"""
     add_bar(conn, "600519", "2024-01-05", 500.0)
     add_bar(conn, "600519", "2024-01-12", end_close)
-    conn.execute("INSERT OR REPLACE INTO index_daily VALUES ('000300','2024-01-05',4000.0)")
-    conn.execute("INSERT OR REPLACE INTO index_daily VALUES ('000300','2024-01-12',4080.0)")  # 基准 +2%
+    conn.execute("INSERT OR REPLACE INTO index_daily (index_code, trade_date, close) VALUES ('000300','2024-01-05',4000.0)")
+    conn.execute("INSERT OR REPLACE INTO index_daily (index_code, trade_date, close) VALUES ('000300','2024-01-12',4080.0)")  # 基准 +2%
     add_pos(conn, "600519", "贵州茅台", 1000, 480.0)
     add_state(conn, "2024-01-05", 1000000.0, cash=500000.0)          # 期初：市值50万+现金50万
     add_state(conn, "2024-01-12", week_ret_target_total, cash=500000.0)
@@ -335,7 +335,7 @@ def test_weekly_benchmark_missing_degrades():
 
 def test_ensure_benchmark_existing_skips_fetch():
     conn = make_conn()
-    conn.execute("INSERT OR REPLACE INTO index_daily VALUES ('000300','2024-01-10',4000.0)")
+    conn.execute("INSERT OR REPLACE INTO index_daily (index_code, trade_date, close) VALUES ('000300','2024-01-10',4000.0)")
     conn.commit()
 
     def _should_not_run(start8, end8):

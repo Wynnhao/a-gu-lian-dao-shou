@@ -6,7 +6,10 @@
 - daily_bar.pct_chg 优先用东财官方「涨跌幅」列（已按除息参考价计算），腾讯源由
   库内前收盘推算，首行无前收时存 0 并由 audit 标注；
 - daily_bar.close_qfq 存前复权收盘（除权除息不污染动量/均线类因子），因子层
-  优先取它，缺失时回退不复权 close；
+  优先取它，缺失时回退不复权 close；high_qfq/low_qfq 由 close_qfq/close 比例
+  同行导出（复权是逐行线性缩放），供 ATR 全复权计算（混用 raw H/L 与 qfq C
+  会在除权日产生假 TR 跳变）；
+- index_daily 存指数 close + high/low（RSRS 需要高低价回归）；
 - daily_bar.source / fetch_log.detail 记录实际命中数据源，降级口径可审计；
 - SQLite 连接统一 WAL + busy_timeout，webapp/catchup/postclose 三方并发写不再撞锁。
 """
@@ -41,7 +44,7 @@ DDL = """
 CREATE TABLE IF NOT EXISTS daily_bar (
     code TEXT, trade_date TEXT, open REAL, high REAL, low REAL, close REAL,
     volume REAL, amount REAL, pct_chg REAL, turnover REAL,
-    source TEXT, close_qfq REAL,
+    source TEXT, close_qfq REAL, high_qfq REAL, low_qfq REAL,
     PRIMARY KEY (code, trade_date)
 );
 CREATE TABLE IF NOT EXISTS stock_info (
@@ -63,9 +66,9 @@ CREATE TABLE IF NOT EXISTS news (
     UNIQUE(code, title, published_at)
 );
 CREATE INDEX IF NOT EXISTS idx_news_code_pub ON news(code, published_at);
--- P1.5 指数行情与估值分位
+-- P1.5 指数行情与估值分位（high/low 供 RSRS 阻力支撑回归）
 CREATE TABLE IF NOT EXISTS index_daily (
-    index_code TEXT, trade_date TEXT, close REAL,
+    index_code TEXT, trade_date TEXT, close REAL, high REAL, low REAL,
     PRIMARY KEY (index_code, trade_date)
 );
 CREATE TABLE IF NOT EXISTS index_valuation (
@@ -119,12 +122,22 @@ CREATE TABLE IF NOT EXISTS dynamic_pool (
     strength REAL, added_date TEXT, updated_at TEXT, mode TEXT,
     PRIMARY KEY (pool, code, added_date)
 );
+-- 回测宇宙成员留痕（如中证800）：宇宙票不进 stock_info（否则会混入自选池
+-- 信号计算与决策 bundle），只进 daily_bar 供回测；成分表按快照日留痕
+CREATE TABLE IF NOT EXISTS universe_member (
+    universe TEXT, code TEXT, name TEXT, as_of TEXT,
+    PRIMARY KEY (universe, code, as_of)
+);
 """
 
 # 已有库的增量迁移：DDL 只对新建库生效，老库靠 ALTER 补列
 _MIGRATIONS = [
     ("daily_bar", "source", "ALTER TABLE daily_bar ADD COLUMN source TEXT"),
     ("daily_bar", "close_qfq", "ALTER TABLE daily_bar ADD COLUMN close_qfq REAL"),
+    ("daily_bar", "high_qfq", "ALTER TABLE daily_bar ADD COLUMN high_qfq REAL"),
+    ("daily_bar", "low_qfq", "ALTER TABLE daily_bar ADD COLUMN low_qfq REAL"),
+    ("index_daily", "high", "ALTER TABLE index_daily ADD COLUMN high REAL"),
+    ("index_daily", "low", "ALTER TABLE index_daily ADD COLUMN low REAL"),
     ("decision", "trade_date", "ALTER TABLE decision ADD COLUMN trade_date TEXT"),
     ("decision", "model", "ALTER TABLE decision ADD COLUMN model TEXT"),
     ("decision", "prompt_version", "ALTER TABLE decision ADD COLUMN prompt_version TEXT"),
@@ -260,6 +273,25 @@ def _hist_em_qfq(code: str, start: str, end: str) -> pd.DataFrame:
     })
 
 
+def _hist_tx_qfq(code: str, start: str, end: str) -> pd.DataFrame:
+    """腾讯前复权 OHLC 兜底（东财封禁期间的前复权唯一来源）。
+
+    返回 date/close_qfq/high_qfq/low_qfq；腾讯源按分页拉全史，量大时较慢。
+    """
+    prefix = ("sh" if code.startswith(("6", "9")) else
+              "sz" if code.startswith(("0", "3")) else "bj")
+    df = call_ak("tx_qfq", ak.stock_zh_a_hist_tx, symbol=f"{prefix}{code}",
+                 start_date=start, end_date=end, adjust="qfq")
+    if df is None or df.empty:
+        return df
+    return pd.DataFrame({
+        "date": pd.to_datetime(df["date"]),
+        "close_qfq": pd.to_numeric(df["close"], errors="coerce"),
+        "high_qfq": pd.to_numeric(df["high"], errors="coerce"),
+        "low_qfq": pd.to_numeric(df["low"], errors="coerce"),
+    })
+
+
 def _hist_tx(code: str, start: str, end: str) -> pd.DataFrame:
     """腾讯源兜底；volume 单位不定，交由 _norm_volume 逐行归一。"""
     prefix = ("sh" if code.startswith(("6", "9")) else
@@ -353,9 +385,11 @@ def fetch_daily(code: str, conn: sqlite3.Connection) -> int:
 
 
 def backfill_qfq(code: str, conn: sqlite3.Connection) -> int:
-    """回填前复权收盘列（除权除息不再污染动量/均线/新高新低）；失败静默跳过。
+    """回填前复权 OHLC 列（close_qfq/high_qfq/low_qfq；除权除息不再污染动量/均线/ATR）。
 
-    em 被限流时本函数整体 no-op，因子层自动回退不复权 close，audit 会提示补跑。
+    东财 em_qfq 优先（仅收盘，high/low_qfq 由 close_qfq/close 比例同行导出），
+    腾讯 tx_qfq 兜底（自带前复权 OHLC）。失败静默跳过：因子层自动回退不复权
+    close，audit 会提示补跑。
     """
     last_qfq = conn.execute(
         "SELECT MAX(trade_date) FROM daily_bar WHERE code=? AND close_qfq IS NOT NULL",
@@ -366,18 +400,127 @@ def backfill_qfq(code: str, conn: sqlite3.Connection) -> int:
     end = date.today().strftime("%Y%m%d")
     if _market_data_window():
         end = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
-    try:
-        df = _hist_em_qfq(code, start, end)
-    except Exception as e:  # noqa: BLE001
-        log.info("%s qfq 跳过: %s", code, repr(e)[:80])
-        return 0
+
+    df, src = None, ""
+    for src_name, fn in (("em_qfq", _hist_em_qfq), ("tx_qfq", _hist_tx_qfq)):
+        try:
+            got = fn(code, start, end)
+        except Exception as e:  # noqa: BLE001
+            log.info("%s qfq via %s fail: %s", code, src_name, repr(e)[:80])
+            continue
+        if got is not None and not got.empty:
+            df, src = got, src_name
+            break
     if df is None or df.empty:
         return 0
-    rows = [(float(r["close_qfq"]), code, r["date"].strftime("%Y-%m-%d"))
-            for _, r in df.iterrows() if pd.notna(r["close_qfq"])]
+
+    raw = {d: (h, l, c) for d, h, l, c in conn.execute(
+        "SELECT trade_date, high, low, close FROM daily_bar WHERE code=?", (code,))}
+    rows = []
+    for _, r in df.iterrows():
+        d = r["date"].strftime("%Y-%m-%d")
+        cq = r["close_qfq"]
+        if pd.isna(cq) or d not in raw:
+            continue
+        hq = r.get("high_qfq") if "high_qfq" in df.columns else None
+        lq = r.get("low_qfq") if "low_qfq" in df.columns else None
+        rh, rl, rc = raw[d]
+        # em 源只给收盘：复权是逐行线性缩放，high/low_qfq 按 close 比例同行导出
+        if (hq is None or pd.isna(hq)) and rc and rh is not None and not pd.isna(rh):
+            hq = float(rh) * float(cq) / float(rc)
+        if (lq is None or pd.isna(lq)) and rc and rl is not None and not pd.isna(rl):
+            lq = float(rl) * float(cq) / float(rc)
+        rows.append((round(float(cq), 4),
+                     round(float(hq), 4) if hq is not None and not pd.isna(hq) else None,
+                     round(float(lq), 4) if lq is not None and not pd.isna(lq) else None,
+                     code, d))
+    if not rows:
+        return 0
     conn.executemany(
-        "UPDATE daily_bar SET close_qfq=? WHERE code=? AND trade_date=?", rows)
+        "UPDATE daily_bar SET close_qfq=?, high_qfq=?, low_qfq=? "
+        "WHERE code=? AND trade_date=?", rows)
     conn.commit()
+    log.info("%s qfq via %s: %d rows", code, src, len(rows))
+    return len(rows)
+
+
+# ---------------------------------------------------------------- 指数日线
+
+# 宽基指数 → 腾讯 symbol 前缀映射（显式表，避免按代码推断深市前缀出错）
+INDEX_TX_SYMBOL = {
+    "000001": "sh000001",   # 上证指数
+    "000300": "sh000300",   # 沪深300
+    "000905": "sh000905",   # 中证500
+    "000906": "sh000906",   # 中证800
+    "399006": "sz399006",   # 创业板指
+    "399330": "sz399330",   # 深证300
+}
+
+
+def _index_em(code: str, start: str, end: str) -> pd.DataFrame:
+    """东财指数日线（收盘+最高+最低），中文列名。"""
+    df = call_ak("em", ak.index_zh_a_hist, symbol=code, period="daily",
+                 start_date=start, end_date=end)
+    if df is None or df.empty:
+        return df
+    return pd.DataFrame({
+        "date": pd.to_datetime(df["日期"]),
+        "close": pd.to_numeric(df["收盘"], errors="coerce"),
+        "high": pd.to_numeric(df["最高"], errors="coerce"),
+        "low": pd.to_numeric(df["最低"], errors="coerce"),
+    })
+
+
+def _index_tx(code: str, start: str, end: str) -> pd.DataFrame:
+    """腾讯指数日线兜底（含 OHLC，全史）。"""
+    sym = INDEX_TX_SYMBOL.get(code)
+    if sym is None:
+        raise ValueError(f"index {code} 无腾讯 symbol 映射")
+    df = call_ak("tx", ak.stock_zh_index_daily_tx, symbol=sym)
+    if df is None or df.empty:
+        return df
+    out = pd.DataFrame({
+        "date": pd.to_datetime(df["date"]),
+        "close": pd.to_numeric(df["close"], errors="coerce"),
+        "high": pd.to_numeric(df["high"], errors="coerce"),
+        "low": pd.to_numeric(df["low"], errors="coerce"),
+    })
+    return out[(out["date"] >= pd.Timestamp(start)) & (out["date"] <= pd.Timestamp(end))]
+
+
+def ensure_index_daily(conn: sqlite3.Connection, code: str,
+                       start: str = "20180101") -> int:
+    """保障指数日线（含 high/low）最新：东财优先、腾讯兜底、都挂则沿用库内。
+
+    regime（二八轮动/RSRS）与回测基准共用；幂等 INSERT OR REPLACE。
+    """
+    end = date.today().strftime("%Y%m%d")
+    if _market_data_window():
+        end = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
+    df, src = None, ""
+    for src_name, fn in (("em", _index_em), ("tx", _index_tx)):
+        try:
+            got = fn(code, start, end)
+        except Exception as e:  # noqa: BLE001
+            log.info("index %s via %s fail: %s", code, src_name, repr(e)[:80])
+            time.sleep(1)
+            continue
+        if got is not None and not got.empty:
+            df, src = got, src_name
+            break
+    if df is None or df.empty:
+        log.warning("index %s 两个源均不可用，沿用库内已有数据", code)
+        return 0
+    rows = [(code, r["date"].strftime("%Y-%m-%d"),
+             float(r["close"]) if pd.notna(r["close"]) else None,
+             float(r["high"]) if pd.notna(r.get("high")) else None,
+             float(r["low"]) if pd.notna(r.get("low")) else None)
+            for _, r in df.iterrows()]
+    conn.executemany(
+        "INSERT OR REPLACE INTO index_daily (index_code, trade_date, close, high, low) "
+        "VALUES (?,?,?,?,?)", rows)
+    conn.commit()
+    log.info("index %s via %s: %d rows", code, src, len(rows))
     return len(rows)
 
 
@@ -410,7 +553,7 @@ def run():
             log.error("%s FAIL: %s", code, e)
         conn.commit()
         time.sleep(1)  # 温和限速
-    if not source_blocked("em_qfq"):
+    if not (source_blocked("em_qfq") and source_blocked("tx_qfq")):
         for item in CFG["watchlist"]:
             try:
                 backfill_qfq(item["code"], conn)

@@ -20,8 +20,12 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 MIN_SAMPLES = 100
-FACTORS = ("mom_5d", "mom_20d", "atr_pct", "turnover_pct", "rsi_14")
+FACTORS = ("mom_5d", "mom_20d", "atr_pct", "turnover_pct", "turn20", "rsi_14")
 HORIZONS = (1, 5, 10)
+# profile 切换判据（成文防事后挑赢家）：score h5 RankIC ≥ +0.02 保留、
+# ≤ −0.02 切换、其间维持积累；样本不足一律 insufficient
+IC_KEEP = 0.02
+IC_SWITCH = -0.02
 
 
 def _signal_frame(conn: sqlite3.Connection) -> pd.DataFrame:
@@ -118,6 +122,63 @@ def pool_eval(conn: sqlite3.Connection, pool: str = "movers", horizon: int = 5) 
             "win_rate": round(win, 4)}
 
 
+def rolling_ic(conn: sqlite3.Connection, col: str = "score", horizon: int = 5,
+               min_bucket: int = 20) -> dict:
+    """按月分桶的滚动 RankIC（观察因子衰减/拥挤：连续走负即预警，策略库 §2.1
+    对换手率因子拥挤迹象的警示即靠它监控）。样本不足的月份跳过。"""
+    sig = _signal_frame(conn)
+    if sig.empty:
+        return {"col": col, "horizon": horizon, "buckets": []}
+    fwd = _forward_returns(conn, horizon)
+    if fwd.empty:
+        return {"col": col, "horizon": horizon, "buckets": []}
+    m = sig.merge(fwd, on=["code", "as_of"], how="inner").dropna(
+        subset=["fwd_ret", col])
+    if m.empty:
+        return {"col": col, "horizon": horizon, "buckets": []}
+    m = m.copy()
+    m["bucket"] = m["as_of"].str[:7]
+    buckets = []
+    for b, g in m.groupby("bucket"):
+        if len(g) < min_bucket:
+            continue
+        ic = g[col].rank(pct=True).corr(g["fwd_ret"].rank(pct=True))
+        buckets.append({"bucket": str(b), "ic": round(float(ic), 4),
+                        "n": int(len(g))})
+    return {"col": col, "horizon": horizon, "buckets": buckets}
+
+
+def profile_verdict(conn: sqlite3.Connection) -> dict:
+    """profile 切换判据（成文执行，杜绝事后人为挑赢家）。
+
+    - 样本 < MIN_SAMPLES 或 IC 不可算 → insufficient（维持现状，继续积累）；
+    - score h5 RankIC ≥ IC_KEEP → keep（当前 profile 正向预测力成立）；
+    - ≤ IC_SWITCH → switch（当前 profile 反向，建议切另一 profile）；
+    - 其间 → hold（证据不足，维持并继续积累）。
+    只输出建议——切换需人工确认后改 config.signals.profile 并留痕
+    （决策文档 §7 判据），不做自动切换。
+    """
+    from signals.signals import profile as _profile
+    prof = _profile()
+    other = "momentum" if prof == "reversal_lowvol" else "reversal_lowvol"
+    ic = factor_ic(conn)
+    n = int(ic.get("samples", 0))
+    h5 = (ic.get("ic") or {}).get("h5", {}).get("score")
+    if not ic.get("sufficient") or h5 is None:
+        verdict = "insufficient"
+    elif h5 >= IC_KEEP:
+        verdict = "keep"
+    elif h5 <= IC_SWITCH:
+        verdict = "switch"
+    else:
+        verdict = "hold"
+    return {"profile": prof, "samples": n, "score_ic_h5": h5,
+            "thresholds": {"keep_ge": IC_KEEP, "switch_le": IC_SWITCH},
+            "verdict": verdict,
+            "suggest_profile": prof if verdict != "switch" else other,
+            "note": "建议需人工确认后改 config.signals.profile（不自动切换）"}
+
+
 def evaluate(conn: sqlite3.Connection) -> dict:
     """完整评估包（供周报与看板引用）。"""
     return {
@@ -125,6 +186,9 @@ def evaluate(conn: sqlite3.Connection) -> dict:
         "score_quintiles_h5": score_quintiles(conn, 5),
         "pool_movers_h5": pool_eval(conn, "movers", 5),
         "pool_hot_stock_h5": pool_eval(conn, "hot_stock", 5),
+        "rolling_ic_score_h5": rolling_ic(conn, "score", 5),
+        "rolling_ic_mom5d_h5": rolling_ic(conn, "mom_5d", 5),
+        "profile_verdict": profile_verdict(conn),
     }
 
 

@@ -1,4 +1,5 @@
 """因子库：MA/RSI(Wilder)/ATR(Wilder)/动量/换手率分位/涨跌停幅度的纯函数，输入 pd.Series 或 numpy array，输出 float，数据长度不足返回 None。"""
+import math
 from typing import Optional
 
 import numpy as np
@@ -43,8 +44,12 @@ def rsi(close, period: int = 14) -> Optional[float]:
     return float(100.0 - 100.0 / (1.0 + rs))
 
 
-def atr(high, low, close, period: int = 14) -> Optional[float]:
-    """Wilder 平滑 ATR；至少需要 period+1 个点（首日 TR 用 high-low），否则 None。"""
+def atr_series(high, low, close, period: int = 14) -> Optional[pd.Series]:
+    """Wilder 平滑 ATR 全序列（与 atr() 同一种子与递推，供回测面板逐日取值）。
+
+    输入等长序列；返回与输入等长的 Series（前 period 个点为 NaN）。序列过短
+    （< period+1 个点）返回 None。
+    """
     h, l, c = _arr(high), _arr(low), _arr(close)
     if not (len(h) == len(l) == len(c)):
         raise ValueError("high/low/close 长度不一致")
@@ -52,10 +57,22 @@ def atr(high, low, close, period: int = 14) -> Optional[float]:
         return None
     prev_c = np.concatenate([[c[0]], c[:-1]])
     tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
+    out = np.full(len(tr), np.nan)
     val = float(tr[1:period + 1].mean())  # 用前 period 个完整 TR 作种子
+    out[period] = val
     for i in range(period + 1, len(tr)):
         val = (val * (period - 1) + float(tr[i])) / period
-    return float(val)
+        out[i] = val
+    return pd.Series(out, index=pd.RangeIndex(len(tr)))
+
+
+def atr(high, low, close, period: int = 14) -> Optional[float]:
+    """Wilder 平滑 ATR（最新值）；至少需要 period+1 个点（首日 TR 用 high-low），否则 None。"""
+    s = atr_series(high, low, close, period)
+    if s is None:
+        return None
+    v = float(s.iloc[-1])
+    return None if math.isnan(v) else v
 
 
 def mom(close, n: int = 20) -> Optional[float]:

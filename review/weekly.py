@@ -129,7 +129,7 @@ def ensure_benchmark(end_date: str, conn: Optional[sqlite3.Connection] = None,
                 if not rows:
                     last_err = f"{fn.__name__}: 空数据"
                     continue
-                conn.executemany("INSERT OR REPLACE INTO index_daily VALUES (?,?,?)", rows)
+                conn.executemany("INSERT OR REPLACE INTO index_daily (index_code, trade_date, close) VALUES (?,?,?)", rows)
                 conn.commit()
                 return {"ok": True, "source": fn.__name__, "rows": len(rows), "error": None}
             except Exception as e:

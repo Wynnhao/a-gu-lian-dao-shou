@@ -12,7 +12,7 @@ BASE = Path(__file__).resolve().parent.parent
 SLOW = {"test_execution.py", "test_ai_pipeline.py"}
 
 FILES = [
-    "test_risk_engine.py", "test_execution.py", "test_ai_pipeline.py",
+    "test_risk_engine.py", "test_regime.py", "test_execution.py", "test_ai_pipeline.py",
     "test_signals.py", "test_review.py", "test_news_macro.py",
     "test_quotes.py", "test_movers_hot.py", "test_webapp.py",
 ]

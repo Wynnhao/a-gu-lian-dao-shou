@@ -113,35 +113,83 @@ def test_limit_pct_by_board():
     assert limit_pct("000001") == 0.10
 
 
-# ---------- score profiles（reversal_lowvol 默认 / momentum 可选） ----------
+# ---------- score profiles（reversal_lowvol 截面 / momentum 时序） ----------
 
-def _synth_bars(closes, days=None):
+def _synth_bars(closes, days=None, code="600519", turnover=1.0):
     """由收盘序列构造升序 daily_bar DataFrame（high/low ±1%）。"""
     from datetime import date, timedelta
     d0 = date(2025, 1, 1)
     n = len(closes)
     return pd.DataFrame({
-        "code": "600519",
+        "code": code,
         "trade_date": [(d0 + timedelta(days=i)).isoformat() for i in range(n)],
         "open": [c * 0.999 for c in closes], "high": [c * 1.01 for c in closes],
         "low": [c * 0.99 for c in closes], "close": closes,
         "volume": [1000.0] * n, "amount": [c * 1000 for c in closes],
-        "pct_chg": [0.0] * n, "turnover": [1.0] * n,
+        "pct_chg": [0.0] * n, "turnover": [turnover] * n,
     })
 
 
-def test_score_reversal_default_prefers_dip_over_surged():
-    """默认 profile：短期暴跌票 score 应高于短期暴涨票（反转因子）。"""
+def test_rank01_basics():
+    """min-max rank 归一：单调、并列平均秩、单元素中性 0.5。"""
+    from signals.signals import _rank01
+    s = pd.Series([0.10, 0.30, 0.20], index=["a", "b", "c"])
+    r = _rank01(s)
+    assert abs(r["a"] - 0.0) < 1e-9 and abs(r["b"] - 1.0) < 1e-9 \
+        and abs(r["c"] - 0.5) < 1e-9
+    # 并列取平均秩：两个最小值 → 秩 1.5 → (1.5-1)/3 = 1/6
+    s2 = pd.Series([1.0, 1.0, 2.0, 3.0])
+    r2 = _rank01(s2)
+    assert abs(r2.iloc[0] - 1.0 / 6) < 1e-9 and abs(r2.iloc[1] - 1.0 / 6) < 1e-9
+    # 单元素截面 → 中性
+    r3 = _rank01(pd.Series([7.0], index=["x"]))
+    assert abs(r3["x"] - 0.5) < 1e-9
+
+
+def test_score_xs_reversal_prefers_dip_in_cross_section():
+    """截面打分：同池中短期暴跌票 score 应高于短期暴涨票（反转因子主导）。"""
     import signals.signals as sig
     assert sig.profile() == "reversal_lowvol"
     base = [100.0] * 70
-    up = sig.compute_signal("600519", pool=_synth_bars(base + [115.0] * 5))
-    down = sig.compute_signal("600519", pool=_synth_bars(base + [85.0] * 5))
+    pool = pd.concat([
+        _synth_bars(base + [115.0] * 5, code="600519"),
+        _synth_bars(base + [85.0] * 5, code="000001"),
+    ], ignore_index=True)
+    up = sig.compute_signal("600519", pool=pool)
+    down = sig.compute_signal("000001", pool=pool)
+    assert 0.0 <= up["score"] <= 1.0 and 0.0 <= down["score"] <= 1.0
     assert down["score"] > up["score"], (down["score"], up["score"])
+    # 截面 rank 已写入 JSON
+    assert "score_parts" in down["signals"]
+    assert down["signals"]["score_parts"]["rev_rank"] > \
+        up["signals"]["score_parts"]["rev_rank"]
+
+
+def test_score_xs_missing_factor_renormalizes():
+    """缺某因子 → 该因子权重剔除重归一化：score 等于可用因子 rank 的加权和。"""
+    import signals.signals as sig
+    m5 = pd.Series({"a": -0.10, "b": 0.0, "c": 0.10})
+    atrp = pd.Series({"a": 0.02, "b": 0.03, "c": 0.04})
+    turn20 = pd.Series({"a": None, "b": 1.0, "c": 2.0}, dtype=float)
+    score, parts = sig.score_reversal_lowvol_xs(m5, atrp, turn20)
+    # a 缺换手：反转 rank 1.0 + 低波 rank 1.0 → (0.40+0.35)/0.75 = 1.0
+    assert abs(score["a"] - 1.0) < 1e-9
+    # c：反转 rank 0、低波 rank 0、换手最高 rank 0 → 0.0
+    assert abs(score["c"] - 0.0) < 1e-9
+    # b：三因子全有 → 0.40×0.5 + 0.35×0.5 + 0.25×1.0（换手最低 rank 1）= 0.625
+    assert abs(score["b"] - 0.625) < 1e-9
+
+
+def test_score_xs_single_stock_neutral():
+    """单票截面无排序信息 → 中性 0.5（旧 clip 口径在单票上会给出极端分，已修）。"""
+    import signals.signals as sig
+    score, _ = sig.score_reversal_lowvol_xs(
+        pd.Series({"a": -0.2}), pd.Series({"a": 0.01}), pd.Series({"a": 0.5}))
+    assert abs(score["a"] - 0.5) < 1e-9
 
 
 def test_score_momentum_profile_prefers_surged():
-    """momentum profile：暴涨票 score 应高于暴跌票（与反转相反）。"""
+    """momentum profile（时序口径）：暴涨票 score 应高于暴跌票（与反转相反）。"""
     import signals.signals as sig
     orig = sig.profile
     sig.profile = lambda: "momentum"
@@ -152,6 +200,70 @@ def test_score_momentum_profile_prefers_surged():
         assert up["score"] > down["score"], (up["score"], down["score"])
     finally:
         sig.profile = orig
+
+
+def test_atr_uses_full_qfq_ohlc_when_available():
+    """ATR 口径：high/low/close 前复权齐全 → 全复权（atr_basis=qfq）；
+    混用 raw H/L 与复权 C 的旧做法在除权日产生假 TR，已修。"""
+    import signals.signals as sig
+    bars = _synth_bars([100.0] * 40)
+    bars["close_qfq"] = bars["close"]
+    bars["high_qfq"] = bars["high"]
+    bars["low_qfq"] = bars["low"]
+    h, l, c, basis = sig._factor_ohlc(bars)
+    assert basis == "qfq"
+    # 部分缺失 → 整体回退不复权
+    bars2 = bars.copy()
+    bars2.loc[bars2.index[:20], "high_qfq"] = None
+    h2, l2, c2, basis2 = sig._factor_ohlc(bars2)
+    assert basis2 == "raw"
+
+
+def test_atr_series_matches_scalar_atr():
+    """atr_series 与标量 atr 同种子同递推：末值一致。"""
+    from signals.factors import atr, atr_series
+    rng = np.random.default_rng(11)
+    close = 100 + np.cumsum(rng.normal(0, 1, 120))
+    high, low = close + 1.0, close - 1.0
+    s = atr_series(high, low, close, 14)
+    assert s is not None and s.iloc[:14].isna().all() and not math.isnan(s.iloc[14])
+    assert abs(float(s.iloc[-1]) - atr(high, low, close, 14)) < 1e-12
+
+
+def test_backfill_history_synthetic_db():
+    """全史回填：逐日重算并入 signal 表，行数=交易日×票数，幂等重跑覆盖。"""
+    import sqlite3
+    import signals.signals as sig
+    from data.fetcher import DDL
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(DDL)
+    from datetime import date, timedelta
+    d0 = date(2025, 1, 1)
+    dates = [(d0 + timedelta(days=i)).isoformat() for i in range(40)]
+    for code, drift in (("600519", 0.05), ("000001", -0.05)):
+        closes = [100.0]
+        for i in range(39):
+            closes.append(closes[-1] * (1 + (drift if i % 3 else -drift / 2)))
+        for i, d in enumerate(dates):
+            c = closes[i]
+            conn.execute(
+                "INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
+                " volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (code, d, c * 0.999, c * 1.01, c * 0.99, c, 1000.0, c * 1000, 0.0, 1.0))
+        conn.execute("INSERT INTO stock_info VALUES (?,?,?,?)",
+                     (code, code, (d0 - timedelta(days=200)).isoformat(), "x"))
+    conn.commit()
+    n = sig.backfill_history(conn=conn)
+    assert n == 40 * 2
+    rows = conn.execute("SELECT COUNT(*) FROM signal").fetchone()[0]
+    assert rows == n
+    # 幂等：重跑行数不变
+    n2 = sig.backfill_history(conn=conn)
+    assert n2 == n and conn.execute("SELECT COUNT(*) FROM signal").fetchone()[0] == n
+    # 每日截面分数合法
+    lo, hi = conn.execute("SELECT MIN(score), MAX(score) FROM signal").fetchone()
+    assert 0.0 <= lo <= 1.0 and 0.0 <= hi <= 1.0
+    conn.close()
 
 
 def test_factor_close_prefers_qfq():
@@ -202,7 +314,7 @@ def test_compute_all_synthetic_db():
         for k, v in res["signals"].items():
             if isinstance(v, float):
                 assert not math.isnan(v), f"{res['code']}.{k} 是 NaN"
-            assert v is None or isinstance(v, (int, float, str, bool))
+            assert v is None or isinstance(v, (int, float, str, bool, dict, list))
         assert res["signals"]["ma_trend"] in ("up", "down", "flat")
         assert isinstance(res["signals"]["above_ma60"], bool)
         assert type(res["score"]) is float
