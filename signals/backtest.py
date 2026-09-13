@@ -1,4 +1,18 @@
-"""P2.4 信号回测：2024-01-02 至最新交易日，每周最后交易日收盘按 mom 动量等权调仓，双边成本合计 0.15%（买卖各 0.075%），对比沪深300。"""
+"""P2.4 信号回测：周调仓等权组合 vs 沪深300，双 profile 对比。
+
+2026-09 修复（此前回测四重虚高来源）：
+1. 可成交口径——入选日封死涨停（close ≥ 涨停价）跳过、ffill 停牌超 5 日剔除、
+   成交额地板 5000 万（动量入选者天然集中在涨停票上，是回测虚高的头号来源，
+   策略库 §4 自己指出了但旧代码没实现）；
+2. 成本模型与执行层统一——佣金 0.025% 双边 + 印花税 0.05% 卖出 + 滑点 10bps，
+   旧模型单边 0.075% 且无滑点；
+3. 回测对象改为生产 score 的两个 profile（momentum / reversal_lowvol）对比，
+   不再自动挑参（旧逻辑"不过关就从备选挑第一组达标"是样本内过拟合）；
+4. 输出分年度收益与滑点敏感性区间，不再只给单点数字。
+
+已知限制：回测宇宙仍是 daily_bar 中的票（当前=自选池 30 只，事后人工挑选、
+幸存者偏差大）；中证 800 宇宙回补待东财接口解封后执行（见 docs/优化修复纪要.md）。
+"""
 import sys
 from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
@@ -22,11 +36,13 @@ log.addHandler(logging.FileHandler(BASE / "logs" / "signal.log", encoding="utf-8
 log.propagate = False
 
 START = "2024-01-02"
-COST_SIDE = 0.00075          # 单边 0.075%，双边合计 0.15%
-DEFAULT_PARAMS = (20, "mom>0")
-# 验收不达标时的备选参数（窗口 {10,30} + 过滤阈值 mom>截面中位数），合计补试 ≤3 组
-ALTERNATE_PARAMS = [(10, "mom>0"), (30, "mom>0"), (20, "mom>median")]
 ANN_DAYS = 252
+COMMISSION = 0.00025     # 双边佣金（与 config.execution 一致）
+STAMP_TAX = 0.0005       # 卖出印花税
+SLIPPAGE = 0.001         # 滑点 10bps（默认档，敏感性 ±50%）
+AMOUNT_FLOOR = 5e7       # 流动性地板：成交额 < 5000 万不入选
+MAX_STALE_DAYS = 5       # 停牌（ffill）超过 5 日的票不入选
+TOP_N = 5                # 等权持仓数
 
 
 def _fetch_index_em(conn) -> int:
@@ -84,47 +100,100 @@ def _metrics(nav: pd.Series) -> Tuple[float, float, float]:
     return total, ann, mdd
 
 
-def run_backtest(pool: pd.DataFrame, idx_close: pd.Series,
-                 mom_window: int, filt: str) -> dict:
-    """周调仓动量策略：调仓日收盘选 mom 达标者等权，空仓持币合法，权重在期内随涨跌漂移。"""
-    wide = pool.pivot(index="trade_date", columns="code", values="close").sort_index()
-    wide = wide.ffill()
-    wide = wide.loc[(wide.index >= START) & (wide.index <= idx_close.index.max())]
-    rets = wide.pct_change(fill_method=None)
-    mom_w = wide / wide.shift(mom_window) - 1.0
-    dates = list(wide.index)
+def _limit_up_price(prev_close: float, code: str) -> float:
+    pct = 0.20 if str(code).startswith(("30", "68")) else 0.10
+    return float(prev_close) * (1 + pct)
 
-    # 每周最后一个交易日（ISO 周分组取组内最大交易日）；动量窗口未填满的周不调仓
+
+def _per_year(nav: pd.Series) -> dict:
+    """分年度收益拆解。"""
+    out = {}
+    for y, seg in nav.groupby(nav.index.year):
+        if len(seg) < 2:
+            continue
+        out[str(y)] = round(float(seg.iloc[-1] / seg.iloc[0] - 1.0), 4)
+    return out
+
+
+def run_backtest(pool: pd.DataFrame, idx_close: pd.Series, strategy: str = "reversal_lowvol",
+                 top_n: int = TOP_N, slippage: float = SLIPPAGE) -> dict:
+    """周调仓 Top-N 等权策略（含可成交口径），空仓持币合法，权重期内随价格漂移。
+
+    strategy: momentum = 20日动量 TopN（正向）；reversal_lowvol = 5日反转 + 低波动
+    综合分 TopN（生产 reversal_lowvol score 的日线代理口径）。
+    """
+    wide = pool.pivot(index="trade_date", columns="code", values="close").sort_index()
+    valid = wide.notna()                       # 原始非缺失掩码（判停牌 ffill 陈旧度）
+    wide = wide.ffill()
+    amt = (pool.pivot(index="trade_date", columns="code", values="amount")
+           .sort_index().reindex(wide.index).ffill())
+    wide = wide.loc[(wide.index >= START) & (wide.index <= idx_close.index.max())]
+    valid = valid.reindex(wide.index).fillna(False)
+    amt = amt.reindex(wide.index)
+    rets = wide.pct_change(fill_method=None)
+    win = 20 if strategy == "momentum" else 5
+    mom_w = wide / wide.shift(win) - 1.0
+    vol20 = rets.rolling(20).std()
+
+    dates = list(wide.index)
     tmp = pd.DataFrame({"d": dates, "w": pd.PeriodIndex(dates, freq="W").astype(str)})
     rebal_dates = [d for d in tmp.groupby("w")["d"].max()
                    if bool(mom_w.loc[d].notna().any())]
 
-    v, w = 1.0, {}                     # 净值、持仓权重（随价格漂移）
+    def tradable(d, code) -> bool:
+        """可成交口径：未停牌超限、成交额达地板、未封死涨停。"""
+        loc = wide.index.get_loc(d)
+        if loc == 0:
+            return False
+        stale = 0
+        for j in range(loc, -1, -1):
+            if bool(valid.iloc[j][code]):
+                break
+            stale += 1
+        if stale > MAX_STALE_DAYS:
+            return False
+        a = amt.loc[d, code] if code in amt.columns else None
+        if a is None or pd.isna(a) or float(a) < AMOUNT_FLOOR:
+            return False
+        prev = float(wide.iloc[loc - 1][code])
+        cur = float(wide.loc[d, code])
+        if cur >= _limit_up_price(prev, code) - 1e-9:
+            return False                        # 封死涨停，买不进
+        return True
+
+    c_buy = COMMISSION + slippage
+    c_sell = COMMISSION + STAMP_TAX + slippage
+    avg_side = (c_buy + c_sell) / 2.0
+
+    v, w = 1.0, {}
     nav_d = {}
     for d in dates:
-        # 审查 P1-2 修复：先用【旧权重】结算 d 日收益，收盘后再切换新权重——
-        # 否则新组合会吃到据以选股的 d 日当日涨幅（look-ahead）。
         r = float((rets.loc[d] * pd.Series(w)).fillna(0.0).sum()) if w else 0.0
         v *= (1.0 + r)
         if w and r != 0.0:
             w = {c: wi * (1.0 + _safe(rets, d, c)) / (1.0 + r) for c, wi in w.items()}
         if d in rebal_dates:
             m = mom_w.loc[d].dropna()
-            if filt == "mom>median" and len(m) >= 2:
-                sel = m[m > m.median()].index.tolist()
+            if strategy == "momentum":
+                ranked = m[m > 0.0].sort_values(ascending=False)
             else:
-                sel = m[m > 0.0].index.tolist()
+                # 反转+低波综合分：5日跌幅越深分越高，同等跌幅下波动越低越优
+                rev = -m
+                vol = vol20.loc[d].reindex(rev.index)
+                score = rev.rank(pct=True) + (1.0 - vol.rank(pct=True, na_option="bottom"))
+                ranked = score.sort_values(ascending=False)
+            sel = [c for c in ranked.index if tradable(d, c)][:top_n]
             target = {c: 1.0 / len(sel) for c in sel}
             turnover = sum(abs(target.get(c, 0.0) - w.get(c, 0.0))
                            for c in set(target) | set(w))
-            v *= (1.0 - COST_SIDE * turnover)   # 买卖双边各 0.075%
+            v *= (1.0 - avg_side * turnover)
             w = target
         nav_d[d] = v
     nav = pd.Series(nav_d)
 
     st_total, st_ann, st_mdd = _metrics(nav)
     bench = idx_close.reindex(nav.index).dropna()
-    b_total, b_ann, b_mdd = _metrics(bench / bench.iloc[0])  # 归一到净值口径再算年化
+    b_total, b_ann, b_mdd = _metrics(bench / bench.iloc[0])
 
     if w:
         w_sum = sum(w.values())
@@ -136,16 +205,21 @@ def run_backtest(pool: pd.DataFrame, idx_close: pd.Series,
                  "cash_weight": 1.0}
 
     return {
-        "params": {"mom_window": mom_window, "filter": filt,
-                   "cost_round_trip_pct": COST_SIDE * 200},
+        "strategy": strategy,
+        "params": {"top_n": top_n, "cost_model": "commission 0.025%% + stamp 0.05%%(sell)"
+                                                   " + slippage %.0fbps" % (slippage * 1e4),
+                   "amount_floor": AMOUNT_FLOOR, "max_stale_days": MAX_STALE_DAYS,
+                   "tradable_filter": True},
         "window": {"start": str(nav.index[0]), "end": str(nav.index[-1]),
                    "trading_days": int(len(nav) - 1)},
-        "strategy": {"total_return": round(st_total, 4),
-                     "annual_return": round(st_ann, 4),
-                     "max_drawdown": round(st_mdd, 4)},
+        "strategy_perf": {"total_return": round(st_total, 4),
+                          "annual_return": round(st_ann, 4),
+                          "max_drawdown": round(st_mdd, 4),
+                          "per_year": _per_year(nav)},
         "benchmark_hs300": {"total_return": round(b_total, 4),
                             "annual_return": round(b_ann, 4),
-                            "max_drawdown": round(b_mdd, 4)},
+                            "max_drawdown": round(b_mdd, 4),
+                            "per_year": _per_year(bench / bench.iloc[0])},
         "rebalance_count": len(rebal_dates),
         "final_holdings": final,
         "pass": bool(st_ann > b_ann and st_mdd > -0.25),
@@ -161,32 +235,42 @@ def _safe(rets: pd.DataFrame, d, c) -> float:
 def main():
     conn = get_conn()
     ensure_benchmark(conn)
-    pool = pd.read_sql("SELECT code, trade_date, close FROM daily_bar", conn)
+    pool = pd.read_sql("SELECT code, trade_date, close, amount FROM daily_bar", conn)
     idx = pd.read_sql("SELECT trade_date, close FROM index_daily WHERE index_code='000300' "
                       "ORDER BY trade_date", conn)
     conn.close()
     pool["close"] = pool["close"].astype(float)
+    pool["amount"] = pd.to_numeric(pool["amount"], errors="coerce")
     idx_close = idx.set_index("trade_date")["close"].astype(float)
 
-    tried: List[dict] = []
-    result = run_backtest(pool, idx_close, *DEFAULT_PARAMS)
-    tried.append({"params": result["params"], "pass": result["pass"],
-                  "annual_return": result["strategy"]["annual_return"]})
-    if not result["pass"]:  # 只允许 ≤3 组备选小范围重试
-        for cand in ALTERNATE_PARAMS:
-            result = run_backtest(pool, idx_close, *cand)
-            tried.append({"params": result["params"], "pass": result["pass"],
-                          "annual_return": result["strategy"]["annual_return"]})
-            if result["pass"]:
-                break
-    result["tried_params"] = tried
-    if not result["pass"]:
-        log.warning("全部参数组均未达标，如实输出（小池子分散不足是已知限制）")
+    results = {"generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "profiles": {}, "notes": [
+                   "回测宇宙仍为 daily_bar 内票池（幸存者偏差），中证800 宇宙回补待数据源解封",
+                   "momentum 与 reversal_lowvol 均为样本内结果，置信度打折看（策略库 §9）"]}
+    for strat in ("momentum", "reversal_lowvol"):
+        r = run_backtest(pool, idx_close, strategy=strat)
+        results["profiles"][strat] = r
+        log.info("回测 %s: ann=%.2f%% mdd=%.2f%% pass=%s",
+                 strat, r["strategy_perf"]["annual_return"] * 100,
+                 r["strategy_perf"]["max_drawdown"] * 100, r["pass"])
+    # 滑点敏感性（生产默认 profile ±50%）
+    base = results["profiles"]["reversal_lowvol"]
+    sens = {}
+    for s in (SLIPPAGE * 0.5, SLIPPAGE, SLIPPAGE * 1.5):
+        r = run_backtest(pool, idx_close, strategy="reversal_lowvol", slippage=s)
+        sens["%.0fbps" % (s * 1e4)] = r["strategy_perf"]["annual_return"]
+    base["slippage_sensitivity_annual"] = sens
 
-    out = json.dumps(result, ensure_ascii=False, indent=2)
+    try:
+        cfg = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+        results["selected_profile"] = cfg.get("signals", {}).get("profile",
+                                                                 "reversal_lowvol")
+    except Exception:  # noqa: BLE001
+        results["selected_profile"] = "reversal_lowvol"
+
+    out = json.dumps(results, ensure_ascii=False, indent=2)
     (BASE / "logs" / "backtest_result.json").write_text(out, encoding="utf-8")
     print(out)
-    log.info("回测完成: params=%s pass=%s", result["params"], result["pass"])
 
 
 if __name__ == "__main__":

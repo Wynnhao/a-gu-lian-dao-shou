@@ -11,7 +11,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from data.fetcher import get_conn
+from data.fetcher import get_conn  # noqa: F401  (保留给外部工具，测试已改用 :memory:)
 from signals.factors import atr, limit_pct, ma, mom, rsi, turnover_pct
 from signals.signals import compute_all
 
@@ -113,13 +113,87 @@ def test_limit_pct_by_board():
     assert limit_pct("000001") == 0.10
 
 
-# ---------- 真实 DB：compute_all ----------
-def test_compute_all_real_db():
-    conn = get_conn()
-    results = compute_all(conn=conn)
-    conn.close()
-    assert isinstance(results, list) and len(results) >= 1
+# ---------- score profiles（reversal_lowvol 默认 / momentum 可选） ----------
 
+def _synth_bars(closes, days=None):
+    """由收盘序列构造升序 daily_bar DataFrame（high/low ±1%）。"""
+    from datetime import date, timedelta
+    d0 = date(2025, 1, 1)
+    n = len(closes)
+    return pd.DataFrame({
+        "code": "600519",
+        "trade_date": [(d0 + timedelta(days=i)).isoformat() for i in range(n)],
+        "open": [c * 0.999 for c in closes], "high": [c * 1.01 for c in closes],
+        "low": [c * 0.99 for c in closes], "close": closes,
+        "volume": [1000.0] * n, "amount": [c * 1000 for c in closes],
+        "pct_chg": [0.0] * n, "turnover": [1.0] * n,
+    })
+
+
+def test_score_reversal_default_prefers_dip_over_surged():
+    """默认 profile：短期暴跌票 score 应高于短期暴涨票（反转因子）。"""
+    import signals.signals as sig
+    assert sig.profile() == "reversal_lowvol"
+    base = [100.0] * 70
+    up = sig.compute_signal("600519", pool=_synth_bars(base + [115.0] * 5))
+    down = sig.compute_signal("600519", pool=_synth_bars(base + [85.0] * 5))
+    assert down["score"] > up["score"], (down["score"], up["score"])
+
+
+def test_score_momentum_profile_prefers_surged():
+    """momentum profile：暴涨票 score 应高于暴跌票（与反转相反）。"""
+    import signals.signals as sig
+    orig = sig.profile
+    sig.profile = lambda: "momentum"
+    try:
+        base = [100.0] * 70
+        up = sig.compute_signal("600519", pool=_synth_bars(base + [115.0] * 5))
+        down = sig.compute_signal("600519", pool=_synth_bars(base + [85.0] * 5))
+        assert up["score"] > down["score"], (up["score"], down["score"])
+    finally:
+        sig.profile = orig
+
+
+def test_factor_close_prefers_qfq():
+    """close_qfq 存在时因子用前复权价：除权日的 -50% 假暴跌不再污染动量。"""
+    bars = _synth_bars([100.0] * 30)
+    bars["close_qfq"] = bars["close"]  # 未除权：两列相同
+    bars.loc[bars.index[-1], "close"] = 50.0   # 模拟 10送10 除权后的不复权价
+    bars.loc[bars.index[-1], "close_qfq"] = 100.0  # 复权口径无跳变
+    import signals.signals as sig
+    m_raw = sig.mom(bars["close"], 5)
+    m_qfq = sig.mom(sig._factor_close(bars), 5)
+    assert abs(m_raw + 0.5) < 1e-6             # 不复权：假暴跌 -50%
+    assert abs(m_qfq) < 1e-6                   # 前复权：动量为 0
+
+
+# ---------- compute_all（:memory: 合成库，不触碰生产 market.db——审查 P2-7 修复） ----------
+
+def test_compute_all_synthetic_db():
+    import sqlite3
+    from data.fetcher import DDL
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(DDL)
+    n = 0
+    for code, closes in (("600519", [100.0 + i for i in range(70)]),
+                         ("000001", [20.0 - i * 0.05 for i in range(70)])):
+        bars = _synth_bars(closes).copy()
+        bars["code"] = code
+        for _, r in bars.iterrows():
+            conn.execute(
+                "INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
+                " volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (r["code"], r["trade_date"], r["open"], r["high"], r["low"], r["close"],
+                 r["volume"], r["amount"], r["pct_chg"], r["turnover"]))
+        # 上市 200 天（远离 60 日次新黑名单线）
+        from datetime import date, timedelta
+        conn.execute("INSERT INTO stock_info VALUES (?,?,?,?)",
+                     (code, code, (date(2025, 1, 1) - timedelta(days=200)).isoformat(), "x"))
+        n += 1
+    conn.commit()
+    results = compute_all(conn=conn)
+    assert isinstance(results, list) and len(results) == n
+    assert {r["code"] for r in results} == {"600519", "000001"}
     for res in results:
         # JSON 可序列化且禁止 NaN/Inf 混入（allow_nan=False 会拒绝 NaN）
         s = json.dumps(res, ensure_ascii=False, allow_nan=False)
@@ -128,18 +202,14 @@ def test_compute_all_real_db():
         for k, v in res["signals"].items():
             if isinstance(v, float):
                 assert not math.isnan(v), f"{res['code']}.{k} 是 NaN"
-            # None 因子必须是显式 null（json 里合法），不允许 numpy 类型
             assert v is None or isinstance(v, (int, float, str, bool))
         assert res["signals"]["ma_trend"] in ("up", "down", "flat")
         assert isinstance(res["signals"]["above_ma60"], bool)
-        # pd.read_sql 出来的数值可能是 numpy 类型，检查已转成 Python float
         assert type(res["score"]) is float
-
-    # 与 signal 表内容一致（每票最新 as_of 各一行）
-    conn = get_conn()
-    n = conn.execute("SELECT COUNT(*) FROM signal").fetchone()[0]
+    # 与 signal 表内容一致
+    got = conn.execute("SELECT COUNT(*) FROM signal").fetchone()[0]
+    assert got == len(results)
     conn.close()
-    assert n >= len(results)
 
 
 if __name__ == "__main__":

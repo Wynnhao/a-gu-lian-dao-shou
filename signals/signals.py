@@ -1,9 +1,20 @@
-"""信号层：按技术方案 §3 P2.3 输出个股技术信号 JSON 并入库；score 为 0~1 加权合成。
+"""信号层：输出个股技术信号 JSON 并入库；score 为 0~1 加权合成，支持双 profile。
 
-score 权重（写死）：趋势方向 0.35（up=1.0 / flat=0.5 / down=0.0，要求 MA5/20/60 齐全）；
-20日动量 0.40（0.5 + mom_20d/0.30 截断到 [0,1]，即 ±15% 动量映射到满/零分，含符号与幅度）；
-RSI 健康 0.25（30~70 区间内 =1.0，区间外 =0.0，二值）。
-任一因子缺失时按剩余因子权重重归一化；全部缺失时 score 取中性 0.5。
+score profiles（config.signals.profile 切换）：
+
+- `reversal_lowvol`（默认，落地 docs/策略库.md Top1 结论）：
+  短期反转 0.40（5日动量反向：clip(0.5 - mom5/REV_SPAN)）+ 低波动 0.35
+  （ATR占价比反向）+ 低换手 0.25（换手分位反向）。
+  依据：策略库 §2——A 股 2015-2025 中期价格动量 IC 为负、短期反转/低波动/低换手
+  显著有效。旧 profile 的 20 日正向动量与自有研究结论相反，降为可选项。
+
+- `momentum`（旧版保留）：趋势方向 0.35 + 20日动量 0.40（正向）+ RSI 健康 0.25
+  （RSI 连续衰减 1-|RSI-50|/50，替代原 30~70 二值跳变）。
+
+权重未经实证校准（signal 表历史尚短），review/signal_eval.py 会随数据积累输出
+IC/分层验证，届时用证据重校。任一因子缺失按剩余权重重归一化；全缺取中性 0.5。
+
+因子价格口径：优先用前复权 close_qfq（除权除息不污染动量/均线/新高），缺失回退不复权。
 """
 import sys
 from pathlib import Path
@@ -29,11 +40,26 @@ log = logging.getLogger("signals")
 log.addHandler(logging.FileHandler(BASE / "logs" / "signal.log", encoding="utf-8"))
 log.propagate = False  # 只写 signal.log，不串到 fetcher 的 root handler
 
-# 权重与参数（与模块 docstring 一致，勿随手改）
+PROFILES = ("reversal_lowvol", "momentum")
+# momentum（旧）：趋势 / 20日动量 / RSI 健康
 W_TREND, W_MOM, W_RSI = 0.35, 0.40, 0.25
 MOM_SPAN = 0.30          # mom 映射斜率：score = clip(0.5 + mom/MOM_SPAN, 0, 1)
 RSI_HEALTH = (30.0, 70.0)
+# reversal_lowvol（新默认）：短期反转 / 低波动 / 低换手
+W_REV, W_LOWVOL, W_LOTURNOVER = 0.40, 0.35, 0.25
+REV_SPAN = 0.15          # 5日动量映射斜率：score = clip(0.5 - mom5/REV_SPAN, 0, 1)
+VOL_SPAN = 0.05          # ATR/收盘 占价比映射：score = clip(1 - atr_pct/VOL_SPAN, 0, 1)
 TURNOVER_WINDOW = 250
+
+
+def profile() -> str:
+    """当前 score profile（config.signals.profile，缺省 reversal_lowvol）。"""
+    try:
+        cfg = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+        p = cfg.get("signals", {}).get("profile", "reversal_lowvol")
+        return p if p in PROFILES else "reversal_lowvol"
+    except Exception:  # noqa: BLE001
+        return "reversal_lowvol"
 
 
 def _f(x) -> Optional[float]:
@@ -47,6 +73,49 @@ def _f(x) -> Optional[float]:
     return None if math.isnan(v) else v
 
 
+def _factor_close(bars: pd.DataFrame) -> pd.Series:
+    """因子用收盘价：前复权 close_qfq 优先（除权除息日不产生假暴跌），缺失回退不复权。"""
+    if "close_qfq" in bars.columns:
+        qfq = pd.to_numeric(bars["close_qfq"], errors="coerce")
+        if qfq.notna().any():
+            return qfq.fillna(pd.to_numeric(bars["close"], errors="coerce"))
+    return pd.to_numeric(bars["close"], errors="coerce")
+
+
+def _clip01(x: float) -> float:
+    return min(max(x, 0.0), 1.0)
+
+
+def _score_reversal_lowvol(m5, atr_pct, tp) -> tuple:
+    """反转+低波+低换手三因子加权，缺谁去掉谁的权重（重归一化）。返回 (score, den)。"""
+    num, den = 0.0, 0.0
+    if m5 is not None:
+        num += W_REV * _clip01(0.5 - m5 / REV_SPAN)
+        den += W_REV
+    if atr_pct is not None:
+        num += W_LOWVOL * _clip01(1.0 - atr_pct / VOL_SPAN)
+        den += W_LOWVOL
+    if tp is not None:
+        num += W_LOTURNOVER * (1.0 - tp)  # 换手分位越低分越高
+        den += W_LOTURNOVER
+    return (num / den if den > 0 else 0.5), den
+
+
+def _score_momentum(trend, m, r) -> float:
+    """旧三因子：趋势 / 20日动量正向 / RSI 连续健康度。"""
+    num, den = 0.0, 0.0
+    if trend is not None:
+        num += W_TREND * {"up": 1.0, "flat": 0.5, "down": 0.0}[trend]
+        den += W_TREND
+    if m is not None:
+        num += W_MOM * _clip01(0.5 + m / MOM_SPAN)
+        den += W_MOM
+    if r is not None:
+        num += W_RSI * (1.0 - abs(r - 50.0) / 50.0)  # 连续衰减，替代 30~70 二值
+        den += W_RSI
+    return num / den if den > 0 else 0.5
+
+
 def _signal_from_bars(bars: pd.DataFrame, code: str, as_of: Optional[str]) -> dict:
     """对单只票的截至 as_of 日线序列计算信号 dict（bars 需按 trade_date 升序）。"""
     if as_of is not None:
@@ -55,10 +124,11 @@ def _signal_from_bars(bars: pd.DataFrame, code: str, as_of: Optional[str]) -> di
     if bars.empty:
         raise ValueError(f"{code} 在 as_of={as_of} 前无行情数据")
 
-    close = bars["close"].reset_index(drop=True)
-    high = bars["high"].reset_index(drop=True)
-    low = bars["low"].reset_index(drop=True)
-    to = bars["turnover"].reset_index(drop=True)
+    close = _factor_close(bars).reset_index(drop=True)
+    raw_close = pd.to_numeric(bars["close"], errors="coerce").reset_index(drop=True)
+    high = pd.to_numeric(bars["high"], errors="coerce").reset_index(drop=True)
+    low = pd.to_numeric(bars["low"], errors="coerce").reset_index(drop=True)
+    to = pd.to_numeric(bars["turnover"], errors="coerce").reset_index(drop=True)
 
     ma5, ma20, ma60 = ma(close, 5), ma(close, 20), ma(close, 60)
     if ma5 is not None and ma20 is not None and ma60 is not None:
@@ -68,30 +138,32 @@ def _signal_from_bars(bars: pd.DataFrame, code: str, as_of: Optional[str]) -> di
     r = rsi(close, 14)
     a = atr(high, low, close, 14)
     m = mom(close, 20)
+    m5 = mom(close, 5)
     tp = turnover_pct(to, TURNOVER_WINDOW)
     last = bars.iloc[-1]
+    last_close = _f(raw_close.iloc[-1]) or 0.0
+    atr_pct = (a / last_close) if (a is not None and last_close > 0) else None
 
     signals = {
         "ma_trend": trend,
         "ma5": _f(ma5), "ma20": _f(ma20), "ma60": _f(ma60),
-        "rsi_14": _f(r), "atr_14": _f(a),
-        "mom_20d": _f(m), "turnover_pct": _f(tp),
-        "above_ma60": bool(_f(ma60) is not None and float(last["close"]) > _f(ma60)),
-        "close": _f(last["close"]), "pct_chg": _f(last["pct_chg"]),
+        "rsi_14": _f(r), "atr_14": _f(a), "atr_pct": _f(atr_pct),
+        "mom_20d": _f(m), "mom_5d": _f(m5), "turnover_pct": _f(tp),
+        "above_ma60": bool(_f(ma60) is not None and last_close > _f(ma60)),
+        "close": _f(last_close), "pct_chg": _f(last["pct_chg"]),
+        "adj_close": _f(close.iloc[-1]),
     }
+    if "close_qfq" in bars.columns and pd.to_numeric(
+            bars["close_qfq"], errors="coerce").notna().any():
+        signals["price_basis"] = "qfq"
+    else:
+        signals["price_basis"] = "raw"
 
-    # score：三因子加权，缺谁去掉谁的权重（重归一化）
-    num, den = 0.0, 0.0
-    if ma5 is not None and ma20 is not None and ma60 is not None:
-        num += W_TREND * {"up": 1.0, "flat": 0.5, "down": 0.0}[trend]
-        den += W_TREND
-    if m is not None:
-        num += W_MOM * min(max(0.5 + m / MOM_SPAN, 0.0), 1.0)
-        den += W_MOM
-    if r is not None:
-        num += W_RSI * (1.0 if RSI_HEALTH[0] <= r <= RSI_HEALTH[1] else 0.0)
-        den += W_RSI
-    score = (num / den) if den > 0 else 0.5  # 全缺时中性
+    if profile() == "momentum":
+        score = _score_momentum(trend if ma5 is not None else None, m, r)
+    else:
+        score, _den = _score_reversal_lowvol(m5, atr_pct, tp)
+        signals["score_profile"] = "reversal_lowvol"
 
     return {"code": str(code), "signals": signals,
             "score": round(float(score), 4),
@@ -138,7 +210,8 @@ def compute_all(as_of: Optional[str] = None, conn=None) -> list:
     c.commit()
     if own:
         c.close()
-    log.info("compute_all %s 票，耗时 %.2fs", len(results), time.time() - t0)
+    log.info("compute_all %s 票（profile=%s），耗时 %.2fs",
+             len(results), profile(), time.time() - t0)
     return results
 
 
@@ -154,9 +227,9 @@ def main():
     else:
         for r in results:
             s = r["signals"]
-            log.info("%s as_of=%s trend=%s score=%.3f mom=%.3f rsi=%.1f close=%.2f",
+            log.info("%s as_of=%s trend=%s score=%.3f mom5=%.3f rsi=%.1f close=%.2f",
                      r["code"], r["as_of"], s["ma_trend"], r["score"],
-                     s["mom_20d"] if s["mom_20d"] is not None else float("nan"),
+                     s["mom_5d"] if s["mom_5d"] is not None else float("nan"),
                      s["rsi_14"] if s["rsi_14"] is not None else float("nan"),
                      s["close"] if s["close"] is not None else float("nan"))
 

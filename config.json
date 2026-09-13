@@ -89,5 +89,8 @@
     "start_date": "20240101",
     "source_cooldown_min": 30,
     "source_max_fail": 5
+  },
+  "signals": {
+    "profile": "reversal_lowvol"
   }
 }
