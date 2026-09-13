@@ -25,7 +25,8 @@ from data.fetcher import get_conn          # noqa: E402
 from data import quotes                    # noqa: E402
 from execution import runner               # noqa: E402
 from execution.paper import PaperBroker    # noqa: E402
-from risk.engine import record_event, stop_loss_breaches  # noqa: E402
+from risk.engine import (record_event, stop_loss_breaches,  # noqa: E402
+                         stop_loss_line)
 from risk.notify import notify             # noqa: E402
 
 REPORTS_DIR = BASE / "logs" / "reports"
@@ -91,12 +92,13 @@ def main() -> int:
             }, decision_id=None, run_date=now.strftime("%Y-%m-%d"), now=now)
             kill_fired = True
 
-        # 3.5) 单票止损扫描（规则16 的盘中执行端：只报告+留痕+通知，不自动卖）
-        breaches = stop_loss_breaches(ctx, runner.CFG.get("risk", {}))
+        # 3.5) 单票止损扫描（规则16 的盘中执行端：只报告+留痕+通知，不自动卖；
+        # 止损线为 ATR 自适应口径——高波票线更宽，见 risk/regime.stop_loss_line）
+        risk_cfg = runner.CFG.get("risk", {})
+        breaches = stop_loss_breaches(ctx, risk_cfg)
         for code, loss in breaches:
             msg = "单票止损预警：%s 浮亏 %.1f%% ≥ 止损线 %.0f%%，建议人工评估止损卖出" % (
-                code, loss * 100,
-                float(runner.CFG.get("risk", {}).get("stop_loss_pct", 0.08)) * 100)
+                code, loss * 100, stop_loss_line(ctx, risk_cfg, code) * 100)
             record_event(conn, "stop_loss_alert", msg)
             print("[sweep] %s" % msg)
         if breaches:

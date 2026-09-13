@@ -65,8 +65,29 @@
     "min_confidence": 0.60,
     "lot_size": 100,
     "stop_loss_pct": 0.08,
+    "atr_stop_mult": 2.0,
     "max_concept_weight": 0.45,
     "max_amount_share": 0.01
+  },
+  "regime": {
+    "enabled": true,
+    "rsrs_index": "000300",
+    "rsrs_window": 18,
+    "rsrs_zscore_window": 600,
+    "rsrs_min_beta": 250,
+    "rsrs_bull_z": 1.0,
+    "rsrs_bear_z": -1.0,
+    "index_big": "000300",
+    "index_small": "000905",
+    "dual_mom_window": 20,
+    "cap_half": 0.50,
+    "cap_shelter": 0.20
+  },
+  "vol_target": {
+    "enabled": true,
+    "target_ann_vol": 0.30,
+    "window": 20,
+    "min_samples": 21
   },
   "execution": {
     "mode": "paper",

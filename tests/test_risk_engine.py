@@ -451,6 +451,68 @@ def test_kill_deferred_positions_reported():
     assert len(v.kill_orders) == 1
 
 
+# ---------------- 2026-09-14 市场环境总闸 + ATR 自适应止损 ----------------
+
+
+def test_dynamic_position_cap_rejects_buy():
+    """regime 动态闸（cap=50%）< 静态 80%：买入后总仓位 52.9% 被拒，且提示动态闸。"""
+    ctx = mk_ctx(positions={"600519": {"name": "贵州茅台", "shares": 350,
+                                       "avail_shares": 350, "cost": 1400.0}},
+                 position_cap=0.50)
+    v = check(mk_dec("buy", "000001", 10.0, 3000), ctx, CFG)
+    assert not v.approved and hit(v, "动态闸")
+    # 卖出永远不受总仓位闸限制
+    v2 = check(mk_dec("sell", "600519", 1500.0, 100), ctx, CFG)
+    assert v2.approved, v2.violations
+
+
+def test_dynamic_position_cap_none_is_noop():
+    """position_cap=None（regime 故障 fail-open）→ 行为与旧版完全一致。"""
+    ctx = mk_ctx(positions={"600519": {"name": "贵州茅台", "shares": 466,
+                                       "avail_shares": 466, "cost": 1400.0}})
+    v = check(mk_dec("buy", "000001", 10.0, 15000), ctx, CFG)
+    assert not v.approved and hit(v, "总仓位") and not hit(v, "动态闸")
+
+
+def test_atr_stop_line_widens_for_high_vol():
+    """ATR 自适应止损线：高波票 2ATR=14% > 基础 8%；低波票仍 8%；缺失回退基础线。"""
+    from risk.engine import stop_loss_line
+    ctx = mk_ctx(atr_pct={"300750": 0.07, "600519": 0.03})
+    assert abs(stop_loss_line(ctx, CFG, "300750") - 0.14) < 1e-9
+    assert abs(stop_loss_line(ctx, CFG, "600519") - 0.08) < 1e-9
+    assert abs(stop_loss_line(mk_ctx(), CFG, "600519") - 0.08) < 1e-9
+
+
+def test_rule16_atr_aware_no_premature_block():
+    """高波票浮亏 10%（< 2ATR=14%）不触发止损拦截；同幅亏损低波票仍拦截。"""
+    pos = {"300750": {"name": "宁德时代", "shares": 100, "avail_shares": 100,
+                      "cost": 13.33}}
+    prices = {"300750": 12.0, "000001": 11.0, "600519": 1500.0}
+    prevs = {"300750": 12.1, "000001": 10.0, "600519": 1490.0}
+    wide = mk_ctx(positions=pos, latest_prices=prices, prev_close=prevs,
+                  atr_pct={"300750": 0.07})
+    v = check(mk_dec("buy", "300750", 12.0, 100), wide, CFG)
+    assert v.approved, v.violations
+    narrow = mk_ctx(positions=pos, latest_prices=prices, prev_close=prevs,
+                    atr_pct={"300750": 0.03})
+    v2 = check(mk_dec("buy", "300750", 12.0, 100), narrow, CFG)
+    assert not v2.approved and hit(v2, "单票止损")
+
+
+def test_stop_loss_breaches_uses_atr_line():
+    """盘中扫描口径：浮亏超自适应线才算破线。"""
+    from risk.engine import stop_loss_breaches
+    ctx = mk_ctx(positions={"300750": {"name": "宁德时代", "shares": 100,
+                                       "avail_shares": 100, "cost": 13.33}},
+                 latest_prices={"300750": 12.0, "000001": 11.0, "600519": 1500.0},
+                 atr_pct={"300750": 0.07})
+    assert stop_loss_breaches(ctx, CFG) == []          # 10% < 14%（2ATR）
+    ctx_narrow = mk_ctx(positions=ctx.positions,
+                        latest_prices=ctx.latest_prices,
+                        atr_pct={"300750": 0.03})
+    assert [c for c, _ in stop_loss_breaches(ctx_narrow, CFG)] == ["300750"]
+
+
 # ---------------- 直接运行入口 ----------------
 
 if __name__ == "__main__":

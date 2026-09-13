@@ -230,6 +230,19 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
         for t in (w.get("concepts") or []):
             code_concepts.setdefault(str(w["code"]), []).append(str(t))
 
+    # 市场环境总闸（regime/波动率目标 → 动态总仓位上限）与持仓 ATR（ATR 自适应止损）。
+    # 两者 fail-open：计算失败不阻断交易，engine 退回静态上限/固定止损线。
+    position_cap: Optional[float] = None
+    atr_pct: Dict[str, float] = {}
+    try:
+        from risk import regime as _regime
+        cap_info = _regime.position_cap(conn, CFG)
+        position_cap = cap_info.get("cap")
+        if positions:
+            atr_pct = _regime.latest_atr_pct(conn, positions.keys())
+    except Exception as e:  # noqa: BLE001
+        log.warning("regime/vol cap 计算失败（fail-open，无动态闸）: %s", repr(e)[:120])
+
     return RiskContext(
         now=now,
         positions=positions,
@@ -247,6 +260,8 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
         code_concepts=code_concepts,
         today_sold_codes=today_sold,
         watchlist_codes=wl_codes,
+        position_cap=position_cap,
+        atr_pct=atr_pct,
     )
 
 

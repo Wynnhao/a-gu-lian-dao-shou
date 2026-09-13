@@ -34,6 +34,7 @@ WATCHLIST = CFG.get("watchlist", [])
 START_CASH = float(CFG.get("execution", {}).get("paper_start_cash", 1000000.0))
 PRICE_GUARD_PCT = float(CFG.get("risk", {}).get("price_guard_pct", 0.02))
 MAX_SINGLE_WEIGHT = float(CFG.get("risk", {}).get("max_single_weight", 0.20))
+MAX_TOTAL_WEIGHT = float(CFG.get("risk", {}).get("max_total_weight", 0.80))
 
 PROMPT_VERSION = "2026-09.1"   # 固定文案/输出规则版本，落 decision.prompt_version 供迭代归因
 MD_BUDGET = 45000              # bundle.md 字符数软预算（超限降级新闻正文）
@@ -90,6 +91,16 @@ def _money(v) -> str:
 
 def _pct(v) -> str:
     return "n/a" if v is None else f"{float(v) * 100:+.2f}%"
+
+
+def _signals_profile() -> str:
+    """当前 score profile（直接读 config，避免为此引入 signals 导入链）。"""
+    try:
+        p = json.loads((BASE / "config.json").read_text(encoding="utf-8")) \
+            .get("signals", {}).get("profile", "reversal_lowvol")
+        return p if p in ("reversal_lowvol", "momentum") else "reversal_lowvol"
+    except Exception:
+        return "reversal_lowvol"
 
 
 # ---------------------------------------------------------------- 组装
@@ -221,7 +232,16 @@ def build_bundle(run_date: Optional[str] = None,
             bundle["dynamic_pools"] = {}
             bundle["dynamic_pools_error"] = f"动态池读取失败：{type(e).__name__}: {e}"
 
-        # ---- 组合状态（持仓补现价/市值/浮盈/权重——此前 LLM 看不到这些卖出决策关键依据）----
+        # ---- 市场环境总闸（regime/波动率目标 → 动态总仓位上限，风控引擎强制）----
+        try:
+            from risk import regime as _regime
+            cap_info = _regime.position_cap(c, CFG)
+            bundle["regime"] = cap_info
+            bundle["score_profile"] = _signals_profile()
+        except Exception as e:
+            bundle["regime"] = {"error": f"{type(e).__name__}: {e}"}
+
+        # ---- 组合状态（持仓补现价/市值/浮盈/权重/止损参考价）----
         try:
             ps_row = c.execute(
                 "SELECT date, cash, market_value, total, drawdown, kill_switch, note "
@@ -230,6 +250,16 @@ def build_bundle(run_date: Optional[str] = None,
             pos_rows = c.execute(
                 "SELECT code, name, shares, avail_shares, cost, updated_at "
                 "FROM position ORDER BY code").fetchall()
+            atr_map: dict = {}
+            try:
+                from risk import regime as regime_mod
+                atr_map = regime_mod.latest_atr_pct(
+                    c, [r[0] for r in pos_rows]) if pos_rows else {}
+            except Exception:
+                atr_map = {}
+            stop_base = float(CFG.get("risk", {}).get("stop_loss_pct", 0.08))
+            stop_mult = float(CFG.get("risk", {}).get("atr_stop_mult", 2.0))
+            from risk.regime import stop_loss_line as _stop_line
             positions = []
             for r in pos_rows:
                 code, name, shares, avail, cost = r[0], r[1] or "", int(r[2] or 0), \
@@ -241,6 +271,10 @@ def build_bundle(run_date: Optional[str] = None,
                 mv = shares * last_close if (last_close is not None and shares) else None
                 unrealized = shares * (last_close - cost) \
                     if (last_close is not None and cost is not None and shares) else None
+                # 止损参考价：ATR 自适应止损线（risk/regime）作用于成本价
+                line = _stop_line(stop_base, atr_map.get(code), stop_mult)
+                stop_price = round(cost * (1.0 - line), 2) \
+                    if (cost and line) else None
                 positions.append({
                     "code": code, "name": name, "shares": shares, "avail_shares": avail,
                     "cost": cost, "last_close": last_close,
@@ -249,6 +283,7 @@ def build_bundle(run_date: Optional[str] = None,
                     if unrealized is not None and cost else None,
                     "weight": _f(mv / total_equity)
                     if (mv is not None and total_equity and total_equity > 0) else None,
+                    "stop_line_pct": _f(line), "stop_price": _f(stop_price),
                     "updated_at": r[5]})
             bundle["positions"] = positions
         except Exception as e:
@@ -328,7 +363,9 @@ _OUTPUT_RULES = """## 决策输出要求（prompt_version={pv}）
 4. **不交易黑名单票**（见"黑名单"一节中 BLOCK 的标的）。
 5. 无合适标的时输出 `[]`，或对标的输出 `hold`。
 6. `confidence` 取值 [0,1]；`target_weight` 取值 [0, {maxw}]（hold/watch 的 target_weight 恒为 0）；
-   置信度 < {minconf} 时当日只出报告不下单。"""
+   置信度 < {minconf} 时当日只出报告不下单。
+7. **遵守"市场环境总闸"**：当日全部买入的 target_weight 合计不得超过当前总仓位上限
+   （见 regime 一节，当前 {captop}）；触及上限时优先输出减仓/持有，不要输出加仓。"""
 
 
 def _md_table(headers: list, rows: list) -> str:
@@ -446,6 +483,43 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120) -> str:
         lines.append(f"- 估值缺失：{bundle.get('macro_missing', '无数据')}")
     lines.append("")
 
+    # 市场环境总闸（策略库 Top3：RSRS+二八三档 + 波动率目标仓位）
+    rg = bundle.get("regime") or {}
+    lines += ["## 市场环境总闸（regime）", ""]
+    if rg.get("error"):
+        lines.append(f"- 计算失败（fail-open，无动态闸）：{rg['error']}")
+    else:
+        r = rg.get("regime") or {}
+        v = rg.get("vol_target") or {}
+        cap = rg.get("cap")
+        tier = r.get("tier")
+        if cap is None:
+            lines.append("- 当前无动态约束（engine 按静态上限执行）")
+        else:
+            lines.append(
+                f"- **总仓位上限 {cap:.0%}（{tier or '-'}档）**：风控引擎强制，"
+                f"建议全部 target_weight 合计 ≤ {cap:.0%}；卖出不受限")
+        rs = r.get("rsrs") or {}
+        if rs:
+            ztxt = "n/a" if rs.get("z") is None else f"z={rs['z']}"
+            lines.append(f"- RSRS（{rs.get('as_of', '-')}）：{ztxt}，"
+                         f"β={rs.get('beta', 'n/a')}（z>+1 满配 / z<−1 避险 / 其余半配）")
+        dm = r.get("dual_mom") or {}
+        if dm:
+            lines.append(f"- 二八动量（{dm.get('window', '-')}日）：大盘 "
+                         f"{_pct(dm.get('big'))}，小盘 {_pct(dm.get('small'))}"
+                         f"——{dm.get('signal', '')}")
+        if v:
+            if v.get("cap") is not None:
+                lines.append(f"- 波动率目标：组合年化波动 {v.get('sigma_ann', 0):.1%} "
+                             f"vs 目标 {v.get('target_ann_vol', 0):.0%} → scale="
+                             f"{v.get('scale')}, cap={v.get('cap'):.0%}")
+            elif v.get("note"):
+                lines.append(f"- 波动率目标：{v['note']}")
+            elif v.get("error"):
+                lines.append(f"- 波动率目标计算失败：{v['error']}")
+    lines.append("")
+
     # 动态池
     dp = bundle.get("dynamic_pools") or {}
     lines += ["## 异动池 / 热门池（评估参考）", ""]
@@ -482,12 +556,16 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120) -> str:
     pos = bundle.get("positions") or []
     if pos:
         lines.append(_md_table(
-            ["代码", "名称", "持股", "可卖", "成本", "现价", "市值", "浮动盈亏", "当前权重"],
+            ["代码", "名称", "持股", "可卖", "成本", "现价", "市值", "浮动盈亏",
+             "当前权重", "止损参考价"],
             [(p["code"], p["name"], p["shares"], p["avail_shares"], _money(p["cost"]),
               _money(p.get("last_close")), _money(p.get("market_value")),
               _pct(p.get("unrealized_pct")) + f"（{_money(p.get('unrealized_pnl'))}）",
-              None if p.get("weight") is None else f"{p['weight']:.1%}")
+              None if p.get("weight") is None else f"{p['weight']:.1%}",
+              _money(p.get("stop_price")))
              for p in pos]))
+        lines.append("- 止损参考价 = 成本 × (1 − 止损线)；止损线 = max(8%, 2×ATR占比)"
+                     "（ATR 自适应，触发后应止损卖出而非加仓，规则16）")
     else:
         lines.append("- 当前无持仓")
     if bundle.get("realized_pnl") is not None:
@@ -535,9 +613,13 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120) -> str:
     lines.append("")
 
     # 固定文案
+    rg_cap = ((bundle.get("regime") or {}).get("cap"))
+    captop = ("无动态约束，静态 %.0f%%" % (MAX_TOTAL_WEIGHT * 100)) if rg_cap is None \
+        else ("%.0f%%（regime 动态闸）" % (rg_cap * 100))
     lines.append(_OUTPUT_RULES.format(pv=bundle.get("prompt_version", "-"),
                                       guard=PRICE_GUARD_PCT,
                                       maxw=MAX_SINGLE_WEIGHT,
+                                      captop=captop,
                                       minconf=CFG.get("risk", {}).get("min_confidence", 0.60)))
     lines.append("")
     return "\n".join(lines)

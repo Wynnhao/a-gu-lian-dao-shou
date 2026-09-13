@@ -36,6 +36,9 @@ class RiskContext:
     code_concepts: Dict[str, List[str]] = field(default_factory=dict)  # {code: [概念]}
     today_sold_codes: set = field(default_factory=set)            # 当日已卖出代码
     watchlist_codes: set = field(default_factory=set)             # 自选池全集（晋升判断用）
+    # ---- 2026-09-14 市场环境总闸（risk/regime.py，策略库 Top2/Top3） ----
+    position_cap: Optional[float] = None            # 动态总仓位上限（绝对值）；None=无附加约束
+    atr_pct: Dict[str, float] = field(default_factory=dict)  # {code: ATR占比}（ATR 自适应止损）
 
 
 @dataclass
@@ -210,8 +213,23 @@ def rule_kill_switch(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) ->
             v.violations.append(msg)
 
 
+def stop_loss_line(ctx: RiskContext, cfg: dict, code: str) -> float:
+    """单票有效止损线（浮亏口径）：max(stop_loss_pct, atr_stop_mult × 该票 ATR占比)。
+
+    ATR 自适应（海龟 2N 逻辑，risk/regime.stop_loss_line）：高波票止损更宽防噪声
+    扫损，低波票维持基础线；ATR 数据缺失 → 基础线（行为与旧版一致）。
+    """
+    from risk.regime import stop_loss_line as _line
+    return _line(float(cfg.get("stop_loss_pct", 0.08) or 0),
+                 (ctx.atr_pct or {}).get(code),
+                 float(cfg.get("atr_stop_mult", 2.0) or 2.0))
+
+
 def stop_loss_breaches(ctx: RiskContext, cfg: dict) -> List[Tuple[str, float]]:
-    """单票浮亏超止损线的持仓 [(code, 浮亏%)]（供盘中扫描生成止损卖出提示）。"""
+    """单票浮亏超止损线的持仓 [(code, 浮亏%)]（供盘中扫描生成止损卖出提示）。
+
+    止损线为 ATR 自适应口径（见 stop_loss_line），不再固定 8%。
+    """
     cap = float(cfg.get("stop_loss_pct", 0.08) or 0)
     if cap <= 0:
         return []
@@ -222,7 +240,7 @@ def stop_loss_breaches(ctx: RiskContext, cfg: dict) -> List[Tuple[str, float]]:
         if cost <= 0 or price is None or price <= 0:
             continue
         loss = 1.0 - float(price) / cost
-        if loss >= cap:
+        if loss >= stop_loss_line(ctx, cfg, code) - 1e-12:
             out.append((code, loss))
     return sorted(out, key=lambda x: -x[1])
 
@@ -244,7 +262,12 @@ def rule_single_weight(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) 
 
 
 def rule_total_weight(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
-    """规则7：总仓位（现有持仓市值+本次买入金额)/总权益 ≤ 上限（仅 buy）。"""
+    """规则7：总仓位（现有持仓市值+本次买入金额)/总权益 ≤ 上限（仅 buy）。
+
+    上限 = min(静态 max_total_weight, ctx.position_cap 动态闸)——动态闸由
+    risk/regime.py（RSRS+二八三档、波动率目标）计算并经 build_context 注入；
+    None 表示无附加约束（regime 故障 fail-open，静态上限仍生效）。
+    """
     if decision.get("action") != "buy":
         return
     equity = float(ctx.total_equity or 0)
@@ -256,6 +279,15 @@ def rule_total_weight(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -
     total_mv = sum(_position_mv(ctx, c) for c in (ctx.positions or {}))
     w = (total_mv + amount) / equity
     cap = float(cfg.get("max_total_weight", 0.80))
+    dyn = ctx.position_cap
+    if dyn is not None:
+        cap = min(cap, float(dyn))
+        if w > cap + 1e-9:
+            v.violations.append(
+                "总仓位 %.1f%% > 动态闸上限 %.1f%%（市场环境总闸，静态 %.0f%%；"
+                "降仓或等环境转暖，卖出不受限）" % (w * 100, cap * 100,
+                                          float(cfg.get("max_total_weight", 0.80)) * 100))
+            return
     if w > cap + 1e-9:
         v.violations.append("总仓位 %.1f%% > 上限 %.1f%%" % (w * 100, cap * 100))
 
@@ -387,17 +419,16 @@ def rule_target_weight(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) 
 
 
 def rule_stop_loss(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
-    """规则16：单票浮亏 ≥ stop_loss_pct 的票禁止加仓（浮亏更深只会放大暴露），
-    应走止损卖出（盘中扫描据此生成提示）。"""
+    """规则16：单票浮亏 ≥ 有效止损线（ATR 自适应，见 stop_loss_line）的票禁止加仓
+    （浮亏更深只会放大暴露），应走止损卖出（盘中扫描据此生成提示）。"""
     if decision.get("action") != "buy":
         return
     code = str(decision.get("code") or "")
     for c, loss in stop_loss_breaches(ctx, cfg):
         if c == code:
-            cap = float(cfg.get("stop_loss_pct", 0.08))
             v.violations.append(
                 "单票止损：%s 浮亏 %.1f%% ≥ 止损线 %.0f%%，禁止加仓（应止损卖出）"
-                % (c, loss * 100, cap * 100))
+                % (c, loss * 100, stop_loss_line(ctx, cfg, code) * 100))
 
 
 def rule_concept_concentration(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
@@ -632,6 +663,21 @@ def demo() -> None:
          _demo_dec("buy", "000001", 10.0, 15000),
          _demo_ctx(positions={"600519": {"name": "贵州茅台", "shares": 466,
                                          "avail_shares": 466, "cost": 1400.0}})),
+        ("动态总仓位闸（regime cap=50% < 静态 80%，拒买）",
+         _demo_dec("buy", "000001", 10.0, 3000),
+         _demo_ctx(positions={"600519": {"name": "贵州茅台", "shares": 350,
+                                         "avail_shares": 350, "cost": 1400.0}},
+                   position_cap=0.50)),
+        ("ATR 自适应止损：高波票 2ATR=14% 线，浮亏 10% 未破线（放行）",
+         _demo_dec("buy", "300750", 12.0, 100),
+         _demo_ctx(positions={"300750": {"name": "宁德时代", "shares": 100,
+                                         "avail_shares": 100, "cost": 13.33}},
+                   atr_pct={"300750": 0.07})),
+        ("ATR 自适应止损：低波票仍按 8% 基础线，浮亏 10% 破线（拒买）",
+         _demo_dec("buy", "300750", 12.0, 100),
+         _demo_ctx(positions={"300750": {"name": "宁德时代", "shares": 100,
+                                         "avail_shares": 100, "cost": 13.33}},
+                   atr_pct={"300750": 0.03})),
         ("超持仓数（第6只）",
          _demo_dec("buy", "688801", 50.0, 100),
          _demo_ctx(positions={c: {"name": c, "shares": 100, "avail_shares": 100, "cost": 10.0}
