@@ -63,7 +63,10 @@
     "max_drawdown_kill": 0.08,
     "kill_stop_hours": 72,
     "min_confidence": 0.60,
-    "lot_size": 100
+    "lot_size": 100,
+    "stop_loss_pct": 0.08,
+    "max_concept_weight": 0.45,
+    "max_amount_share": 0.01
   },
   "execution": {
     "mode": "paper",
@@ -72,6 +75,19 @@
     "paper_start_cash": 1000000,
     "commission_rate": 0.00025,
     "min_commission": 5.0,
-    "stamp_tax_rate": 0.0005
+    "stamp_tax_rate": 0.0005,
+    "slippage_bps": 10,
+    "volume_participation_cap": 0.01,
+    "sim_limit_halt": true
+  },
+  "notify": {
+    "enabled": true,
+    "osascript": true,
+    "webhook_url": ""
+  },
+  "data": {
+    "start_date": "20240101",
+    "source_cooldown_min": 30,
+    "source_max_fail": 5
   }
 }

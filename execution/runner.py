@@ -15,8 +15,11 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 import argparse
+import contextlib
+import fcntl
 import json
 import logging
+import os
 import sqlite3
 from dataclasses import asdict
 from datetime import datetime, timedelta
@@ -24,11 +27,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from data.fetcher import get_conn
 from risk.blacklist import check_blacklist, health_check
-from risk.engine import (RiskContext, Verdict, check, record_event, apply_kill_switch)
+from risk.engine import (RiskContext, Verdict, check, record_event, apply_kill_switch,
+                         limit_pct, limit_price)
+from risk.notify import notify
 from execution.paper import PaperBroker, compute_fees
 
 CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
-ORDERS_DIR = BASE / "logs" / "orders"
+ORDERS_DIR = Path(os.environ.get("AGSICKLE_ORDERS_DIR") or (BASE / "logs" / "orders"))
+STATE_DIR = Path(os.environ.get("AGSICKLE_STATE_DIR") or (BASE / "logs" / "state"))
+KILL_STATE_FILE = STATE_DIR / "kill.json"
 
 log = logging.getLogger("exec.runner")
 log.setLevel(logging.INFO)
@@ -37,6 +44,83 @@ if not log.handlers:
     _fh = logging.FileHandler(BASE / "logs" / "exec.log", encoding="utf-8")
     _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     log.addHandler(_fh)
+
+
+# ---------------------------------------------------------------- 模式守卫与并发锁
+
+def _assert_paper_mode() -> None:
+    """mode=ui 硬拒绝：UI 自动化的成交回执补录/截图回写/账本对账三件事都还没实现，
+    切过去会让本地账本与同花顺账户脱节、风控基于错误账本裁决——代码层直接挡住，
+    不靠 runbook 文字约束。确需演练时设 AGSICKLE_ALLOW_UI=1。"""
+    if CFG.get("execution", {}).get("mode") == "ui" \
+            and os.environ.get("AGSICKLE_ALLOW_UI") != "1":
+        raise SystemExit(
+            "[runner] execution.mode=ui 未就绪（缺 UI 成交回执补录/截图回写/账本对账），"
+            "已硬性拒绝。演练请设 AGSICKLE_ALLOW_UI=1 并按 execution/runbook_ths.md 执行。")
+
+
+@contextlib.contextmanager
+def _exec_lock():
+    """执行入口互斥锁：cron/catchup/人工/看板四方可能同时触发 confirm/propose，
+    SQLite 并发写有 busy_timeout 兜底，但 trade 计数→成交之间的 TOCTOU 只能靠进程锁。"""
+    ORDERS_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = ORDERS_DIR / ".lock"
+    with open(lock_path, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+# ---------------------------------------------------------------- kill 状态文件
+
+def read_kill_state() -> Optional[dict]:
+    """logs/state/kill.json：{"active": bool, "until": iso, "note": str}。
+
+    存在时为权威状态（支持人工 resume/extend）；不存在时回退 risk_event 推导
+    （兼容旧库）。此前靠 rule LIKE '%kill%' 推导停机期，任何含 kill 的新规则名
+    都会改变停机推导，且无法人工提前恢复。
+    """
+    try:
+        return json.loads(KILL_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def write_kill_state(until: Optional[datetime], note: str = "") -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.chmod(0o755)
+    payload = {"active": until is not None,
+               "until": until.isoformat(timespec="seconds") if until else None,
+               "note": note,
+               "updated_at": datetime.now().isoformat(timespec="seconds")}
+    KILL_STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                               encoding="utf-8")
+
+
+def kill_resume(conn: sqlite3.Connection, reason: str = "") -> dict:
+    """人工提前解除停机（写 active=false 覆盖事件推导），留痕 risk_event。"""
+    write_kill_state(None, "resume: %s" % (reason or "人工解除"))
+    record_event(conn, "kill_resume", "人工解除停机：%s" % (reason or "未填写理由"))
+    log.info("kill 停机已人工解除: %s", reason)
+    return read_kill_state() or {}
+
+
+def kill_extend(conn: sqlite3.Connection, hours: float, reason: str = "") -> dict:
+    """人工延长停机。"""
+    cur = read_kill_state() or {}
+    base = cur.get("until")
+    new_until = datetime.now() + timedelta(hours=hours)
+    if base:
+        try:
+            new_until = max(new_until, datetime.fromisoformat(str(base)))
+        except ValueError:
+            pass
+    write_kill_state(new_until, "extend: %s" % (reason or "人工延长"))
+    record_event(conn, "kill_extend", "人工延长停机 %s 小时（至 %s）：%s"
+                 % (hours, new_until.strftime("%Y-%m-%d %H:%M"), reason))
+    return read_kill_state() or {}
 
 
 # ---------------------------------------------------------------- 上下文组装
@@ -84,10 +168,18 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
     today_trades = int(conn.execute(
         "SELECT COUNT(*) FROM trade WHERE trade_date=? AND status IN ('filled','submitted')",
         (today,)).fetchone()[0])
+    today_sold = {r[0] for r in conn.execute(
+        "SELECT DISTINCT code FROM trade WHERE trade_date=? AND side='sell' AND " 
+        "(status IS NULL OR status NOT IN ('rejected','cancelled','canceled','pending'))",
+        (today,)).fetchall()}
 
-    week_amount = 0.0
+    # 近5交易日换手：daily_bar 最近5日 ∪ 今天（当日 bar 盘后才入库，
+    # 漏掉今天会低估当日换手、放行超限交易）
     days = [r[0] for r in conn.execute(
         "SELECT DISTINCT trade_date FROM daily_bar ORDER BY trade_date DESC LIMIT 5").fetchall()]
+    if today not in days:
+        days.append(today)
+    week_amount = 0.0
     if days:
         ph = ",".join("?" * len(days))
         row = conn.execute(
@@ -96,18 +188,46 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
         week_amount = float(row[0] or 0.0)
     week_turnover = (week_amount / total_equity) if total_equity > 0 else 0.0
 
-    peak_row = conn.execute("SELECT MAX(total) FROM portfolio_state").fetchone()
+    # 峰值只取最近 250 行：一条坏数据/测试 seed 行此前会永久抬高峰值，
+    # 导致误 kill 或回撤永远 ≥8% 而锁死
+    peak_row = conn.execute(
+        "SELECT MAX(total) FROM (SELECT total FROM portfolio_state "
+        "ORDER BY date DESC LIMIT 250)").fetchone()
     peak_equity = max(float(peak_row[0] or 0.0), float(total_equity))
 
+    # kill 停机期：logs/state/kill.json 为权威（支持人工 resume/extend），
+    # 文件缺失时回退 risk_event 白名单推导（kill_switch/kill_manual/kill_extend）
     kill_until: Optional[datetime] = None
     hours = float(CFG.get("risk", {}).get("kill_stop_hours", 72))
-    ev = conn.execute(
-        "SELECT ts FROM risk_event WHERE rule LIKE '%kill%' ORDER BY id DESC LIMIT 1").fetchone()
-    if ev and ev[0]:
-        try:
-            kill_until = datetime.fromisoformat(str(ev[0])) + timedelta(hours=hours)
-        except ValueError:
-            log.warning("kill 事件时间戳无法解析: %r", ev[0])
+    ks = read_kill_state()
+    if ks is not None:
+        if ks.get("active") and ks.get("until"):
+            try:
+                kill_until = datetime.fromisoformat(str(ks["until"]))
+            except ValueError:
+                log.warning("kill 状态文件时间无法解析: %r", ks.get("until"))
+    else:
+        ev = conn.execute(
+            "SELECT ts FROM risk_event WHERE rule IN "
+            "('kill_switch','kill_manual','kill_extend') ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if ev and ev[0]:
+            try:
+                kill_until = datetime.fromisoformat(str(ev[0])) + timedelta(hours=hours)
+            except ValueError:
+                log.warning("kill 事件时间戳无法解析: %r", ev[0])
+
+    # 新规则上下文：最新日线成交额（流动性约束）与概念标签（集中度约束）
+    day_amount: Dict[str, float] = {str(c): float(a or 0) for c, a in conn.execute(
+        "SELECT code, amount FROM daily_bar WHERE trade_date IN "
+        "(SELECT MAX(trade_date) FROM daily_bar GROUP BY code) AND amount IS NOT NULL"
+    ).fetchall()}
+    code_concepts: Dict[str, List[str]] = {}
+    wl_codes = set()
+    for w in CFG.get("watchlist", []):
+        wl_codes.add(str(w["code"]))
+        for t in (w.get("concepts") or []):
+            code_concepts.setdefault(str(w["code"]), []).append(str(t))
 
     return RiskContext(
         now=now,
@@ -122,6 +242,10 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
         kill_switch_until=kill_until,
         blacklist=check_blacklist(conn),
         health_issues=health_check(conn),
+        day_amount=day_amount,
+        code_concepts=code_concepts,
+        today_sold_codes=today_sold,
+        watchlist_codes=wl_codes,
     )
 
 
@@ -226,11 +350,17 @@ def _pending_path(date_str: str, decision_id: int,
 
 def _write_pending(conn: sqlite3.Connection, decision_id: int, decision: dict, v: Verdict,
                    now: datetime, orders_dir: Optional[Path] = None) -> Path:
-    """闸门开启时把待确认单写 logs/orders/<date>/pending_<decision_id>.json。"""
+    """闸门开启时把待确认单写 logs/orders/<date>/pending_<decision_id>.json。
+
+    valid_until=当日 15:05（此前 pending 无 TTL，昨日决策今天仍可按今日价成交，
+    决策依据早已失效）。
+    """
     order = v.adjusted_order if v.adjusted_order is not None else (decision.get("order") or {})
+    valid_until = now.strftime("%Y-%m-%d") + "T15:05:00"
     payload = {
         "decision_id": decision_id,
         "created_at": now.isoformat(timespec="seconds"),
+        "valid_until": valid_until,
         "status": "pending",
         "decision": decision,
         "verdict": _verdict_dict(v),
@@ -242,7 +372,11 @@ def _write_pending(conn: sqlite3.Connection, decision_id: int, decision: dict, v
     path = _pending_path(now.strftime("%Y-%m-%d"), decision_id, orders_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    log.info("pending 单已写入 %s", path)
+    log.info("pending 单已写入 %s（有效至 %s）", path, valid_until)
+    notify("待确认单 decision#%d" % decision_id,
+           "%s %s %s @%s x%s，有效至 15:05"
+           % (decision.get("action"), decision.get("code"), decision.get("name", ""),
+              order.get("price"), order.get("shares")))
     return path
 
 
@@ -268,12 +402,18 @@ def list_pending(orders_dir: Optional[Path] = None) -> List[Path]:
 
 def _do_kill(conn: sqlite3.Connection, v: Verdict, decision_id: Optional[int],
              now: datetime) -> None:
-    """kill 触发：kill_orders 逐条走 PaperBroker.sell + apply_kill_switch，如实打印。"""
+    """kill 触发：kill_orders 逐条走 PaperBroker.sell + apply_kill_switch，如实打印。
+
+    卖出失败的单此前只留痕不重试、T+1 不可卖的票直接被跳过——残仓在停机期被锁死。
+    现在：失败单与 T+1 递延票统一写 risk_event(kill_liquidation_pending)，
+    盘前流水线调 resolve_liquidations() 自动补清算。
+    """
     broker = PaperBroker()
     td = now.strftime("%Y-%m-%d")
     print("[KILL] kill switch 触发：清仓 %d 笔 + 停机至 %s"
           % (len(v.kill_orders),
              v.kill_until.strftime("%Y-%m-%d %H:%M") if v.kill_until else "-"))
+    deferred = list(v.kill_pending or [])
     for ko in v.kill_orders:
         res = broker.sell(conn, str(ko["code"]), str(ko.get("name") or ko["code"]),
                           float(ko.get("price") or 0), int(ko.get("shares") or 0),
@@ -283,13 +423,77 @@ def _do_kill(conn: sqlite3.Connection, v: Verdict, decision_id: Optional[int],
             msg = "kill 清仓失败：%s" % json.dumps(ko, ensure_ascii=False)
             record_event(conn, "kill_sell_failed", msg, decision_id)
             print("[KILL] 清仓失败：%s" % msg)
+            deferred.append(str(ko["code"]))
             continue
         rb = broker.readback(conn, res["trade_id"])
         print("[KILL] 已清仓 %s %s x%d @%.2f 金额=%.2f 回读ok=%s"
               % (res["code"], res["name"], res["shares"], res["price"],
                  res["amount"], rb["ok"]))
+    for code in dict.fromkeys(deferred):  # 去重保序
+        pos = conn.execute(
+            "SELECT name, shares FROM position WHERE code=?", (code,)).fetchone()
+        if not pos:
+            continue  # 已无持仓（例如同批 kill 单已清掉）
+        record_event(conn, "kill_liquidation_pending",
+                     json.dumps({"code": code, "name": pos[0], "shares": int(pos[1])},
+                                ensure_ascii=False),
+                     decision_id)
+        print("[KILL] %s T+1/失败递延，已列入次日补清算（%d 股）" % (code, pos[1]))
     apply_kill_switch(conn, v.kill_until, note="decision#%s 触发" % decision_id)
-    print("[KILL] kill switch 已落库（portfolio_state.kill_switch=1 + risk_event 留痕）")
+    write_kill_state(v.kill_until, "decision#%s 触发" % decision_id)
+    notify("⚠️ KILL SWITCH 触发", "回撤熔断：清仓 %d 笔，停机至 %s%s"
+           % (len(v.kill_orders),
+              v.kill_until.strftime("%m-%d %H:%M") if v.kill_until else "-",
+              "，递延补清算 %d 只" % len(deferred) if deferred else ""))
+    print("[KILL] kill switch 已落库（portfolio_state.kill_switch=1 + kill.json + 留痕）")
+
+
+def resolve_liquidations(conn: sqlite3.Connection, now: Optional[datetime] = None,
+                         orders_dir: Optional[Path] = None) -> int:
+    """补清算：扫描未完成的 kill_liquidation_pending 事件，对仍有持仓的票
+    自动 propose 一条 kill_liquidation 卖单（走正常风控，停机期也放行）。
+
+    判定"未完成"：事件之后该票没有足额的 filled 卖出流水。返回补清算单数。
+    """
+    now = now or datetime.now()
+    rows = conn.execute(
+        "SELECT id, ts, detail FROM risk_event WHERE rule='kill_liquidation_pending' "
+        "ORDER BY id").fetchall()
+    n = 0
+    for eid, ts, detail in rows:
+        try:
+            info = json.loads(detail)
+        except (TypeError, ValueError):
+            continue
+        code = str(info.get("code") or "")
+        shares = int(info.get("shares") or 0)
+        if not code or shares <= 0:
+            continue
+        sold = conn.execute(
+            "SELECT COALESCE(SUM(shares),0) FROM trade WHERE code=? AND side='sell' "
+            "AND status='filled' AND created_at > ?", (code, ts)).fetchone()[0]
+        pos = conn.execute(
+            "SELECT name, shares, cost FROM position WHERE code=?", (code,)).fetchone()
+        if not pos or int(pos[1]) <= 0 or sold >= shares:
+            continue  # 已清仓完成
+        price = PaperBroker().latest_price(conn, code, live=False) or 0.0
+        if price <= 0:
+            price = float(pos[2] or 0)
+        if price <= 0:
+            continue
+        decision = {
+            "action": "sell", "code": code, "name": pos[0],
+            "target_weight": 0.0, "confidence": 1.0,
+            "reasons": ["kill 递延补清算（T+1 解锁/上次卖出失败）"],
+            "risk_notes": ["kill_switch 自动清算单"],
+            "kill_liquidation": True,
+            "order": {"side": "sell", "price": price, "shares": int(pos[1])},
+        }
+        print("[liquidation] %s %s 补清算 %d 股 @%.2f" % (code, pos[0], int(pos[1]), price))
+        propose(conn, decision, run_date=now.strftime("%Y-%m-%d"), now=now,
+                orders_dir=orders_dir)
+        n += 1
+    return n
 
 
 # ---------------------------------------------------------------- 核心编排
@@ -313,19 +517,47 @@ def _print_verdict(v: Verdict) -> None:
         print("[risk]   [警告] %s" % w)
 
 
+def _dedupe_check(conn: sqlite3.Connection, decision: dict, run_date: str) -> bool:
+    """propose --file 重跑幂等：同 run_date 同 code+action 且订单参数一致、
+    状态未被否决的决策已存在 → 跳过（此前 catchup/人工重跑会重复入库并重复 propose）。"""
+    order = decision.get("order") or {}
+    rows = conn.execute(
+        "SELECT id, input_snapshot, status FROM decision WHERE run_date=? AND code=? "
+        "AND action=? AND status NOT IN ('rejected','expired')",
+        (run_date, decision.get("code"), decision.get("action"))).fetchall()
+    for _id, snap, _st in rows:
+        try:
+            old = json.loads(snap) if snap else {}
+        except (TypeError, ValueError):
+            continue
+        old_order = old.get("order") if isinstance(old, dict) else None
+        if isinstance(old_order, dict) and \
+                float(old_order.get("price") or 0) == float(order.get("price") or 0) and \
+                int(old_order.get("shares") or 0) == int(order.get("shares") or 0):
+            return True
+    return False
+
+
 def propose(conn: sqlite3.Connection, decision: dict, decision_id: Optional[int] = None,
             run_date: Optional[str] = None, now: Optional[datetime] = None,
             orders_dir: Optional[Path] = None) -> Verdict:
     """跑风控并落库裁决结论；approved 且闸门开启 → 写 pending 等人工确认。
 
-    - decision_id 为 None 时先插入 decision 行（status=proposed）；
+    - decision_id 为 None 时先插入 decision 行（status=proposed，重复文件内容跳过）；
     - kill_trigger=True 时立即执行清仓 + apply_kill_switch（不受人工闸门约束）；
     - report_only / rejected 均不进入闸门。
     """
     now = now or datetime.now()
+    _assert_paper_mode()
     exec_cfg = CFG.get("execution", {})
     if decision_id is None:
-        decision_id = _insert_decision(conn, decision, run_date or now.strftime("%Y-%m-%d"))
+        run_date = run_date or now.strftime("%Y-%m-%d")
+        if _dedupe_check(conn, decision, run_date):
+            print("[propose] 跳过重复决策：%s %s %s（同日同参数已存在）"
+                  % (decision.get("code"), decision.get("action"),
+                     (decision.get("order") or {}).get("price")))
+            return Verdict(approved=False, warnings=["duplicate skipped"])
+        decision_id = _insert_decision(conn, decision, run_date)
     ctx = build_context(conn, now)
     v = check(decision, ctx, CFG.get("risk", {}))
 
@@ -355,7 +587,19 @@ def propose(conn: sqlite3.Connection, decision: dict, decision_id: Optional[int]
         else:
             order = v.adjusted_order if v.adjusted_order is not None else decision["order"]
             print("[gate] 人工闸门关闭：直接执行")
-            _execute(conn, decision_id, decision, float(order["price"]),
+            # gate-off 自动模式按实时价成交（此前直接用决策价，决策价与市价的
+            # 偏差完全不被记录）
+            price = PaperBroker().latest_price(conn, str(decision.get("code")))
+            if price is None:
+                price = float(order["price"])
+            else:
+                ref = float(order["price"])
+                if ref > 0 and abs(price - ref) / ref > 0.01:
+                    record_event(conn, "auto_price_drift",
+                                 "decision#%d 决策价 %.2f → 自动成交价 %.2f（偏离 %.1f%%）"
+                                 % (decision_id, ref, price, abs(price - ref) / ref * 100),
+                                 decision_id)
+            _execute(conn, decision_id, decision, float(price),
                      int(order["shares"]), confirmed_by="auto", now=now)
     else:
         status = "report_only" if v.report_only else "rejected"
@@ -366,7 +610,12 @@ def propose(conn: sqlite3.Connection, decision: dict, decision_id: Optional[int]
 
 def _execute(conn: sqlite3.Connection, decision_id: int, decision: dict, price: float,
              shares: int, confirmed_by: str, now: datetime) -> Optional[dict]:
-    """PaperBroker 成交 + readback 回读 + decision.status=executed。"""
+    """PaperBroker 成交 + readback 回读 + decision.status=executed。
+
+    成交失败 → decision 保持 approved 可重试；回读不一致 → status=executed_unverified
+    （不可再 confirm，等人工核查；此前保持 approved 且 pending 已删，重跑 confirm
+    会二次成交）。
+    """
     broker = PaperBroker()
     code = str(decision.get("code"))
     name = _code_name(conn, code, decision)
@@ -379,9 +628,10 @@ def _execute(conn: sqlite3.Connection, decision_id: int, decision: dict, price: 
         res = broker.sell(conn, code, name, price, shares, decision_id=decision_id,
                           confirmed_by=confirmed_by, trade_date=td)
     if res is None:
-        msg = "成交失败 decision#%d %s %s x%d @%.2f（现金不足/可卖不足/参数非法）" % (
+        msg = "成交失败 decision#%d %s %s x%d @%.2f（现金不足/可卖不足/前置防线/参数非法）" % (
             decision_id, action, code, shares, price)
         record_event(conn, "execution_failed", msg, decision_id)
+        notify("成交失败 decision#%d" % decision_id, msg)
         print("[exec] 失败：%s" % msg)
         return None
     rb = broker.readback(conn, res["trade_id"])
@@ -393,16 +643,25 @@ def _execute(conn: sqlite3.Connection, decision_id: int, decision: dict, price: 
         _set_status(conn, decision_id, "executed")
         print("[propose] decision#%d 状态 -> executed" % decision_id)
     else:
-        # 回读不一致：已写 risk_event(readback)，状态保持 approved 等人工核查
-        print("[readback] 不一致！decision#%d 保持 approved，请人工核查 risk_event" % decision_id)
+        _set_status(conn, decision_id, "executed_unverified")
+        notify("回读不一致 decision#%d" % decision_id,
+               "trade#%s 成交但账本回读失败，请人工核查 risk_event" % res["trade_id"])
+        print("[readback] 不一致！decision#%d 状态 -> executed_unverified（不可再确认）"
+              % decision_id)
     return res
 
 
 def confirm(conn: sqlite3.Connection, decision_id: int, confirmed_by: str = "human",
             price_override: Optional[float] = None, now: Optional[datetime] = None,
             orders_dir: Optional[Path] = None) -> Optional[dict]:
-    """人工确认执行单条 approved 决策：重跑风控 → 成交（price_override 或最新收盘）→ 回读。"""
+    """人工确认执行单条 approved 决策：重跑风控 → 成交（price_override 或最新价）→ 回读。
+
+    - 决策 run_date 与今天不一致（或 pending 过期）→ 置 expired，拒绝执行昨天的决策；
+    - 最终成交价（override/实时价）确定后，再对**执行价**重跑价格保护与涨跌停
+      校验——此前重跑风控用的是决策原始价，--price 覆盖价可绕过全部价格类风控。
+    """
     now = now or datetime.now()
+    _assert_paper_mode()
     got = _get_decision(conn, decision_id)
     if not got:
         print("[confirm] decision#%d 不存在" % decision_id)
@@ -410,6 +669,17 @@ def confirm(conn: sqlite3.Connection, decision_id: int, confirmed_by: str = "hum
     row, decision = got
     if row[9] != "approved":
         print("[confirm] decision#%d 当前状态 %s，仅 approved 可确认" % (decision_id, row[9]))
+        return None
+    # 过期闸门：决策是为某个交易日做的，跨日（或超当日 15:05）决策依据已失效
+    run_date = str(row[1] or "")
+    if run_date and run_date != now.strftime("%Y-%m-%d"):
+        _set_status(conn, decision_id, "expired")
+        _remove_pending(decision_id, orders_dir)
+        record_event(conn, "pending_expired",
+                     "decision#%d run_date=%s 跨日确认被拒（今日 %s）"
+                     % (decision_id, run_date, now.strftime("%Y-%m-%d")), decision_id)
+        print("[confirm] decision#%d 状态 -> expired（决策日 %s ≠ 今日，需重新决策）"
+              % (decision_id, run_date))
         return None
     ctx = build_context(conn, now)
     v = check(decision, ctx, CFG.get("risk", {}))
@@ -443,8 +713,26 @@ def confirm(conn: sqlite3.Connection, decision_id: int, confirmed_by: str = "hum
     if shares <= 0 or price <= 0:
         print("[confirm] 价格/数量非法，放弃执行")
         return None
+
+    # 执行价二次风控：price_guard + price_limit 用最终成交价重跑
+    recheck = Verdict()
+    recheck_decision = dict(decision)
+    recheck_decision["order"] = dict(order)
+    recheck_decision["order"]["price"] = price
+    from risk import engine as _eng
+    _eng.rule_price_guard(recheck_decision, ctx, CFG.get("risk", {}), recheck)
+    _eng.rule_price_limit(recheck_decision, ctx, CFG.get("risk", {}), recheck)
+    if recheck.violations:
+        for x in recheck.violations:
+            record_event(conn, "price_recheck", x, decision_id)
+            print("[confirm] [执行价校验] %s" % x)
+        print("[confirm] 执行价 %.2f 未通过二次校验，保留待确认单（可用更接近市价的"
+              " --price 重试或 reject）" % price)
+        return None
+
     res = _execute(conn, decision_id, decision, price, shares, confirmed_by, now)
-    _remove_pending(decision_id, orders_dir)
+    if res is not None:
+        _remove_pending(decision_id, orders_dir)
     return res
 
 
@@ -588,6 +876,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--by", default="human")
     add_common(p)
 
+    p = sub.add_parser("kill", help="kill 停机状态管理（resume 解除 / extend 延长）")
+    p.add_argument("action", choices=["resume", "extend", "show"])
+    p.add_argument("--hours", type=float, default=24.0, help="extend 延长小时数")
+    p.add_argument("--reason", default="", help="操作理由（留痕）")
+    add_common(p)
+
     p = sub.add_parser("status", help="当日决策/成交/现金/持仓一览")
     p.add_argument("--date", default=None)
     add_common(p)
@@ -595,22 +889,36 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = ap.parse_args(argv)
     now = _parse_now(args.now)
 
+    _assert_paper_mode()
     conn = get_conn()
     try:
         if args.cmd == "propose":
             decisions = load_decision_file(args.file)
             print("[propose] 读取 %s 共 %d 条决策" % (args.file, len(decisions)))
-            for d in decisions:
-                propose(conn, d, run_date=args.date, now=now)
+            with _exec_lock():
+                for d in decisions:
+                    propose(conn, d, run_date=args.date, now=now)
         elif args.cmd == "propose-db":
-            n = propose_db(conn, run_date=args.date, now=now)
+            with _exec_lock():
+                n = propose_db(conn, run_date=args.date, now=now)
             if n:
                 status(conn, args.date)
         elif args.cmd == "confirm":
-            confirm(conn, args.decision_id, confirmed_by=args.by,
-                    price_override=args.price, now=now)
+            with _exec_lock():
+                confirm(conn, args.decision_id, confirmed_by=args.by,
+                        price_override=args.price, now=now)
         elif args.cmd == "reject":
-            reject(conn, args.decision_id, by=args.by, reason=args.reason)
+            with _exec_lock():
+                reject(conn, args.decision_id, by=args.by, reason=args.reason)
+        elif args.cmd == "kill":
+            if args.action == "resume":
+                st = kill_resume(conn, args.reason)
+                print("[kill] 停机已解除：%s" % json.dumps(st, ensure_ascii=False))
+            elif args.action == "extend":
+                st = kill_extend(conn, args.hours, args.reason)
+                print("[kill] 停机已延长：%s" % json.dumps(st, ensure_ascii=False))
+            else:
+                print("[kill] 当前状态：%s" % json.dumps(read_kill_state(), ensure_ascii=False))
         elif args.cmd == "status":
             status(conn, args.date)
     finally:

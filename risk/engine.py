@@ -10,6 +10,7 @@ import json
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time as dtime
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, List, Optional, Tuple
 
 # ---------------- 数据结构 ----------------
@@ -30,6 +31,11 @@ class RiskContext:
     kill_switch_until: Optional[datetime] = None
     blacklist: Dict[str, Tuple[bool, str]] = field(default_factory=dict)
     health_issues: List[str] = field(default_factory=list)
+    # ---- 2026-09 风控补强新增（缺省为空 = 对应规则自动跳过，向后兼容旧调用方） ----
+    day_amount: Dict[str, float] = field(default_factory=dict)    # {code: 最新日线成交额}
+    code_concepts: Dict[str, List[str]] = field(default_factory=dict)  # {code: [概念]}
+    today_sold_codes: set = field(default_factory=set)            # 当日已卖出代码
+    watchlist_codes: set = field(default_factory=set)             # 自选池全集（晋升判断用）
 
 
 @dataclass
@@ -42,6 +48,7 @@ class Verdict:
     adjusted_order: Optional[dict] = None            # 手数规整等修正后的 order
     kill_trigger: bool = False
     kill_orders: List[dict] = field(default_factory=list)  # 触发清仓时的 sell 指令
+    kill_pending: List[str] = field(default_factory=list)  # T+1 不可卖、需次日补清算的代码
     kill_until: Optional[datetime] = None
 
     def brief(self) -> str:
@@ -52,6 +59,8 @@ class Verdict:
             parts.append("adjusted_shares=%s" % self.adjusted_order.get("shares"))
         if self.kill_until is not None:
             parts.append("kill_until=%s" % self.kill_until.strftime("%Y-%m-%d %H:%M"))
+        if self.kill_pending:
+            parts.append("kill_pending=%s" % ",".join(self.kill_pending))
         return " ".join(parts)
 
 
@@ -91,12 +100,29 @@ def _effective_shares(order: dict, v: Verdict) -> int:
     return int(round(float(src.get("shares", 0) or 0)))
 
 
-def _build_kill_orders(ctx: RiskContext) -> List[dict]:
-    """对全部持仓按可卖数量生成市价卖单（avail_shares<=0 的跳过）。"""
-    orders = []
+def limit_price(pc: float, pct: float, up: bool) -> float:
+    """停板价：Decimal 四舍五入到分（交易所口径）。
+
+    此前用 round()（银行家舍入），.005 边界会与交易所差 1 分钱。
+    """
+    q = Decimal(str(pc)) * (Decimal("1") + Decimal(str(pct)) if up
+                            else Decimal("1") - Decimal(str(pct)))
+    return float(q.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _build_kill_orders(ctx: RiskContext) -> Tuple[List[dict], List[str]]:
+    """对全部持仓按可卖数量生成市价卖单。
+
+    avail_shares<=0（当日买入 T+1 不可卖）的票无法当日清仓，返回递延名单——
+    执行层落 risk_event(kill_liquidation_pending)，次日解锁后由补清算流程卖出。
+    此前直接跳过且停机期禁卖，残仓至少锁死 72 小时（kill 清仓承诺与能力不一致）。
+    """
+    orders, deferred = [], []
     for code, pos in (ctx.positions or {}).items():
         avail = int(pos.get("avail_shares", 0) or 0)
         if avail <= 0:
+            if int(pos.get("shares", 0) or 0) > 0:
+                deferred.append(code)
             continue
         price = ctx.latest_prices.get(code)
         if price is None:
@@ -109,8 +135,9 @@ def _build_kill_orders(ctx: RiskContext) -> List[dict]:
             "price": float(price),
             "shares": avail,
             "reason": "kill switch 清仓",
+            "kill_liquidation": True,
         })
-    return orders
+    return orders, deferred
 
 
 # ---------------- 规则（逐条函数化） ----------------
@@ -153,12 +180,17 @@ def rule_trading_session(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict
 
 
 def rule_kill_switch(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
-    """规则5：停机期内拒绝一切买卖（buy/sell）；回撤达阈值且未停机 → 触发清仓+停机。"""
+    """规则5：停机期内拒绝买入与普通卖出；kill_liquidation 清算卖单放行（补清仓）；
+    回撤达阈值且未停机 → 触发清仓+停机。"""
     action = decision.get("action")
     in_stop = ctx.kill_switch_until is not None and ctx.now < ctx.kill_switch_until
-    if in_stop and action in ("buy", "sell"):
+    if in_stop and action == "buy":
         v.violations.append(
-            "kill switch 停机期（至 %s），拒绝一切买卖"
+            "kill switch 停机期（至 %s），拒绝买入"
+            % ctx.kill_switch_until.strftime("%Y-%m-%d %H:%M"))
+    elif in_stop and action == "sell" and not decision.get("kill_liquidation"):
+        v.violations.append(
+            "kill switch 停机期（至 %s），拒绝普通卖出（清算单除外）"
             % ctx.kill_switch_until.strftime("%Y-%m-%d %H:%M"))
     peak = float(ctx.peak_equity or 0)
     equity = float(ctx.total_equity or 0)
@@ -168,10 +200,31 @@ def rule_kill_switch(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) ->
         if dd >= cap and not in_stop:
             v.kill_trigger = True
             v.kill_until = ctx.now + timedelta(hours=float(cfg.get("kill_stop_hours", 72)))
-            v.kill_orders = _build_kill_orders(ctx)
-            v.violations.append(
-                "kill switch 触发：回撤 %.1f%% ≥ %.0f%%，清仓并停机 %s 小时"
-                % (dd * 100, cap * 100, cfg.get("kill_stop_hours", 72)))
+            orders, deferred = _build_kill_orders(ctx)
+            v.kill_orders = orders
+            v.kill_pending = deferred
+            msg = "kill switch 触发：回撤 %.1f%% ≥ %.0f%%，清仓并停机 %s 小时" % (
+                dd * 100, cap * 100, cfg.get("kill_stop_hours", 72))
+            if deferred:
+                msg += "；%s 当日买入 T+1 不可卖，已列入次日补清算" % ",".join(deferred)
+            v.violations.append(msg)
+
+
+def stop_loss_breaches(ctx: RiskContext, cfg: dict) -> List[Tuple[str, float]]:
+    """单票浮亏超止损线的持仓 [(code, 浮亏%)]（供盘中扫描生成止损卖出提示）。"""
+    cap = float(cfg.get("stop_loss_pct", 0.08) or 0)
+    if cap <= 0:
+        return []
+    out = []
+    for code, pos in (ctx.positions or {}).items():
+        cost = float(pos.get("cost", 0) or 0)
+        price = ctx.latest_prices.get(code)
+        if cost <= 0 or price is None or price <= 0:
+            continue
+        loss = 1.0 - float(price) / cost
+        if loss >= cap:
+            out.append((code, loss))
+    return sorted(out, key=lambda x: -x[1])
 
 
 def rule_single_weight(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
@@ -305,13 +358,13 @@ def rule_price_limit(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) ->
     pct = limit_pct(code)
     price = float(order.get("price", 0) or 0)
     if action == "buy":
-        up = round(float(pc) * (1 + pct), 2)
+        up = limit_price(float(pc), pct, up=True)
         if price >= up:
             v.violations.append(
                 "涨停保护：委托买价 %.2f ≥ 涨停价 %.2f（昨收 %.2f，±%.0f%%），拒买"
                 % (price, up, float(pc), pct * 100))
     elif action == "sell":
-        down = round(float(pc) * (1 - pct), 2)
+        down = limit_price(float(pc), pct, up=False)
         if price <= down:
             v.violations.append(
                 "跌停保护：委托卖价 %.2f ≤ 跌停价 %.2f（昨收 %.2f，±%.0f%%），拒卖"
@@ -331,6 +384,76 @@ def rule_target_weight(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) 
     cap = float(cfg.get("max_single_weight", 0.20))
     if tw < 0 or tw > cap + 1e-9:
         v.violations.append("目标权重 %.1f%% 越界（合法范围 0 ~ %.0f%%）" % (tw * 100, cap * 100))
+
+
+def rule_stop_loss(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
+    """规则16：单票浮亏 ≥ stop_loss_pct 的票禁止加仓（浮亏更深只会放大暴露），
+    应走止损卖出（盘中扫描据此生成提示）。"""
+    if decision.get("action") != "buy":
+        return
+    code = str(decision.get("code") or "")
+    for c, loss in stop_loss_breaches(ctx, cfg):
+        if c == code:
+            cap = float(cfg.get("stop_loss_pct", 0.08))
+            v.violations.append(
+                "单票止损：%s 浮亏 %.1f%% ≥ 止损线 %.0f%%，禁止加仓（应止损卖出）"
+                % (c, loss * 100, cap * 100))
+
+
+def rule_concept_concentration(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
+    """规则17：同概念持仓市值+本次买入 ≤ max_concept_weight（概念齐涨齐跌，
+    此前 5 只持仓可全押同一题材）。代码无概念标签时跳过。"""
+    if decision.get("action") != "buy":
+        return
+    cap = float(cfg.get("max_concept_weight", 0.45) or 0)
+    if cap <= 0:
+        return
+    code = str(decision.get("code") or "")
+    concepts = ctx.code_concepts.get(code) or []
+    if not concepts:
+        return
+    order = decision.get("order") or {}
+    amount = float(order.get("price", 0) or 0) * _effective_shares(order, v)
+    equity = float(ctx.total_equity or 0)
+    if equity <= 0:
+        return
+    for concept in concepts:
+        mv = sum(_position_mv(ctx, c) for c, pos in (ctx.positions or {}).items()
+                 if c != code and concept in (ctx.code_concepts.get(c) or []))
+        w = (mv + amount) / equity
+        if w > cap + 1e-9:
+            v.violations.append(
+                "概念集中度：概念「%s」持仓+本次 %.1f%% > 上限 %.0f%%"
+                % (concept, w * 100, cap * 100))
+
+
+def rule_liquidity(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
+    """规则18：本次下单金额 ≤ 最新日线成交额 × max_amount_share（paper 资金对
+    小成交额票会吃掉大量盘口，成交价假设失真）。无成交额数据时跳过。"""
+    order = decision.get("order") or {}
+    if not (order and decision.get("action") in ("buy", "sell")):
+        return
+    cap = float(cfg.get("max_amount_share", 0.01) or 0)
+    if cap <= 0:
+        return
+    code = str(decision.get("code") or "")
+    amt = float(ctx.day_amount.get(code) or 0)
+    if amt <= 0:
+        return
+    gross = float(order.get("price", 0) or 0) * _effective_shares(order, v)
+    if gross > amt * cap + 1e-6:
+        v.violations.append(
+            "流动性约束：下单 %.0f 元 > 最新成交额 %.0f × %.1f%%（=%.0f），拒绝"
+            % (gross, amt, cap * 100, amt * cap))
+
+
+def rule_round_trip(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
+    """规则19：当日已卖出的票禁止再买回（防止同日高频往返刷交易次数）。"""
+    if decision.get("action") != "buy":
+        return
+    code = str(decision.get("code") or "")
+    if code in (ctx.today_sold_codes or set()):
+        v.violations.append("同票往返：%s 当日已卖出，禁止再买回" % code)
 
 
 # ---------------- 结构校验与主入口 ----------------
@@ -403,6 +526,10 @@ def check(decision: dict, ctx: RiskContext, cfg: dict) -> Verdict:
     rule_max_positions(decision, ctx, cfg, v)    # 规则8
     rule_daily_trades(decision, ctx, cfg, v)     # 规则10
     rule_weekly_turnover(decision, ctx, cfg, v)  # 规则11
+    rule_stop_loss(decision, ctx, cfg, v)        # 规则16
+    rule_concept_concentration(decision, ctx, cfg, v)  # 规则17
+    rule_liquidity(decision, ctx, cfg, v)        # 规则18
+    rule_round_trip(decision, ctx, cfg, v)       # 规则19
 
     v.approved = (not v.violations) and (not v.report_only) and (not v.kill_trigger)
     return v

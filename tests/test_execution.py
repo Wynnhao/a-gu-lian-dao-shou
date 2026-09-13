@@ -19,6 +19,11 @@ from datetime import date, datetime, time, timedelta
 from typing import Dict, Optional
 
 os.environ.setdefault("AGSICKLE_DISABLE_LIVE_QUOTES", "1")  # 测试保持离线确定价
+os.environ.setdefault("AGSICKLE_DISABLE_NOTIFY", "1")       # 测试不弹系统通知
+os.environ.setdefault("AGSICKLE_DISABLE_SLIPPAGE", "1")     # 测试金额断言不含滑点
+_TMP_STATE = tempfile.mkdtemp(prefix="agsickle_state_")
+os.environ.setdefault("AGSICKLE_STATE_DIR", _TMP_STATE)     # kill.json 隔离到临时目录
+os.environ.setdefault("AGSICKLE_ORDERS_DIR", _TMP_STATE)    # 执行锁文件隔离
 
 from data.fetcher import DDL
 from execution.paper import PaperBroker, compute_fees
@@ -66,7 +71,8 @@ def seed_market(conn: sqlite3.Connection, prices: Optional[Dict[str, tuple]] = N
             conn.execute(
                 "INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
                 " volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (code, td, close, close, close, close, 1000, close * 1000, 0.0, 1.0))
+                # amount 取 1e6 股口径（真实票日成交额亿级），避免流动性约束规则误伤合成数据
+                (code, td, close, close, close, close, 1000, close * 1000000, 0.0, 1.0))
     conn.commit()
 
 
@@ -140,11 +146,13 @@ def test_buy_weighted_cost_and_cash():
     seed_market(conn)
     b = PaperBroker(EXEC_CFG)
     b.buy(conn, "000001", "平安银行", 11.0, 100)
-    b.buy(conn, "000001", "平安银行", 12.0, 100)
+    # 委托价 12.0 会超合成数据的涨停价 11.99（昨收 10.9×1.1）→ 停板模拟拒绝，
+    # 故用 11.5 验证加权成本
+    b.buy(conn, "000001", "平安银行", 11.5, 100)
     sh, avail, cost = conn.execute(
         "SELECT shares, avail_shares, cost FROM position WHERE code='000001'").fetchone()
-    assert (sh, avail, cost) == (200, 0, 11.5)        # 加权成本 (1100+1200)/200
-    assert b.cash(conn) == 1000000.0 - 1105.0 - 1205.0
+    assert (sh, avail, cost) == (200, 0, 11.25)       # 加权成交价 (1100+1150)/200（成本不含费用）
+    assert b.cash(conn) == 1000000.0 - 1105.0 - 1155.0
 
 
 def test_sell_stamp_tax_cash_and_position():
@@ -400,9 +408,10 @@ def test_confirm_rerun_risk_rejects_non_session():
         runner.propose(conn, d, now=NOW10, orders_dir=orders)
         assert conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0] == "approved"
         res = runner.confirm(conn, 1, confirmed_by="王五", now=SAT10, orders_dir=orders)
-        assert res is None                             # 周六重跑风控不过
+        assert res is None
+        # 跨日确认（周三决策周六确认）先命中过期闸门：昨日的决策今天不允许执行
         st = conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0]
-        assert st == "rejected"
+        assert st == "expired", st
         assert len(trade_rows(conn)) == 0
     finally:
         shutil.rmtree(orders, ignore_errors=True)
@@ -483,6 +492,9 @@ def test_kill_trigger_liquidates_and_marks_switch():
         v2 = check(mk_decision("buy", "000001", 11.0, 100), ctx, runner.CFG["risk"])
         assert not v2.approved and any("kill switch" in x for x in v2.violations)
     finally:
+        # kill 状态文件是进程级持久态，清掉避免泄漏到同进程后续测试
+        if runner.KILL_STATE_FILE.exists():
+            runner.KILL_STATE_FILE.unlink()
         shutil.rmtree(orders, ignore_errors=True)
 
 
@@ -507,6 +519,105 @@ def test_load_decision_file_forms():
         assert len(runner.load_decision_file(str(wrapped))) == 1
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------- 2026-09 风控补强：递延清算 / 执行价二次校验 / 幂等 / 滑点 ----------------
+
+def test_kill_deferred_t1_position_then_resolve_next_day():
+    """kill 时当日买入（T+1 不可卖）→ 递延留痕；次日解锁后 resolve_liquidations 补清算。"""
+    conn = fresh_conn()
+    seed_market(conn, prices={"600519": (1290.0, 1280.0), "000001": (11.0, 10.9)})
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    # 600519 当日买入：avail=0（T+1 不可卖）
+    conn.execute("INSERT INTO position VALUES ('600519','贵州茅台',1000,0,1300.0,?)",
+                 (now_iso,))
+    conn.execute("INSERT INTO portfolio_state VALUES (?,?,?,?,?,?,?)",
+                 (YDAY, 0.0, 0.0, 2500000.0, 0.0, 0, "seed peak"))
+    conn.commit()
+    orders = Path(_tmp_dir())
+    try:
+        with set_gate(False):
+            hold = {"action": "hold", "code": "600519", "target_weight": 0.0,
+                    "confidence": 0.9, "reasons": ["r1", "r2"], "risk_notes": []}
+            v = runner.propose(conn, hold, now=NOW10, orders_dir=orders)
+        assert v.kill_trigger and v.kill_pending == ["600519"]
+        # 清仓失败不假完成：持仓仍在 + 递延事件留痕
+        assert conn.execute("SELECT COUNT(*) FROM position").fetchone()[0] == 1
+        ev = conn.execute("SELECT COUNT(*) FROM risk_event WHERE "
+                          "rule='kill_liquidation_pending'").fetchone()[0]
+        assert ev == 1
+        # 次日：T+1 解锁 + 补清算（关闸门让清算单直接执行）
+        conn.execute("UPDATE position SET avail_shares=shares WHERE code='600519'")
+        conn.commit()
+        with set_gate(False):
+            n = runner.resolve_liquidations(conn, now=NOW10, orders_dir=orders)
+        assert n == 1
+        rows = trade_rows(conn, side="sell")
+        assert len(rows) == 1 and rows[0][2] == "600519" and rows[0][5] == 1000
+        # 再次 resolve 不会重复清算
+        assert runner.resolve_liquidations(conn, now=NOW10, orders_dir=orders) == 0
+    finally:
+        if runner.KILL_STATE_FILE.exists():
+            runner.KILL_STATE_FILE.unlink()
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_confirm_price_override_blocked_by_recheck():
+    """--price 覆盖价偏离市价超阈值 → 执行价二次校验拦截，保留 pending 可重试。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        d = mk_decision("buy", "000001", 11.0, 100)
+        runner.propose(conn, d, now=NOW10, orders_dir=orders)
+        res = runner.confirm(conn, 1, confirmed_by="试探", price_override=12.0,
+                             now=NOW10, orders_dir=orders)  # 偏离实时价 9% > 2%
+        assert res is None
+        st = conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0]
+        assert st == "approved"                            # 不执行也不作废
+        assert len(trade_rows(conn)) == 0
+        assert runner.list_pending(orders)                 # pending 保留可修正重试
+        ev = conn.execute("SELECT COUNT(*) FROM risk_event WHERE "
+                          "rule='price_recheck'").fetchone()[0]
+        assert ev >= 1
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_duplicate_decision_id_trade_rejected():
+    """同 decision_id 二次成交被账本幂等拒绝（readback 失败重跑 confirm 防线）。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    b = PaperBroker(EXEC_CFG)
+    r1 = b.buy(conn, "000001", "平安银行", 11.0, 100, decision_id=42)
+    assert r1 and r1["ok"]
+    r2 = b.buy(conn, "000001", "平安银行", 11.0, 100, decision_id=42)
+    assert r2 is None                                      # 幂等拒绝
+    assert len(trade_rows(conn)) == 1
+    n = conn.execute("SELECT COUNT(*) FROM risk_event WHERE "
+                     "rule='duplicate_decision'").fetchone()[0]
+    assert n == 1
+
+
+def test_slippage_and_limit_halt_sim():
+    """滑点模型 + 停板模拟：enabled 时买入按上滑价成交、超涨停价拒单。"""
+    old = os.environ.pop("AGSICKLE_DISABLE_SLIPPAGE", None)
+    try:
+        conn = fresh_conn()
+        seed_market(conn)
+        cfg = dict(EXEC_CFG, slippage_bps=100)             # 100bps = 1%
+        b = PaperBroker(cfg)
+        res = b.buy(conn, "000001", "平安银行", 11.0, 100)
+        assert res["price"] == 11.11 and res["requested_price"] == 11.0
+        assert res["amount"] == 1116.0                     # gross 1111 + 最低佣金 5
+        # 委托价超涨停（10.9×1.1=11.99）→ 停板模拟拒绝
+        res2 = b.buy(conn, "600519", "贵州茅台", 1500.0, 100)  # 1500 < 1639 正常
+        assert res2 and res2["ok"]
+        up_reject = b.buy(conn, "000001", "平安银行", 12.0, 100)
+        assert up_reject is None                           # 12.0 > 涨停 11.99
+    finally:
+        if old is not None:
+            os.environ["AGSICKLE_DISABLE_SLIPPAGE"] = old
 
 
 # ---------------- 直接运行入口 ----------------

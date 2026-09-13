@@ -377,6 +377,80 @@ def test_apply_kill_switch_empty_table_inserts_today():
     assert row[0] == today and row[1] == 1 and "kill switch" in row[2]
 
 
+# ---------------- 规则16-19（2026-09 风控补强） ----------------
+
+
+def test_rule16_stop_loss_blocks_averaging_down():
+    """单票止损：浮亏 20% ≥ 8% 的票禁止加仓。"""
+    ctx = mk_ctx(positions={"600519": {"name": "贵州茅台", "shares": 100,
+                                       "avail_shares": 100, "cost": 1500.0}},
+                 latest_prices={"600519": 1200.0, "000001": 11.0, "300750": 12.0},
+                 prev_close={"600519": 1230.0, "000001": 10.0, "300750": 10.0})
+    v = check(mk_dec("buy", "600519", 1200.0, 100), ctx, CFG)
+    assert not v.approved and hit(v, "单票止损")
+    # 卖出不受止损规则限制（止损就是靠卖出执行）
+    v2 = check(mk_dec("sell", "600519", 1200.0, 100), ctx, CFG)
+    assert v2.approved, v2.violations
+
+
+def test_rule17_concept_concentration():
+    """概念集中度：同概念持仓+本次 > 45% 拒绝。"""
+    cfg = dict(CFG, max_concept_weight=0.45)
+    ctx = mk_ctx(
+        positions={"002230": {"name": "科大讯飞", "shares": 20000, "avail_shares": 20000,
+                              "cost": 20.0}},
+        latest_prices={"002230": 20.0, "000977": 50.0, "600519": 1500.0},
+        code_concepts={"002230": ["AI"], "000977": ["AI"]})
+    # 已持仓 40万 + 本次 15万 = 55% > 45%
+    v = check(mk_dec("buy", "000977", 50.0, 3000), ctx, cfg)
+    assert not v.approved and hit(v, "概念集中度")
+    # 无概念标签的票不受限
+    v2 = check(mk_dec("buy", "600519", 1500.0, 100), ctx, cfg)
+    assert v2.approved, v2.violations
+
+
+def test_rule18_liquidity_cap():
+    """流动性约束：下单金额 > 最新成交额 × 1% 拒绝；无成交额数据跳过。"""
+    ctx = mk_ctx(day_amount={"600519": 5000000.0})   # 1% 上限 5 万
+    v = check(mk_dec("buy", "600519", 1500.0, 100), ctx, CFG)  # 15 万 > 5 万
+    assert not v.approved and hit(v, "流动性约束")
+    v2 = check(mk_dec("buy", "600519", 1500.0, 100), mk_ctx(), CFG)  # 无数据 → 跳过
+    assert v2.approved and not hit(v2, "流动性")
+
+
+def test_rule19_round_trip():
+    """同票往返：当日已卖出 600519 再买回拒绝。"""
+    ctx = mk_ctx(today_sold_codes={"600519"})
+    v = check(mk_dec("buy", "600519", 1500.0, 100), ctx, CFG)
+    assert not v.approved and hit(v, "同票往返")
+
+
+def test_kill_liquidation_sell_allowed_during_stop():
+    """停机期内普通卖单拒绝，但 kill_liquidation 清算卖单放行（补清仓通道）。"""
+    ctx = mk_ctx(kill_switch_until=WED + timedelta(hours=2),
+                 positions={"600519": {"name": "贵州茅台", "shares": 1000,
+                                       "avail_shares": 1000, "cost": 1400.0}})
+    v = check(mk_dec("sell", "600519", 1500.0, 100), ctx, CFG)
+    assert not v.approved and hit(v, "kill switch")
+    d2 = mk_dec("sell", "600519", 1500.0, 1000, kill_liquidation=True)
+    v2 = check(d2, ctx, CFG)
+    assert v2.approved, v2.violations
+
+
+def test_kill_deferred_positions_reported():
+    """kill 触发时 T+1 不可卖的票进 kill_pending 递延名单（不再被静默跳过）。"""
+    ctx = mk_ctx(
+        positions={
+            "600519": {"name": "贵州茅台", "shares": 1000, "avail_shares": 1000, "cost": 1400.0},
+            "000001": {"name": "平安银行", "shares": 2000, "avail_shares": 0, "cost": 12.0},
+        },
+        total_equity=915000.0)
+    v = check(mk_dec("buy", "300750", 12.0, 100), ctx, CFG)
+    assert v.kill_trigger
+    assert v.kill_pending == ["000001"]
+    assert len(v.kill_orders) == 1
+
+
 # ---------------- 直接运行入口 ----------------
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ import json
 import logging
 import sqlite3
 from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 from risk.engine import record_event
@@ -28,6 +29,13 @@ EXEC_CFG_DEFAULT = dict(FULL_CFG.get("execution", {}))
 
 # 与 review/daily.py 一致的“有效成交”过滤（未成交/已撤单不影响资金与持仓）
 _EFFECTIVE = "(status IS NULL OR status NOT IN ('rejected','cancelled','canceled','pending'))"
+
+
+def _limit_price(pc: float, pct: float, up: bool) -> float:
+    """停板价（与风控引擎同口径：Decimal 四舍五入到分）。"""
+    q = Decimal(str(pc)) * (Decimal("1") + Decimal(str(pct)) if up
+                            else Decimal("1") - Decimal(str(pct)))
+    return float(q.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def _exec_logger(name: str) -> logging.Logger:
@@ -45,9 +53,29 @@ def _exec_logger(name: str) -> logging.Logger:
 log = _exec_logger("exec.paper")
 
 
+class _Reject(Exception):
+    """成交前置防线拒绝（内部信号，buy/sell 捕获后转为返回 None）。"""
+
+
 def _r2(x: float) -> float:
     """金额保留两位小数（修正 -0.0）。"""
     return round(float(x) + 0.0, 2)
+
+
+def _slippage_side(exec_cfg: dict, side: str, price: float) -> float:
+    """滑点调整后的成交价：买入上滑、卖出下滑（bps，默认 0=关闭）。
+
+    环境开关 AGSICKLE_DISABLE_SLIPPAGE=1（测试用）强制关闭——否则读取真实
+    config.json 的 PaperBroker 会让既有金额断言全部漂移。
+    """
+    import os
+    if os.environ.get("AGSICKLE_DISABLE_SLIPPAGE") == "1":
+        return price
+    bps = float(exec_cfg.get("slippage_bps", 0) or 0)
+    if bps <= 0:
+        return price
+    adj = 1.0 + (bps / 10000.0 if side == "buy" else -bps / 10000.0)
+    return float(price) * adj
 
 
 def compute_fees(side: str, price: float, shares: int, exec_cfg: dict) -> dict:
@@ -58,6 +86,7 @@ def compute_fees(side: str, price: float, shares: int, exec_cfg: dict) -> dict:
     - commission = max(gross × commission_rate, min_commission)；
     - stamp_tax 仅卖出计收；
     - amount = 现金净流 = gross + commission − stamp_tax（买入为总支出，卖出为净入账）。
+    price 应传入滑点调整后的实际成交价（由 PaperBroker 负责），本函数不做滑点。
     """
     gross = _r2(float(price) * int(shares))
     commission = max(_r2(gross * float(exec_cfg.get("commission_rate", 0.00025))),
@@ -75,6 +104,53 @@ class PaperBroker:
         self.cfg = dict(EXEC_CFG_DEFAULT)
         if exec_cfg:
             self.cfg.update(exec_cfg)
+        import os
+        if os.environ.get("AGSICKLE_DISABLE_SLIPPAGE") == "1":
+            self.cfg["slippage_bps"] = 0
+            self.cfg["volume_participation_cap"] = 0
+
+    # ------------------------------------------------------------ 成交前置防线
+
+    def _pre_trade_guards(self, conn: sqlite3.Connection, code: str, side: str,
+                          price: float, shares: int,
+                          decision_id: Optional[int]) -> None:
+        """成交前置防线（任一触发直接拒绝成交，返回 None 由调用方处理）：
+
+        1. 幂等：同 decision_id 已有有效成交 → 拒绝（readback 失败后重跑 confirm
+           曾会造成同一决策二次成交）；
+        2. 停板模拟：买价超涨停/卖价超跌停 → 拒绝（现实中根本无法成交，
+           此前 paper 只查 price>0，涨停价也能"成交"）；
+        3. 流动性：下单金额 > 最新日线成交额 × volume_participation_cap → 拒绝。
+        """
+        if decision_id is not None:
+            dup = conn.execute(
+                "SELECT 1 FROM trade WHERE decision_id=? AND " + _EFFECTIVE + " LIMIT 1",
+                (decision_id,)).fetchone()
+            if dup:
+                record_event(conn, "duplicate_decision",
+                             "decision#%s 已有成交，拒绝重复执行（%s %s x%d）"
+                             % (decision_id, side, code, shares), decision_id)
+                raise _Reject("decision#%s 已有成交（幂等拒绝）" % decision_id)
+        if self.cfg.get("sim_limit_halt", True) and price > 0:
+            pc = self.prev_close(conn, code)
+            if pc:
+                pct = 0.20 if str(code).startswith(("30", "68")) else 0.10
+                if side == "buy" and price > _limit_price(pc, pct, True) + 1e-9:
+                    raise _Reject("买价 %.2f 超涨停价，涨停无法成交" % price)
+                if side == "sell" and price < _limit_price(pc, pct, False) - 1e-9:
+                    raise _Reject("卖价 %.2f 低于跌停价，跌停无法成交" % price)
+        cap = float(self.cfg.get("volume_participation_cap", 0) or 0)
+        if cap > 0:
+            row = conn.execute(
+                "SELECT amount FROM daily_bar WHERE code=? ORDER BY trade_date DESC LIMIT 1",
+                (code,)).fetchone()
+            amt = float(row[0] or 0) if row else 0.0
+            if amt > 0 and price * shares > amt * cap + 1e-6:
+                raise _Reject("下单 %.0f 元 > 最新成交额 %.0f × %.1f%%（流动性约束）"
+                              % (price * shares, amt, cap * 100))
+
+    def _exec_price(self, side: str, price: float) -> float:
+        return _slippage_side(self.cfg, side, price)
 
     # ------------------------------------------------------------ 账户基础
 
@@ -159,16 +235,22 @@ class PaperBroker:
     def buy(self, conn: sqlite3.Connection, code: str, name: str, price: float, shares: int,
             decision_id: Optional[int] = None, confirmed_by: Optional[str] = None,
             trade_date: Optional[str] = None) -> Optional[dict]:
-        """买入：现金充足校验 → position upsert（avail 不变，T+1）→ 写 trade(status=filled)。
+        """买入：前置防线 → 现金充足校验 → position upsert（avail 不变，T+1）→ 写 trade。
 
-        现金不足或参数非法返回 None（不写任何行）并记日志。
+        成交价 = 委托价 ×（1+滑点bps）；现金不足/前置防线拒绝/参数非法返回 None。
         """
         shares = int(shares)
         price = float(price)
         if shares <= 0 or price <= 0:
             log.warning("buy 拒绝：非法参数 code=%s price=%s shares=%s", code, price, shares)
             return None
-        fees = compute_fees("buy", price, shares, self.cfg)
+        try:
+            self._pre_trade_guards(conn, code, "buy", price, shares, decision_id)
+        except _Reject as e:
+            log.warning("buy 拒绝：%s code=%s", e, code)
+            return None
+        exec_price = self._exec_price("buy", price)
+        fees = compute_fees("buy", exec_price, shares, self.cfg)
         cash_before = self.cash(conn)
         if cash_before < fees["amount"] - 1e-6:
             log.warning("buy 拒绝：现金不足 code=%s 需要 %.2f（含佣金）仅 %.2f",
@@ -198,28 +280,39 @@ class PaperBroker:
             "INSERT INTO trade (trade_date, code, name, side, price, shares, amount,"
             " order_id, status, decision_id, shots, confirmed_by, created_at)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (td, code, name, "buy", price, shares, fees["amount"], order_id,
+            (td, code, name, "buy", exec_price, shares, fees["amount"], order_id,
              "filled", decision_id, "[]", confirmed_by, now_iso))
         conn.commit()
         res = {"ok": True, "trade_id": int(cur.lastrowid), "order_id": order_id,
-               "code": code, "name": name, "side": "buy", "price": price,
+               "code": code, "name": name, "side": "buy", "price": exec_price,
+               "requested_price": price,
+               "slippage_bps": float(self.cfg.get("slippage_bps", 0) or 0),
                "shares": shares, "trade_date": td,
                "cash_before": cash_before, "cash_after": _r2(cash_before - fees["amount"]),
                "gross": fees["gross"], "commission": fees["commission"],
                "stamp_tax": 0.0, "amount": fees["amount"]}
-        log.info("buy 成交 trade#%s %s %s x%d @%.2f 金额=%.2f 佣金=%.2f 现金 %.2f→%.2f",
-                 res["trade_id"], code, name, shares, price, fees["amount"],
-                 fees["commission"], cash_before, res["cash_after"])
+        log.info("buy 成交 trade#%s %s %s x%d @%.2f（委托 %.2f）金额=%.2f 佣金=%.2f"
+                 " 现金 %.2f→%.2f",
+                 res["trade_id"], code, name, shares, exec_price, price,
+                 fees["amount"], fees["commission"], cash_before, res["cash_after"])
         return res
 
     def sell(self, conn: sqlite3.Connection, code: str, name: str, price: float, shares: int,
              decision_id: Optional[int] = None, confirmed_by: Optional[str] = None,
              trade_date: Optional[str] = None) -> Optional[dict]:
-        """卖出：校验 avail_shares >= shares（T+1）→ position 减持（清零删行）→ 写 trade。"""
+        """卖出：前置防线 → 校验 avail_shares >= shares（T+1）→ position 减持 → 写 trade。
+
+        成交价 = 委托价 ×（1−滑点bps）；拒绝时返回 None。
+        """
         shares = int(shares)
         price = float(price)
         if shares <= 0 or price <= 0:
             log.warning("sell 拒绝：非法参数 code=%s price=%s shares=%s", code, price, shares)
+            return None
+        try:
+            self._pre_trade_guards(conn, code, "sell", price, shares, decision_id)
+        except _Reject as e:
+            log.warning("sell 拒绝：%s code=%s", e, code)
             return None
         row = conn.execute(
             "SELECT name, shares, avail_shares FROM position WHERE code=?", (code,)).fetchone()
@@ -233,7 +326,8 @@ class PaperBroker:
         if shares > total:
             log.warning("sell 拒绝：%s 委托卖出 %d 股 > 持股 %d（数据异常）", code, shares, total)
             return None
-        fees = compute_fees("sell", price, shares, self.cfg)
+        exec_price = self._exec_price("sell", price)
+        fees = compute_fees("sell", exec_price, shares, self.cfg)
         if fees["amount"] <= 0:
             log.warning("sell 拒绝：%s 净入账 %.2f 非正，放弃", code, fees["amount"])
             return None
@@ -254,19 +348,21 @@ class PaperBroker:
             "INSERT INTO trade (trade_date, code, name, side, price, shares, amount,"
             " order_id, status, decision_id, shots, confirmed_by, created_at)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (td, code, name, "sell", price, shares, fees["amount"], order_id,
+            (td, code, name, "sell", exec_price, shares, fees["amount"], order_id,
              "filled", decision_id, "[]", confirmed_by, now_iso))
         conn.commit()
         res = {"ok": True, "trade_id": int(cur.lastrowid), "order_id": order_id,
-               "code": code, "name": name or row[0], "side": "sell", "price": price,
+               "code": code, "name": name or row[0], "side": "sell", "price": exec_price,
+               "requested_price": price,
+               "slippage_bps": float(self.cfg.get("slippage_bps", 0) or 0),
                "shares": shares, "trade_date": td,
                "cash_before": cash_before, "cash_after": _r2(cash_before + fees["amount"]),
                "gross": fees["gross"], "commission": fees["commission"],
                "stamp_tax": fees["stamp_tax"], "amount": fees["amount"]}
-        log.info("sell 成交 trade#%s %s %s x%d @%.2f 金额=%.2f 佣金=%.2f 印花税=%.2f"
-                 " 现金 %.2f→%.2f", res["trade_id"], code, res["name"], shares, price,
-                 fees["amount"], fees["commission"], fees["stamp_tax"],
-                 cash_before, res["cash_after"])
+        log.info("sell 成交 trade#%s %s %s x%d @%.2f（委托 %.2f）金额=%.2f 佣金=%.2f"
+                 " 印花税=%.2f 现金 %.2f→%.2f", res["trade_id"], code, res["name"],
+                 shares, exec_price, price, fees["amount"], fees["commission"],
+                 fees["stamp_tax"], cash_before, res["cash_after"])
         return res
 
     # ------------------------------------------------------------ 回读校验
