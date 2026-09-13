@@ -25,6 +25,8 @@ from data.fetcher import get_conn          # noqa: E402
 from data import quotes                    # noqa: E402
 from execution import runner               # noqa: E402
 from execution.paper import PaperBroker    # noqa: E402
+from risk.engine import record_event, stop_loss_breaches  # noqa: E402
+from risk.notify import notify             # noqa: E402
 
 REPORTS_DIR = BASE / "logs" / "reports"
 
@@ -89,11 +91,23 @@ def main() -> int:
             }, decision_id=None, run_date=now.strftime("%Y-%m-%d"), now=now)
             kill_fired = True
 
+        # 3.5) 单票止损扫描（规则16 的盘中执行端：只报告+留痕+通知，不自动卖）
+        breaches = stop_loss_breaches(ctx, runner.CFG.get("risk", {}))
+        for code, loss in breaches:
+            msg = "单票止损预警：%s 浮亏 %.1f%% ≥ 止损线 %.0f%%，建议人工评估止损卖出" % (
+                code, loss * 100,
+                float(runner.CFG.get("risk", {}).get("stop_loss_pct", 0.08)) * 100)
+            record_event(conn, "stop_loss_alert", msg)
+            print("[sweep] %s" % msg)
+        if breaches:
+            notify("单票止损预警", "；".join(f"{c} {l:.0%}" for c, l in breaches))
+
         # 4) pending 单漂移
         drifts = _pending_drift(conn, now)
 
         # 5) 报告
         broker = PaperBroker()
+        live_ratio = "%d/%d" % (len(live), len(codes)) if codes else "0/0"
         pos_lines = []
         for code, p in sorted(ctx.positions.items()):
             lp = ctx.latest_prices.get(code)
@@ -105,12 +119,16 @@ def main() -> int:
         md = [
             "# 尾盘风控扫描 %s" % now.strftime("%Y-%m-%d %H:%M"),
             "",
-            "- 实时行情：%d/%d 票（%s）" % (len(live), len(codes),
-                                            quotes.freshness_note(live.get(str(codes[0])) if codes else None)),
+            "- 实时行情：%s 票可得" % live_ratio,
             "- 组合实时权益：%.2f（峰值 %.2f，实时回撤 %.2f%%，kill 阈值 %.2f%%）"
             % (ctx.total_equity, peak, dd * 100, kill_th * 100),
             "- kill 状态：%s" % ("已触发清仓+停机" if kill_fired else
                                  ("停机中（至 %s）" % ctx.kill_switch_until if ctx.kill_switch_until else "正常")),
+        ]
+        if breaches:
+            md.append("- ⚠️ 单票止损预警：" +
+                      "；".join("%s 浮亏 %.1f%%" % (c, l * 100) for c, l in breaches))
+        md += [
             "",
             "## 持仓实时盈亏",
             "| 代码 | 名称 | 持股 | 成本 | 实时价 | 浮动盈亏 |",

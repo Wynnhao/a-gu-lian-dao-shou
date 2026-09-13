@@ -19,6 +19,7 @@ LLM 决策缺失的安全语义：当天没有决策 = 当天不交易（fail-sa
 
 退出码：0=无可补或已补齐；1=部分补跑失败（详见输出）；2=盘中触发过 kill。
 """
+import fcntl
 import subprocess
 import sys
 from datetime import date, datetime, timedelta
@@ -34,11 +35,24 @@ from review import daily, weekly               # noqa: E402
 
 REPORTS_DIR = BASE / "logs" / "reports"
 SESSION_DIR = BASE / "logs" / "session"
+STATE_DIR = BASE / "logs" / "state"
+HEARTBEAT_FILE = STATE_DIR / "catchup_heartbeat"
+LOCK_FILE = BASE / "logs" / ".catchup.lock"
 LOG_TAG = "[catchup]"
+BACKFILL_WINDOW = 25   # 回补窗口（此前 10 天，停机超两周的缺失日永久漏补）
 
 
 def _say(msg: str) -> None:
     print("%s %s" % (LOG_TAG, msg))
+
+
+def _heartbeat() -> None:
+    """写心跳文件（mtime=本次运行时刻），供盘前体检判断看门狗是否实际在跑。"""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        HEARTBEAT_FILE.touch()
+    except OSError:
+        pass
 
 
 def _latest_trade_date(conn) -> Optional[str]:
@@ -46,14 +60,19 @@ def _latest_trade_date(conn) -> Optional[str]:
     return row[0] if row and row[0] else None
 
 
-def _recent_trade_dates(conn, n: int = 10) -> List[str]:
+def _recent_trade_dates(conn, n: int = BACKFILL_WINDOW) -> List[str]:
     return [r[0] for r in conn.execute(
         "SELECT DISTINCT trade_date FROM daily_bar ORDER BY trade_date DESC LIMIT ?",
         (n,)).fetchall()]
 
 
-def _is_weekday(d: date) -> bool:
-    return d.weekday() < 5
+def _is_trading_day(conn, d: date) -> bool:
+    """交易日判断：交易日历优先，缺失退化 weekday（此前节假日照常跑流水线）。"""
+    try:
+        from data.calendar import is_trading_day
+        return is_trading_day(conn, d)
+    except Exception:  # noqa: BLE001
+        return d.weekday() < 5
 
 
 def _run_script(rel: str, timeout: int = 900, extra: Optional[List[str]] = None) -> bool:
@@ -85,27 +104,48 @@ def catch_up(now: Optional[datetime] = None) -> int:
     today_str = today.isoformat()
     failures = 0
     killed = False
-    weekday = _is_weekday(today)
-    in_trading_window = weekday and (now.hour, now.minute) >= (8, 30) \
-        and (now.hour, now.minute) <= (15, 30)
 
-    _say("==== 兜底补跑开始 %s（交易日=%s 盘中窗口=%s）===="
-         % (now.strftime("%Y-%m-%d %H:%M:%S"), "是" if weekday else "否",
-            "是" if in_trading_window else "否"))
-
+    _heartbeat()
     conn = fetcher.get_conn()
     try:
+        # 单实例锁：launchd 每30分钟 + cron 四时点 + 手动可并发，
+        # 并发跑 premarket 子进程有 SQLite 写冲突与重复拉数据风险
+        lock_fh = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _say("已有实例在跑（锁 %s 被占），本次退出" % LOCK_FILE)
+            return 0
+
+        trading_day = _is_trading_day(conn, today)
+        # 行情增量：交易日 8:30 后全天可跑（fetcher 自带盘中防半根bar窗口，
+        # 盘后拉当日安全——此前 15:30 后开机当天行情当日不补）
+        can_fetch = trading_day and (now.hour, now.minute) >= (8, 30)
+        # 盘中兜底窗口（bundle/午评/kill 扫描只在盘中补）
+        in_trading_window = trading_day and (now.hour, now.minute) >= (8, 30) \
+            and (now.hour, now.minute) <= (15, 30)
+
+        _say("==== 兜底补跑开始 %s（交易日=%s 可拉行情=%s 盘中窗口=%s）===="
+             % (now.strftime("%Y-%m-%d %H:%M:%S"), "是" if trading_day else "否",
+                "是" if can_fetch else "否",
+                "是" if in_trading_window else "否"))
+
+        if not trading_day:
+            _say("非交易日（交易日历判断），秒退")
+            return 0
+
         latest_td = _latest_trade_date(conn)
         tds = _recent_trade_dates(conn)
 
-        # ---- 0) 行情增量（仅交易日白天；其余时点数据不会更新）----
-        if in_trading_window:
+        # ---- 0) 行情增量 ----
+        if can_fetch:
             _say("步骤0 增量行情（盘中自动防部分bar）")
             if not _run_script("data/fetcher.py", timeout=600):
                 failures += 1
             latest_td = _latest_trade_date(conn)
 
         # ---- 1) 历史缺失日：盯市 + 日报（+周五周报）----
+        oldest_missing = None
         for td in tds:
             if td >= today_str:
                 continue
@@ -125,13 +165,34 @@ def catch_up(now: Optional[datetime] = None) -> int:
             except Exception as e:  # noqa: BLE001
                 failures += 1
                 _say("  ↳ 补跑 %s 失败: %r" % (td, e))
+        # 回补窗口之外的缺失日显式警告（此前静默漏补）
+        try:
+            from data.calendar import recent_trade_days
+            older = [d for d in recent_trade_days(conn, 60)
+                     if d < today_str and d < (min(tds) if tds else today_str)]
+            missing_old = [d for d in older
+                           if not conn.execute(
+                               "SELECT 1 FROM portfolio_state WHERE date=?",
+                               (d,)).fetchone()
+                           and not (REPORTS_DIR / (d + ".md")).is_file()]
+            if missing_old:
+                _say("⚠ 回补窗口(%d交易日)外仍有 %d 个缺失日（最早 %s），请手动补齐"
+                     % (BACKFILL_WINDOW, len(missing_old), missing_old[0]))
+        except Exception:  # noqa: BLE001
+            pass  # 日历不可用时跳过窗口外检查
 
         # ---- 2) 盘中兜底（仅交易日盘中窗口）----
         if in_trading_window and latest_td:
-            # 2a) 盘前 bundle 过期（当日未跑盘前）→ 重跑盘前流水线（不含 LLM 决策）
+            # 2a) 盘前 bundle 过期 或 信号未对齐最新交易日 → 重跑盘前流水线
+            # （此前只看 bundle.md mtime：信号步骤失败但 bundle 已写出时，
+            #  signals_missing 会原样喂给 LLM 一整天）
             bundle = SESSION_DIR / latest_td / "bundle.md"
-            if not _file_fresh_today(bundle):
-                _say("步骤2a 当日盘前流程缺失，补跑（LLM 决策需会话补做）")
+            sig_latest = conn.execute("SELECT MAX(as_of) FROM signal").fetchone()[0]
+            need_premarket = (not _file_fresh_today(bundle)) or (sig_latest != latest_td)
+            if need_premarket:
+                why = "当日盘前流程缺失" if not _file_fresh_today(bundle) \
+                    else "信号未对齐最新交易日（signal as_of=%s ≠ %s）" % (sig_latest, latest_td)
+                _say("步骤2a %s，补跑（LLM 决策需会话补做）" % why)
                 if not _run_script("pipeline/premarket.py", timeout=900):
                     failures += 1
             # 2b) 午间包缺失（11:00 后）→ 补午评准备

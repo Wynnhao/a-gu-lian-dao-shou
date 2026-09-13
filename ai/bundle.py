@@ -1,4 +1,16 @@
-"""AI决策输入包：组装行情/信号/新闻/宏观/组合上下文，落盘 bundle.json 与 bundle.md 供 LLM 决策。"""
+"""AI决策输入包：组装行情/信号/新闻/宏观/组合上下文，落盘 bundle.json 与 bundle.md 供 LLM 决策。
+
+日期口径（2026-09 口径断裂修复）：
+- run_date = 今天（决策运行日 = 预期执行日 T），session 目录、decision.run_date、
+  日报"决策回顾"查询统一用它——此前 run_date 取 daily_bar 最新交易日（盘前=T-1），
+  日报按 T 查询永远查空；
+- evidence_date = daily_bar 最新交易日（T-1，证据截至日），信号/数据质量按它对齐。
+
+信息密度（token 预算）：
+- 黑名单 PASS 行折叠为一行汇总；数据质量只列滞后票；
+- 新闻读取侧已做同事件去重与相关性排序（data.news.get_recent_news）；
+- bundle.md 超预算时逐级降级新闻正文长度（120→60→0 字）。
+"""
 import sys
 from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
@@ -22,6 +34,10 @@ START_CASH = float(CFG.get("execution", {}).get("paper_start_cash", 1000000.0))
 PRICE_GUARD_PCT = float(CFG.get("risk", {}).get("price_guard_pct", 0.02))
 MAX_SINGLE_WEIGHT = float(CFG.get("risk", {}).get("max_single_weight", 0.20))
 
+PROMPT_VERSION = "2026-09.1"   # 固定文案/输出规则版本，落 decision.prompt_version 供迭代归因
+MD_BUDGET = 45000              # bundle.md 字符数软预算（超限降级新闻正文）
+NAME_OF = {str(w["code"]): str(w.get("name") or "") for w in WATCHLIST}
+
 log = logging.getLogger("ai.bundle")
 log.setLevel(logging.INFO)
 if not log.handlers:
@@ -43,15 +59,16 @@ def _latest_trade_date(conn: sqlite3.Connection) -> str:
     return row[0] if row and row[0] else date.today().isoformat()
 
 
-def _trim_news(items: list) -> list:
-    """新闻精简：title + source + published_at + content 前120字。"""
+def _trim_news(items: list, content_len: int = 120) -> list:
+    """新闻精简：title + source + published_at + content 截断 + 相关性标注。"""
     out = []
     for n in items:
         out.append({
             "title": str(n.get("title") or ""),
             "source": str(n.get("source") or ""),
             "published_at": str(n.get("published_at") or ""),
-            "content": str(n.get("content") or "")[:120],
+            "content": str(n.get("content") or "")[:content_len],
+            **({"relevance": n["relevance"]} if n.get("relevance") else {}),
         })
     return out
 
@@ -78,28 +95,26 @@ def _pct(v) -> str:
 
 def build_bundle(run_date: Optional[str] = None,
                  conn: Optional[sqlite3.Connection] = None) -> dict:
-    """组装决策输入包（run_date 默认 daily_bar 最新交易日）。任何小节失败均降级写明原因，不抛异常。"""
+    """组装决策输入包（run_date=今天；evidence_date=daily_bar 最新交易日）。
+
+    任何小节失败均降级写明原因，不抛异常。
+    """
     own = conn is None
     c = get_conn() if own else conn
     bundle = {}
     try:
-        # ---- run_date 与行情可用性 ----
+        # ---- 日期口径：run_date=今天（预期执行日），evidence_date=最新交易日 ----
+        bundle["run_date"] = run_date or date.today().isoformat()
         try:
-            if run_date is None:
-                run_date = _latest_trade_date(c)
-            else:
-                has = c.execute("SELECT 1 FROM daily_bar WHERE trade_date=? LIMIT 1",
-                                (run_date,)).fetchone()
-                if has is None:
-                    real = _latest_trade_date(c)
-                    bundle["run_date_note"] = (
-                        f"指定的 run_date={run_date} 在 daily_bar 中无行情，"
-                        f"参考最新交易日={real}")
+            bundle["evidence_date"] = _latest_trade_date(c)
+            if bundle["evidence_date"] == bundle["run_date"]:
+                bundle["evidence_date_note"] = "最新交易日=今天（盘后口径）"
         except Exception as e:
-            run_date = run_date or date.today().isoformat()
-            bundle["run_date_note"] = f"读取 daily_bar 失败：{type(e).__name__}: {e}"
-        bundle["run_date"] = run_date
+            bundle["evidence_date"] = bundle["run_date"]
+            bundle["evidence_date_note"] = f"读取 daily_bar 失败：{type(e).__name__}: {e}"
+        ev = bundle["evidence_date"]
         bundle["generated_at"] = datetime.now().isoformat(timespec="seconds")
+        bundle["prompt_version"] = PROMPT_VERSION
         bundle["watchlist"] = [dict(x) for x in WATCHLIST]
 
         # ---- 数据健康 ----
@@ -121,11 +136,11 @@ def build_bundle(run_date: Optional[str] = None,
             bundle["blacklist"] = {}
             bundle["blacklist_error"] = f"黑名单检查失败：{type(e).__name__}: {e}"
 
-        # ---- 信号（signal 表当日全部行）----
+        # ---- 信号（signal 表 evidence_date 全部行）----
         try:
             rows = c.execute(
                 "SELECT code, signals, score, as_of FROM signal WHERE as_of=? ORDER BY code",
-                (run_date,)).fetchall()
+                (ev,)).fetchall()
             sigs = []
             for code, raw, score, as_of in rows:
                 try:
@@ -138,19 +153,20 @@ def build_bundle(run_date: Optional[str] = None,
             if not sigs:
                 latest = c.execute("SELECT MAX(as_of) FROM signal").fetchone()[0]
                 bundle["signals_missing"] = (
-                    f"signal 表无 as_of={run_date} 的行"
+                    f"signal 表无 as_of={ev} 的行"
                     + (f"（最新 as_of={latest}，需先运行 signals.compute_all）" if latest
                        else "（表为空，需先运行 signals.compute_all）"))
         except Exception as e:
             bundle["signals"] = []
             bundle["signals_missing"] = f"信号读取失败：{type(e).__name__}: {e}"
 
-        # ---- 新闻（近3天，个股前5条、市场前8条）----
+        # ---- 新闻（近3天，个股前5条、市场前8条；读取侧已去重+相关性排序）----
         news_out, news_err = {}, {}
         for item in WATCHLIST:
             code = item["code"]
             try:
-                news_out[code] = _trim_news(get_recent_news(c, code, days=3)[:5])
+                news_out[code] = _trim_news(
+                    get_recent_news(c, code, days=3, name=item.get("name") or "")[:5])
             except Exception as e:
                 news_out[code] = []
                 news_err[code] = f"读取失败：{type(e).__name__}: {e}"
@@ -191,19 +207,49 @@ def build_bundle(run_date: Optional[str] = None,
                 "hot_stock": dynpool.current_pool(c, "hot_stock"),
             }
             bundle["dynamic_pools"] = dp
+            # 陈旧性标注：池子刷新日期落后证据日 2 个交易日以上要显式告警
+            stale = []
+            for pname, prows in dp.items():
+                as_of = dynpool.pool_as_of(c, pname)
+                if as_of and as_of < ev:
+                    stale.append(f"{pname}(最新刷新 {as_of})")
+            if stale:
+                bundle["dynamic_pools_stale"] = (
+                    "以下池子数据可能过期（证据日 " + ev + "）：" + "、".join(stale))
         except Exception as e:
             bundle["dynamic_pools"] = {}
             bundle["dynamic_pools_error"] = f"动态池读取失败：{type(e).__name__}: {e}"
 
-        # ---- 组合状态 ----
+        # ---- 组合状态（持仓补现价/市值/浮盈/权重——此前 LLM 看不到这些卖出决策关键依据）----
         try:
+            ps_row = c.execute(
+                "SELECT date, cash, market_value, total, drawdown, kill_switch, note "
+                "FROM portfolio_state ORDER BY date DESC LIMIT 1").fetchone()
+            total_equity = _f(ps_row[3]) if ps_row else None
             pos_rows = c.execute(
                 "SELECT code, name, shares, avail_shares, cost, updated_at "
                 "FROM position ORDER BY code").fetchall()
-            bundle["positions"] = [
-                {"code": r[0], "name": r[1] or "", "shares": int(r[2] or 0),
-                 "avail_shares": int(r[3] or 0), "cost": _f(r[4]), "updated_at": r[5]}
-                for r in pos_rows]
+            positions = []
+            for r in pos_rows:
+                code, name, shares, avail, cost = r[0], r[1] or "", int(r[2] or 0), \
+                    int(r[3] or 0), _f(r[4])
+                close_row = c.execute(
+                    "SELECT close FROM daily_bar WHERE code=? ORDER BY trade_date DESC "
+                    "LIMIT 1", (code,)).fetchone()
+                last_close = _f(close_row[0]) if close_row else None
+                mv = shares * last_close if (last_close is not None and shares) else None
+                unrealized = shares * (last_close - cost) \
+                    if (last_close is not None and cost is not None and shares) else None
+                positions.append({
+                    "code": code, "name": name, "shares": shares, "avail_shares": avail,
+                    "cost": cost, "last_close": last_close,
+                    "market_value": _f(mv), "unrealized_pnl": _f(unrealized),
+                    "unrealized_pct": _f(unrealized / (cost * shares))
+                    if unrealized is not None and cost else None,
+                    "weight": _f(mv / total_equity)
+                    if (mv is not None and total_equity and total_equity > 0) else None,
+                    "updated_at": r[5]})
+            bundle["positions"] = positions
         except Exception as e:
             bundle["positions"] = []
             bundle["positions_error"] = f"持仓读取失败：{type(e).__name__}: {e}"
@@ -222,14 +268,29 @@ def build_bundle(run_date: Optional[str] = None,
             bundle["portfolio_state_missing"] = f"组合状态读取失败：{type(e).__name__}: {e}"
         bundle["paper_start_cash"] = START_CASH
 
-        # ---- 最近3条决策 ----
+        # ---- 已实现盈亏（trade 流水口径，含费用）----
+        try:
+            row = c.execute(
+                "SELECT COALESCE(SUM(CASE WHEN side='sell' THEN amount ELSE 0 END),0.0), "
+                "COALESCE(SUM(CASE WHEN side='buy' THEN amount ELSE 0 END),0.0) "
+                "FROM trade WHERE status='filled'").fetchone()
+            bundle["realized_pnl"] = _f(float(row[0]) - float(row[1]))
+            bundle["realized_pnl_note"] = "卖出净入账 − 买入总支出（含佣金印花税，未平仓不计）"
+        except Exception as e:
+            bundle["realized_pnl_error"] = f"已实现盈亏读取失败：{type(e).__name__}: {e}"
+
+        # ---- 最近5条决策（带结果反馈：t1_ret/direction_hit 盘后回填）----
         try:
             rows = c.execute(
-                "SELECT id, action, code, status, confidence FROM decision "
-                "ORDER BY id DESC LIMIT 3").fetchall()
+                "SELECT id, run_date, action, code, status, confidence, reasons, "
+                "t1_ret, direction_hit FROM decision ORDER BY id DESC LIMIT 5").fetchall()
             bundle["recent_decisions"] = [
-                {"id": r[0], "action": r[1], "code": r[2], "status": r[3],
-                 "confidence": _f(r[4])} for r in rows]
+                {"id": r[0], "run_date": r[1], "action": r[2], "code": r[3],
+                 "status": r[4], "confidence": _f(r[5]),
+                 "reason_preview": (json.loads(r[6])[0][:50]
+                                    if r[6] and r[6].startswith("[") else ""),
+                 "t1_ret": _f(r[7]), "direction_hit": None if r[8] is None else int(r[8])}
+                for r in rows]
         except Exception as e:
             bundle["recent_decisions"] = []
             bundle["recent_decisions_error"] = f"决策历史读取失败：{type(e).__name__}: {e}"
@@ -255,7 +316,7 @@ def build_bundle(run_date: Optional[str] = None,
 
 # ---------------------------------------------------------------- Markdown
 
-_OUTPUT_RULES = """## 决策输出要求
+_OUTPUT_RULES = """## 决策输出要求（prompt_version={pv}）
 
 1. 只能输出符合 schema 的 **JSON 数组**（不要附加其他解释文字），每条必须包含：
    `action`（buy|sell|hold|watch）、`code`（6位字符串，须在 watchlist 内）、
@@ -263,9 +324,10 @@ _OUTPUT_RULES = """## 决策输出要求
 2. `reasons` 至少 **2 条非空**，且必须引用本输入包中的具体数据（信号值/估值分位/收盘价）或新闻标题。
 3. `action` 为 buy/sell 时另需 `order` 对象：`{{"side": 与action一致, "price": 委托价, "shares": 股数}}`；
    委托价参考最新收盘价并遵守 **±2% 价格保护**（price_guard_pct={guard}），买入数量为 100 股整数倍。
-4. **不交易黑名单票**（见"黑名单"一节中 PASS=false 的标的）。
+4. **不交易黑名单票**（见"黑名单"一节中 BLOCK 的标的）。
 5. 无合适标的时输出 `[]`，或对标的输出 `hold`。
-6. `confidence` 取值 [0,1]；`target_weight` 取值 [0, {maxw}]；置信度 < {minconf} 时当日只出报告不下单。"""
+6. `confidence` 取值 [0,1]；`target_weight` 取值 [0, {maxw}]（hold/watch 的 target_weight 恒为 0）；
+   置信度 < {minconf} 时当日只出报告不下单。"""
 
 
 def _md_table(headers: list, rows: list) -> str:
@@ -276,13 +338,17 @@ def _md_table(headers: list, rows: list) -> str:
     return "\n".join(lines)
 
 
-def bundle_to_markdown(bundle: dict) -> str:
-    """把 bundle dict 渲染为人话版 markdown（末尾附决策输出要求固定文案）。"""
+def bundle_to_markdown(bundle: dict, news_content_len: int = 120) -> str:
+    """把 bundle dict 渲染为人话版 markdown（末尾附决策输出要求固定文案）。
+
+    news_content_len 供 token 预算降级用（write_bundle 超预算时逐级缩短）。
+    """
     run_date = bundle.get("run_date", "")
+    ev = bundle.get("evidence_date", run_date)
     lines = [f"# 决策输入包 {run_date}", ""]
     if bundle.get("generated_at"):
-        wl = "、".join(f"{x['code']} {x.get('name', '')}" for x in bundle.get("watchlist", []))
-        lines.append(f"> 生成时间：{bundle['generated_at']}｜自选池：{wl}")
+        lines.append(f"> 生成时间：{bundle['generated_at']}｜证据截至：{ev}｜"
+                     f"prompt_version={bundle.get('prompt_version', '-')}")
         lines.append("")
     if bundle.get("notice"):
         lines += [f"**{bundle['notice']}**", ""]
@@ -298,46 +364,58 @@ def bundle_to_markdown(bundle: dict) -> str:
         lines.append(f"- （{bundle['health_check_error']}）")
     lines.append("")
 
-    # 黑名单
+    # 黑名单（PASS 行折叠为一行汇总——此前 30 行里 29 行是 "PASS -" 纯噪音）
     lines += ["## 黑名单", ""]
     bl = bundle.get("blacklist") or {}
     if bl:
-        lines.append(_md_table(
-            ["代码", "状态", "原因"],
-            [(c, "PASS" if v.get("ok") else "BLOCK", v.get("reason", ""))
-             for c, v in sorted(bl.items())]))
+        blocked = [(c, v) for c, v in sorted(bl.items()) if not v.get("ok")]
+        lines.append(f"- PASS {len(bl) - len(blocked)} 只（略）")
+        if blocked:
+            lines.append(_md_table(["代码", "原因"],
+                                   [(c, v.get("reason", "")) for c, v in blocked]))
     else:
         lines.append("（无黑名单数据）")
     lines.append("")
 
-    # 信号
-    lines += [f"## 技术信号（as_of={run_date}）", ""]
+    # 信号（补 ATR占比/换手分位/5日动量/均线结构/价格口径——md 此前丢掉了决策关键列）
+    lines += [f"## 技术信号（as_of={ev}，score profile={bundle.get('score_profile', '见config')}）", ""]
     sigs = bundle.get("signals") or []
     if sigs:
         rows = []
         for s in sigs:
             g = s.get("signals") or {}
             pct = g.get("pct_chg")
+            atrp = g.get("atr_pct")
+            tpp = g.get("turnover_pct")
             rows.append((s.get("code"), g.get("ma_trend"),
-                         _pct(g.get("mom_20d")),  # mom_20d 为小数比例
-                         "n/a" if g.get("rsi_14") is None else f"{g['rsi_14']:.1f}",
+                         _pct(g.get("mom_5d")),
+                         _pct(g.get("mom_20d")),
+                         "n/a" if g.get("rsi_14") is None else f"{g['rsi_14']:.0f}",
+                         "n/a" if atrp is None else f"{atrp * 100:.1f}%",
+                         "n/a" if tpp is None else f"{tpp:.2f}",
+                         "✓" if g.get("above_ma60") else "✗",
                          _f(g.get("close")),
-                         "n/a" if pct is None else f"{float(pct):+.2f}%",  # pct_chg 已是百分数
+                         "n/a" if pct is None else f"{float(pct):+.2f}%",
+                         g.get("price_basis", "-"),
                          s.get("score")))
-        lines.append(_md_table(["代码", "MA趋势", "20日动量", "RSI14", "收盘", "当日涨跌", "score"], rows))
+        lines.append(_md_table(
+            ["代码", "MA趋势", "5日动量", "20日动量", "RSI14", "ATR占比", "换手分位",
+             "站上MA60", "收盘", "当日涨跌", "价格口径", "score"], rows))
     else:
         lines.append(f"- 信号缺失：{bundle.get('signals_missing', '无信号数据')}")
     lines.append("")
 
     # 新闻
-    lines += ["## 近3日新闻", ""]
+    lines += [f"## 近3日新闻（证据日 {ev}）", ""]
     news_all = bundle.get("news") or {}
     for item in WATCHLIST:
         code = item["code"]
         items = news_all.get(code) or []
         lines.append(f"### {code} {item.get('name', '')}（最多5条）")
         if items:
-            lines += [f"- 《{n['title']}》（{n['source']}，{n['published_at']}）：{n['content']}"
+            lines += [f"- 《{n['title']}》（{n['source']}，{n['published_at']}"
+                      + (f"，相关度{n['relevance']}" if n.get("relevance") else "")
+                      + f"）：{n['content'][:news_content_len]}"
                       for n in items]
         else:
             lines.append("- （近3天无新闻）")
@@ -345,7 +423,8 @@ def bundle_to_markdown(bundle: dict) -> str:
     lines.append("### 市场级（最多8条）")
     mk = news_all.get("market") or []
     if mk:
-        lines += [f"- 《{n['title']}》（{n['source']}，{n['published_at']}）：{n['content']}"
+        lines += [f"- 《{n['title']}》（{n['source']}，{n['published_at']}）"
+                  f"：{n['content'][:news_content_len]}"
                   for n in mk]
     else:
         lines.append("- （近3天无市场级新闻）")
@@ -369,14 +448,17 @@ def bundle_to_markdown(bundle: dict) -> str:
     # 动态池
     dp = bundle.get("dynamic_pools") or {}
     lines += ["## 异动池 / 热门池（评估参考）", ""]
+    if bundle.get("dynamic_pools_stale"):
+        lines.append(f"- ⚠️ {bundle['dynamic_pools_stale']}")
     movers_rows = dp.get("movers") or []
     if movers_rows:
         lines.append(_md_table(
-            ["代码", "名称", "异动原因", "强度"],
+            ["代码", "名称", "异动原因", "强度", "口径", "入池日"],
             [(r["code"], r.get("name"), "；".join(r.get("reasons") or []),
-              _f(r.get("strength"))) for r in movers_rows]))
+              _f(r.get("strength")), r.get("mode") or "-", r.get("added_date", "-"))
+             for r in movers_rows]))
     else:
-        lines.append("- 异动池：当前无（自选池口径，阈值见 config.pools.movers）")
+        lines.append("- 异动池：当前无（阈值见 config.pools.movers）")
     themes = dp.get("hot_theme") or []
     if themes:
         lines.append("")
@@ -389,20 +471,27 @@ def bundle_to_markdown(bundle: dict) -> str:
     if not movers_rows and not themes and not stocks:
         lines.append("（无动态池数据）")
     lines += ["",
-              "> 注意：动态池内非自选池标的仅可输出 watch（观察），buy/sell 仍限自选池 30 只。"]
+              "> 注意：动态池内非自选池标的仅可输出 watch（观察），buy/sell 仍限自选池 30 只；"
+              "黑名单票仅展示（blacklist 标注），不可交易。"]
     lines.append("")
 
-    # 组合
+    # 组合（补现价/市值/浮盈/权重 + 已实现盈亏）
     lines += ["## 组合状态", ""]
     lines.append(f"- 期初模拟资金：{_money(bundle.get('paper_start_cash'))}")
     pos = bundle.get("positions") or []
     if pos:
         lines.append(_md_table(
-            ["代码", "名称", "持股", "可卖", "成本"],
-            [(p["code"], p["name"], p["shares"], p["avail_shares"], _money(p["cost"]))
+            ["代码", "名称", "持股", "可卖", "成本", "现价", "市值", "浮动盈亏", "当前权重"],
+            [(p["code"], p["name"], p["shares"], p["avail_shares"], _money(p["cost"]),
+              _money(p.get("last_close")), _money(p.get("market_value")),
+              _pct(p.get("unrealized_pct")) + f"（{_money(p.get('unrealized_pnl'))}）",
+              None if p.get("weight") is None else f"{p['weight']:.1%}")
              for p in pos]))
     else:
         lines.append("- 当前无持仓")
+    if bundle.get("realized_pnl") is not None:
+        lines.append(f"- 累计已实现盈亏：{_money(bundle.get('realized_pnl'))}"
+                     f"（{bundle.get('realized_pnl_note', '')}）")
     st = bundle.get("portfolio_state")
     if st:
         lines.append(
@@ -413,29 +502,40 @@ def bundle_to_markdown(bundle: dict) -> str:
         lines.append(f"- 组合状态缺失：{bundle.get('portfolio_state_missing', '无数据')}")
     lines.append("")
 
-    # 最近决策
-    lines += ["## 最近3条决策", ""]
+    # 最近决策（带结果反馈闭环）
+    lines += ["## 最近5条决策（含结果反馈）", ""]
     rd = bundle.get("recent_decisions") or []
     if rd:
-        lines += [f"- #{d.get('id')} {d.get('code')} {d.get('action')} "
-                  f"status={d.get('status')} confidence={d.get('confidence')}" for d in rd]
+        for d in rd:
+            fb = ""
+            if d.get("t1_ret") is not None:
+                fb = f"｜次日实际 {_pct(d['t1_ret'])}" + \
+                     ("（方向✓）" if d.get("direction_hit") == 1 else "（方向✗）")
+            lines.append(f"- #{d.get('id')} {d.get('run_date')} {d.get('code')} "
+                         f"{d.get('action')} status={d.get('status')} "
+                         f"conf={d.get('confidence')}{fb}｜{d.get('reason_preview', '')}")
+        lines.append("- 提醒：保持决策连续性，无新证据不要反复打脸自己的昨日判断。")
     else:
         lines.append("- （decision 表为空，暂无历史决策）")
     lines.append("")
 
-    # 数据质量
-    lines += ["## 数据质量（各票最新bar日期）", ""]
+    # 数据质量（只列滞后票——此前 30 行逐票列相同日期全是噪音）
+    lines += [f"## 数据质量（证据日 {ev}）", ""]
     dq = bundle.get("data_quality") or {}
     if dq:
-        for code in sorted(dq):
-            mark = "" if dq[code] == run_date else f"（非 {run_date}，滞后）"
-            lines.append(f"- {code}: {dq[code]}{mark}")
+        lag = {c: d for c, d in sorted(dq.items()) if d != ev}
+        if lag:
+            lines.append(f"- 滞后票 {len(lag)} 只：" +
+                         "、".join(f"{c}({d})" for c, d in lag.items()))
+        else:
+            lines.append(f"- 全部 {len(dq)} 只票行情已更新至 {ev}")
     else:
         lines.append(f"- 数据缺失：{bundle.get('data_quality_missing', '无数据')}")
     lines.append("")
 
     # 固定文案
-    lines.append(_OUTPUT_RULES.format(guard=PRICE_GUARD_PCT,
+    lines.append(_OUTPUT_RULES.format(pv=bundle.get("prompt_version", "-"),
+                                      guard=PRICE_GUARD_PCT,
                                       maxw=MAX_SINGLE_WEIGHT,
                                       minconf=CFG.get("risk", {}).get("min_confidence", 0.60)))
     lines.append("")
@@ -446,14 +546,24 @@ def bundle_to_markdown(bundle: dict) -> str:
 
 def write_bundle(run_date: Optional[str] = None,
                  conn: Optional[sqlite3.Connection] = None) -> Tuple[Path, Path]:
-    """落盘 logs/session/<run_date>/bundle.json 与 bundle.md，返回 (json_path, md_path)。"""
+    """落盘 logs/session/<run_date>/bundle.json 与 bundle.md，返回 (json_path, md_path)。
+
+    token 预算：md 超 MD_BUDGET 时逐级降级新闻正文长度（120→60→0 字）。
+    """
     b = build_bundle(run_date, conn=conn)
     target = BASE / "logs" / "session" / str(b["run_date"])
     target.mkdir(parents=True, exist_ok=True)
+    md = bundle_to_markdown(b)
+    if len(md) > MD_BUDGET:
+        md = bundle_to_markdown(b, news_content_len=60)
+        log.info("bundle.md 超预算（%d 字符），新闻正文降级至 60 字", len(md))
+    if len(md) > MD_BUDGET:
+        md = bundle_to_markdown(b, news_content_len=0)
+        log.info("bundle.md 仍超预算（%d 字符），新闻正文置空", len(md))
     json_path = target / "bundle.json"
     md_path = target / "bundle.md"
     json_path.write_text(json.dumps(b, ensure_ascii=False, indent=2), encoding="utf-8")
-    md_path.write_text(bundle_to_markdown(b), encoding="utf-8")
+    md_path.write_text(md, encoding="utf-8")
     log.info("bundle 已落盘 run_date=%s -> %s", b["run_date"], json_path)
     return json_path, md_path
 
@@ -461,7 +571,7 @@ def write_bundle(run_date: Optional[str] = None,
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="组装 AI 决策输入包并落盘（bundle.json + bundle.md）")
     ap.add_argument("--date", default=None, dest="run_date",
-                    help="运行日期 YYYY-MM-DD（默认 daily_bar 最新交易日）")
+                    help="运行日期 YYYY-MM-DD（默认今天，证据取 daily_bar 最新交易日）")
     args = ap.parse_args(argv)
     json_path, md_path = write_bundle(args.run_date)
     print(json_path)

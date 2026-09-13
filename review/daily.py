@@ -294,28 +294,69 @@ def portfolio_pnl(trade_date: str, conn: Optional[sqlite3.Connection] = None) ->
             conn.close()
 
 
+# ---------------------------------------------------------------- 决策结果回填（闭环）
+
+def backfill_decision_outcomes(conn: sqlite3.Connection,
+                               as_of: Optional[str] = None) -> int:
+    """回填 decision.t1_ret / direction_hit（决策→结果闭环，此前完全缺失）。
+
+    对 trade_date < as_of 且 t1_ret 为空的 buy/sell 决策：
+    - t1_ret = 决策交易日后首个有行情日的 close 相对决策日最新收盘的涨跌
+      （用 close_qfq 优先，除权不误判方向）；
+    - direction_hit：buy 且 t1_ret>0 → 1；sell 且 t1_ret<0 → 1；否则 0。
+    返回回填条数。盘后流水线每个交易日调用一次。
+    """
+    as_of = as_of or latest_trade_date(conn)
+    rows = conn.execute(
+        "SELECT id, trade_date, code, action FROM decision "
+        "WHERE trade_date IS NOT NULL AND trade_date < ? AND t1_ret IS NULL "
+        "AND action IN ('buy','sell')", (as_of,)).fetchall()
+    filled = 0
+    for did, tdate, code, action in rows:
+        base = conn.execute(
+            "SELECT trade_date, COALESCE(close_qfq, close) FROM daily_bar "
+            "WHERE code=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 1",
+            (code, tdate)).fetchone()
+        nxt = conn.execute(
+            "SELECT trade_date, COALESCE(close_qfq, close) FROM daily_bar "
+            "WHERE code=? AND trade_date>? ORDER BY trade_date ASC LIMIT 1",
+            (code, tdate)).fetchone()
+        if not base or not nxt or not base[1] or not nxt[1]:
+            continue  # 行情未齐，下个交易日再试
+        ret = float(nxt[1]) / float(base[1]) - 1.0
+        hit = 1 if ((action == "buy" and ret > 0) or (action == "sell" and ret < 0)) else 0
+        conn.execute("UPDATE decision SET t1_ret=?, direction_hit=? WHERE id=?",
+                     (round(ret, 6), hit, did))
+        filled += 1
+    conn.commit()
+    return filled
+
+
 # ---------------------------------------------------------------- 报告生成
 
 def _sec_decisions(conn: sqlite3.Connection, trade_date: str) -> str:
     rows = conn.execute(
-        "SELECT id, code, action, target_weight, confidence, reasons, status, created_at "
+        "SELECT id, code, action, target_weight, confidence, reasons, status, created_at, "
+        "t1_ret, direction_hit, model, prompt_version "
         "FROM decision WHERE run_date=? ORDER BY id",
         (trade_date,),
     ).fetchall()
     if not rows:
         return "暂无数据"
     lines = [
-        "| id | 代码 | 动作 | 目标权重 | 置信度 | 状态 | 生成时间 |",
-        "|---|---|---|---|---|---|---|",
+        "| id | 代码 | 动作 | 目标权重 | 置信度 | 状态 | 次日实际 | 方向 | 生成时间 |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
-    for did, code, action, tw, conf, reasons, status, created in rows:
+    for did, code, action, tw, conf, reasons, status, created, t1r, hit, model, pv in rows:
+        hit_s = "n/a" if hit is None else ("✓" if int(hit) == 1 else "✗")
         lines.append(
             f"| {did} | {code} | {action} | {_fmt_pct(tw)} | "
-            f"{'n/a' if conf is None else f'{float(conf):.2f}'} | {status or 'n/a'} | {created or 'n/a'} |"
+            f"{'n/a' if conf is None else f'{float(conf):.2f}'} | {status or 'n/a'} | "
+            f"{_fmt_pct(t1r)} | {hit_s} | {created or 'n/a'} |"
         )
     lines.append("")
     lines.append("**决策理由（reasons 原文）**")
-    for did, code, action, tw, conf, reasons, status, created in rows:
+    for did, code, action, tw, conf, reasons, status, created, t1r, hit, model, pv in rows:
         lines.append(f"- decision#{did} {code} {action}:")
         items = _parse_json_list(reasons)
         if items:

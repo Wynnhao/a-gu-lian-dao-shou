@@ -28,8 +28,8 @@ SESSION_DIR = BASE / "logs" / "session"
 
 
 def _latest_run_date(conn) -> str:
-    row = conn.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()
-    return row[0] if row and row[0] else datetime.now().strftime("%Y-%m-%d")
+    """决策口径统一后的运行日期=今天（与 premarket/decide/日报一致）。"""
+    return datetime.now().strftime("%Y-%m-%d")
 
 
 def main() -> int:
@@ -37,6 +37,7 @@ def main() -> int:
     ap.add_argument("--now", default=None, help="覆盖当前时间（回放/测试）")
     args = ap.parse_args()
     now = datetime.fromisoformat(args.now) if args.now else datetime.now()
+    replay = args.now is not None
     day = now.strftime("%Y-%m-%d")
     since = day + " 09:00:00"
 
@@ -74,6 +75,14 @@ def main() -> int:
             "SELECT id, code, action, target_weight, confidence, status FROM decision "
             "WHERE run_date=? ORDER BY id", (run_date,)).fetchall()
 
+        # 4.5) 黑名单名单动态渲染（此前硬编码 688801，移出黑名单后文案不更新）
+        try:
+            from risk.blacklist import check_blacklist
+            bl = check_blacklist(conn)
+            blacklist_note = "、".join(c for c in sorted(bl) if not bl[c][0]) or "无"
+        except Exception:  # noqa: BLE001
+            blacklist_note = "见盘前输入包"
+
         # 5) pending 单漂移
         guard = float(runner.CFG.get("risk", {}).get("price_guard_pct", 0.02))
         drifts = []
@@ -104,10 +113,19 @@ def main() -> int:
                 fresh[code or "market"] = rows[:6]
 
         # 7) 组装 markdown
+        live_ratio = "%d/%d" % (len(live), len(codes))
+        stale_note = ""
+        if len(live) < len(codes):
+            stale_note = ("\n\n> ⚠️ 实时行情仅 %s 票可得（缺实时价的票下列表格显示 n/a），"
+                          "决策请以可得数据为限。" % live_ratio)
+        if replay:
+            stale_note += ("\n\n> ⚠️ 本包由 --now 回放生成（时间口径 %s），"
+                           "行情并非真实盘中时点，仅供测试。\n" % now.strftime("%H:%M"))
         lines = [
             "# 午间复核输入包 %s（生成于 %s）" % (run_date, now.strftime("%H:%M:%S")),
             "",
-            "> 口径：实时行情（非日线）；09:00 以来增量资讯。**绝不改动 daily_bar。**",
+            "> 口径：实时行情（非日线）；09:00 以来增量资讯。**绝不改动 daily_bar。**"
+            + stale_note,
             "",
             "## 实时行情",
             "| 代码 | 名称 | 实时价 | 较昨收 | 行情时间 | 来源 |",
@@ -185,13 +203,25 @@ def main() -> int:
             "   - 午间新闻/盘面出现足以改变某票结论的新证据 → 增量 buy/sell/hold/watch；",
             "   - 触发风险情形（实时回撤接近 kill 阈值）→ 在 risk_notes 中说明并由 14:50 扫描兜底；",
             "3. 每条决策仍需 ≥2 条理由，必须引用本文件中的具体数字/新闻；",
-            "4. 禁止推翻上午已 executed 的成交；禁止交易黑名单票（688801）；",
-            "5. 所有增量决策同样要过 15 条风控规则与人工闸门。",
+            "4. 禁止推翻上午已 executed 的成交；禁止交易黑名单票（%s）；" % blacklist_note,
+            "5. 所有增量决策同样要过 19 条风控规则与人工闸门。",
         ]
         out_dir = SESSION_DIR / run_date
+        if replay:
+            out_dir = SESSION_DIR / "test"  # 回放产物隔离，不污染正式 session 目录
         out_dir.mkdir(parents=True, exist_ok=True)
         out = out_dir / "midday_bundle.md"
         out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        out.with_suffix(".json").write_text(json.dumps({
+            "run_date": run_date, "generated_at": now.isoformat(timespec="seconds"),
+            "replay": replay, "live": live, "portfolio": {
+                "equity": ctx.total_equity, "peak": peak, "drawdown": dd,
+                "kill_until": ctx.kill_switch_until.isoformat(timespec="seconds")
+                if ctx.kill_switch_until else None},
+            "pending_drift": drifts, "morning_decisions": [
+                {"id": r[0], "code": r[1], "action": r[2], "status": r[5]}
+                for r in morn]},
+            ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
         print("[midday] run_date=%s 实时行情 %d/%d，新增资讯 %s"
               % (run_date, len(live), len(codes), news_added))

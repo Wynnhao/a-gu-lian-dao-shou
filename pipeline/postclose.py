@@ -58,6 +58,24 @@ def main(argv=None) -> int:
     conn = fetcher.get_conn()
     try:
         trade_date = args.trade_date or daily.latest_trade_date(conn)
+
+        # 2.0 数据体检 + 库备份（此前无任何备份，SQLite 文件级损坏即全损）
+        try:
+            from data import audit as data_audit
+            r = data_audit.run(backup=True)
+            log.info("步骤2.0 数据体检: %s", r["by_kind"] or "无问题")
+            if r["total"]:
+                log.warning("数据体检发现 %d 个问题（详见 logs/audit.log）", r["total"])
+        except Exception as e:  # noqa: BLE001
+            log.error("步骤2.0 数据体检/备份 FAIL（继续）: %s", repr(e))
+
+        # 2.1 决策结果回填（t1_ret/direction_hit——决策→结果闭环此前完全缺失）
+        try:
+            n = daily.backfill_decision_outcomes(conn, trade_date)
+            if n:
+                log.info("步骤2.1 决策结果回填 %d 条", n)
+        except Exception as e:  # noqa: BLE001
+            log.error("步骤2.1 决策结果回填 FAIL（继续）: %s", repr(e))
     finally:
         conn.close()
 

@@ -1,4 +1,4 @@
-"""盘前流水线（9:00 触发）：行情->资讯->估值->体检->T+1解锁->信号->决策输入包，失败降级不中断。"""
+"""盘前流水线（9:00 触发）：行情->资讯->估值->体检->T+1解锁->补清算->信号->决策输入包，失败降级不中断。"""
 import sys
 from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
@@ -12,6 +12,8 @@ from datetime import date, datetime
 from data import fetcher, news
 from data import macro as macro_mod
 from risk.blacklist import check_blacklist, health_check
+from risk.engine import record_event
+from risk.notify import notify
 from signals.signals import compute_all
 from ai import bundle as ai_bundle
 
@@ -27,13 +29,47 @@ if not log.handlers:
     log.addHandler(_sh)
 log.propagate = False
 
+WATCHDOG_HEARTBEAT = BASE / "logs" / "state" / "catchup_heartbeat"
+WATCHDOG_STALE_HOURS = 3
+
+
+def check_watchdog(conn) -> list:
+    """看门狗心跳体检：catchup 心跳文件超过 3 小时未更新 → 告警留痕。
+
+    此前 launchd 因 TCC 授权失败连续 13+ 次拉起 catchup 全部静默失败，
+    系统其他部分完全不感知，三层兜底实际只剩 cron 一层。
+    """
+    problems = []
+    now = datetime.now()
+    if now.weekday() < 5:
+        try:
+            mtime = datetime.fromtimestamp(WATCHDOG_HEARTBEAT.stat().st_mtime)
+            age_h = (now - mtime).total_seconds() / 3600
+            if age_h > WATCHDOG_STALE_HOURS:
+                problems.append("看门狗心跳已停 %.0f 小时（%s），盘中回撤兜底可能失效"
+                                % (age_h, mtime.strftime("%m-%d %H:%M")))
+        except FileNotFoundError:
+            problems.append("看门狗心跳文件不存在（看门狗从未成功运行？检查 launchd 授权）")
+        except OSError:
+            pass
+    for p in problems:
+        log.warning(p)
+        try:
+            record_event(conn, "watchdog_stale", p)
+        except Exception:  # noqa: BLE001
+            pass
+    return problems
+
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="盘前流水线：数据准备 + 决策输入包落盘")
     ap.add_argument("--date", default=None, dest="run_date",
-                    help="运行日期 YYYY-MM-DD（默认 daily_bar 最新交易日）")
+                    help="运行日期 YYYY-MM-DD（默认今天=预期执行日；证据自动取最新交易日）")
     args = ap.parse_args(argv)
     log.info("==== premarket start ====")
+
+    # 0. 看门狗心跳体检（兜底层自检——此前兜底失效无人知晓）
+    watchdog_problems: list = []
 
     # 1. 增量行情
     try:
@@ -49,7 +85,8 @@ def main(argv=None) -> int:
             log.error(msg)
             print("[premarket] " + msg)
             return 1
-        run_date = args.run_date or latest
+        run_date = args.run_date or date.today().isoformat()
+        watchdog_problems = check_watchdog(conn)
 
         # 2. 资讯
         try:
@@ -94,6 +131,16 @@ def main(argv=None) -> int:
         except Exception as e:
             log.error("步骤5 T+1 解锁 FAIL（继续）: %s", repr(e))
 
+        # 5.5 kill 递延补清算（此前 T+1 不可卖的残仓会在停机期锁死 72 小时）
+        try:
+            from execution import runner
+            with runner._exec_lock():
+                n_liq = runner.resolve_liquidations(conn)
+            if n_liq:
+                log.info("步骤5.5 kill 补清算 propose %d 单", n_liq)
+        except Exception as e:
+            log.error("步骤5.5 补清算 FAIL（继续）: %s", repr(e))
+
         # 6. 信号
         try:
             sigs = compute_all()
@@ -102,10 +149,11 @@ def main(argv=None) -> int:
             sigs = []
             log.error("步骤6 signals.compute_all FAIL（继续）: %s", repr(e))
 
-        # 6.5 动态池（异动/热门）：供输入包与看板，LLM 可对池内票输出 watch 观察
+        # 6.5 动态池（异动/热门）：盘前禁用全市场快照口径（9:00 快照是昨日收盘价
+        # 却带今日盘前量比，写成昨日 added_date 会口径混存），只用日线五规则
         try:
             from signals import movers, hot
-            m = movers.refresh(conn)
+            m = movers.refresh(conn, market_mode=False)
             h = hot.refresh(conn)
             log.info("步骤6.5 动态池：异动 %d 只（%s口径）、热门题材 %d/个股 %d",
                      m["count"], m["mode"], len(h["themes"]), len(h["stocks"]))
@@ -125,28 +173,30 @@ def main(argv=None) -> int:
     # 8. 总结
     print("[premarket] ===== 盘前流程完成 run_date=%s =====" % run_date)
     print("[premarket] 数据状态: 最新交易日=%s" % latest)
+    if watchdog_problems:
+        print("[premarket] ⚠️ 看门狗体检: " + "；".join(watchdog_problems))
     print("[premarket] 资讯新增: " + (", ".join(f"{k}: +{v}" for k, v in news_stats.items())
                                        if news_stats else "（本轮无统计）"))
-    print("[premarket] 黑名单:")
-    for code in sorted(bl):
-        ok, reason = bl[code]
-        print("    %s %s (%s)" % (code, "PASS" if ok else "BLOCK", reason))
+    print("[premarket] 黑名单 BLOCK: " + (
+        ", ".join(f"{c}({bl[c][1]})" for c in sorted(bl) if not bl[c][0]) or "无"))
     print("[premarket] 数据健康: " + ("；".join(issues) if issues else "OK"))
     if issues:
         print("[premarket] >>> 【今日只出报告不下单】<<<")
     print("[premarket] 信号摘要（%d 票）:" % len(sigs))
-    print("    %-8s %-6s %-8s %-8s %-10s %s" % ("code", "trend", "mom20d", "rsi14", "close", "score"))
+    print("    %-8s %-6s %-8s %-8s %-10s %s" % ("code", "trend", "mom5d", "rsi14", "close", "score"))
     for s in sigs:
         g = s.get("signals") or {}
         print("    %-8s %-6s %-8s %-8s %-10s %.3f" % (
             s.get("code"), g.get("ma_trend"),
-            "n/a" if g.get("mom_20d") is None else f"{g['mom_20d']:+.3f}",
+            "n/a" if g.get("mom_5d") is None else f"{g['mom_5d']:+.3f}",
             "n/a" if g.get("rsi_14") is None else f"{g['rsi_14']:.1f}",
             "n/a" if g.get("close") is None else f"{g['close']:.2f}",
             s.get("score", 0.0)))
     print("[premarket] 决策输入包:")
     print("    %s" % json_path)
     print("    %s" % md_path)
+    if watchdog_problems:
+        notify("盘前体检：看门狗异常", "；".join(watchdog_problems))
     log.info("==== premarket done exit=0 ====")
     return 0
 

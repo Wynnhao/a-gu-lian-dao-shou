@@ -10,6 +10,7 @@ import json
 import logging
 import sqlite3
 from datetime import date, datetime
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 from data.fetcher import get_conn
@@ -22,6 +23,11 @@ MAX_SINGLE_WEIGHT = float(RISK_CFG.get("max_single_weight", 0.20))
 MIN_CONFIDENCE = float(RISK_CFG.get("min_confidence", 0.60))
 
 _ACTIONS = ("buy", "sell", "hold", "watch")
+
+try:
+    from ai.bundle import PROMPT_VERSION
+except Exception:  # noqa: BLE001  避免循环依赖时退化
+    PROMPT_VERSION = "unknown"
 
 log = logging.getLogger("ai.decide")
 log.setLevel(logging.INFO)
@@ -155,6 +161,8 @@ def validate(obj, blacklist: Optional[dict] = None) -> Tuple[bool, Optional[dict
         "reasons": reasons_clean,
         "risk_notes": rn_clean,
     }
+    if action in ("hold", "watch"):
+        normalized["target_weight"] = 0.0  # 无交易动作不允许挂目标权重（此前 watch 可带 0.1）
     if order_norm is not None:
         normalized["order"] = order_norm
     return True, normalized, []
@@ -162,12 +170,54 @@ def validate(obj, blacklist: Optional[dict] = None) -> Tuple[bool, Optional[dict
 
 # ---------------------------------------------------------------- 落库
 
-def save_decisions(conn: sqlite3.Connection, decisions, input_snapshot: str,
-                   run_date: str) -> List[int]:
-    """逐条校验，全部通过才入库；任一失败整体放弃（返回 []），失败原因写 logs/ai.log。
+def _reason_anchored(reasons: List[str], bundle_text: str) -> bool:
+    """引用核验（轻量）：至少一条理由命中 bundle 中的数字或 8 字以上连续片段。
+    无法核验（bundle 缺失）时返回 True 不降级。"""
+    if not bundle_text:
+        return True
+    import re
+    for r in reasons:
+        if re.search(r"\d+(\.\d+)?%?", r) and any(tok for tok in re.findall(
+                r"[\u4e00-\u9fa5A-Za-z0-9.+\-]{6,}", r) if tok in bundle_text):
+            return True
+        for tok in re.findall(r"[\u4e00-\u9fa5A-Za-z0-9]{8,}", r):
+            if tok in bundle_text:
+                return True
+    return False
 
-    status：confidence >= min_confidence -> "proposed"；否则 "report_only"（当日只出报告不下单）。
-    input_snapshot 为 bundle.json 全文，写入每行 decision.input_snapshot。
+
+def _dump_raw(run_date: str, data, failed: List[Tuple[int, List[str]]]) -> Optional[Path]:
+    """校验失败时把 LLM 原始输出与原因清单落盘（此前失败现场不可复盘，
+    小格式错导致当天无决策且无修复线索）。"""
+    try:
+        d = BASE / "logs" / "session" / str(run_date)
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / ("decision_raw_%s.json" % datetime.now().strftime("%H%M%S"))
+        p.write_text(json.dumps({
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "run_date": run_date,
+            "errors": {str(i): errs for i, errs in failed},
+            "raw": data,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.warning("校验失败原始输出已留存 %s（可修正后重跑，勿直接改判定）", p)
+        return p
+    except Exception as e:  # noqa: BLE001
+        log.warning("失败留痕写入异常（忽略）: %s", repr(e))
+        return None
+
+
+def save_decisions(conn: sqlite3.Connection, decisions, input_snapshot: str,
+                   run_date: str, trade_date: Optional[str] = None,
+                   model: str = "", prompt_version: str = PROMPT_VERSION,
+                   bundle_text: str = "") -> List[int]:
+    """逐条校验，全部通过才入库；任一失败整体放弃（返回 []），原始输出与原因留盘。
+
+    - trade_date = 预期执行日（默认今天）——run_date/trade_date 口径修复；
+    - 幂等：同 run_date 同 code+action 且 target_weight/confidence/reasons 完全一致的
+      重复入库直接跳过（此前同一批决策被重复入库 5 次污染反馈链；不做 DB 唯一约束，
+      午评同日同票的合法增量决策靠内容差异区分）；
+    - 引用核验：buy/sell 理由无法锚定 bundle 内容时降级 report_only（防幻觉）；
+    - status：confidence >= min_confidence -> "proposed"；否则 "report_only"。
     """
     if isinstance(decisions, dict):
         decisions = [decisions]
@@ -195,31 +245,60 @@ def save_decisions(conn: sqlite3.Connection, decisions, input_snapshot: str,
             log.error("决策[%d] 校验失败: %s", i, "；".join(errs))
         log.error("解析失败即放弃当日决策 run_date=%s（共 %d 条，%d 条不合法，全部不入库）",
                   run_date, len(decisions), len(failed))
+        _dump_raw(run_date, decisions, failed)
         return []
 
+    trade_date = trade_date or date.today().isoformat()
     now = datetime.now().isoformat(timespec="seconds")
     ids: List[int] = []
+    skipped = 0
     for d in normalized_all:
+        # 内容级幂等查重
+        dup = conn.execute(
+            "SELECT 1 FROM decision WHERE run_date=? AND code=? AND action=? "
+            "AND target_weight IS ? AND confidence IS ? AND reasons IS ? LIMIT 1",
+            (run_date, d["code"], d["action"],
+             d["target_weight"], d["confidence"],
+             json.dumps(d["reasons"], ensure_ascii=False))).fetchone()
+        if dup:
+            skipped += 1
+            log.info("decision 重复入库跳过 run_date=%s %s %s（同内容已存在）",
+                     run_date, d["code"], d["action"])
+            continue
         status = "proposed" if float(d["confidence"]) >= MIN_CONFIDENCE else "report_only"
+        if d["action"] in ("buy", "sell") and bundle_text \
+                and not _reason_anchored(d["reasons"], bundle_text):
+            status = "report_only"
+            log.warning("decision %s %s 理由未能锚定输入包内容，降级 report_only",
+                        d["code"], d["action"])
         cur = conn.execute(
             "INSERT INTO decision (run_date, code, action, target_weight, confidence, "
-            "reasons, risk_notes, input_snapshot, status, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "reasons, risk_notes, input_snapshot, status, created_at, "
+            "trade_date, model, prompt_version) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (run_date, d["code"], d["action"], d["target_weight"], d["confidence"],
              json.dumps(d["reasons"], ensure_ascii=False),
              json.dumps(d["risk_notes"], ensure_ascii=False),
-             input_snapshot, status, now))
+             input_snapshot, status, now, trade_date, model, prompt_version))
         ids.append(int(cur.lastrowid))
-        log.info("decision#%d run_date=%s %s %s weight=%s conf=%.2f status=%s",
-                 cur.lastrowid, run_date, d["code"], d["action"],
-                 d["target_weight"], float(d["confidence"]), status)
+        log.info("decision#%d run_date=%s trade_date=%s %s %s weight=%s conf=%.2f "
+                 "status=%s model=%s pv=%s",
+                 cur.lastrowid, run_date, trade_date, d["code"], d["action"],
+                 d["target_weight"], float(d["confidence"]), status, model, prompt_version)
     conn.commit()
+    if skipped:
+        log.info("幂等跳过 %d 条重复决策 run_date=%s", skipped, run_date)
     log.info("已入库 %d 条决策 run_date=%s", len(ids), run_date)
     return ids
 
 
-def load_and_save(json_path, run_date: Optional[str] = None) -> List[int]:
-    """CLI 主流程：读决策 JSON 文件（支持单对象或数组）-> validate -> save -> 打印结果。"""
+def load_and_save(json_path, run_date: Optional[str] = None,
+                  model: str = "") -> List[int]:
+    """CLI 主流程：读决策 JSON 文件（支持单对象或数组）-> validate -> save -> 打印结果。
+
+    run_date 默认**今天**（预期执行日，与日报"决策回顾"对齐；此前取 daily_bar
+    最新交易日导致盘前决策 run_date=T-1、日报按 T 查询永远查空）。
+    """
     p = Path(json_path)
     try:
         text = p.read_text(encoding="utf-8")
@@ -237,9 +316,7 @@ def load_and_save(json_path, run_date: Optional[str] = None) -> List[int]:
 
     conn = get_conn()
     try:
-        if run_date is None:
-            row = conn.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()
-            run_date = row[0] if row and row[0] else date.today().isoformat()
+        run_date = run_date or date.today().isoformat()
         # input_snapshot 组合快照：bundle 全文用于归因，decisions 原文供
         # execution.runner._decision_from_row 回读 order（其按 "decisions" 键扫描）
         bundle_obj = None
@@ -257,7 +334,10 @@ def load_and_save(json_path, run_date: Optional[str] = None) -> List[int]:
                                   ensure_ascii=False)
         else:
             snapshot = text
-        ids = save_decisions(conn, data, snapshot, run_date)
+        ids = save_decisions(conn, data, snapshot, run_date,
+                             trade_date=run_date, model=model,
+                             prompt_version=PROMPT_VERSION,
+                             bundle_text=text)
         statuses = dict(conn.execute(
             "SELECT status, COUNT(*) FROM decision WHERE id IN (%s) GROUP BY status"
             % ",".join("?" * len(ids)), ids).fetchall()) if ids else {}
@@ -310,7 +390,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="AI 决策校验与落库（decision 表）")
     ap.add_argument("--file", default=None, help="LLM 输出的决策 JSON 文件路径（单对象或数组）")
     ap.add_argument("--date", default=None, dest="run_date",
-                    help="决策运行日期 YYYY-MM-DD（默认 daily_bar 最新交易日）")
+                    help="决策运行日期 YYYY-MM-DD（默认今天=预期执行日）")
+    ap.add_argument("--model", default="", help="决策模型标识（落 decision.model 供归因）")
     ap.add_argument("--template", action="store_true", help="在 stdout 打印合法示例 JSON 后退出")
     args = ap.parse_args(argv)
     if args.template:
@@ -318,7 +399,7 @@ def main(argv=None) -> int:
         return 0
     if not args.file:
         ap.error("需要 --file decision.json（或使用 --template 查看合法示例）")
-    ids = load_and_save(args.file, args.run_date)
+    ids = load_and_save(args.file, args.run_date, model=args.model)
     return 0 if ids else 1
 
 

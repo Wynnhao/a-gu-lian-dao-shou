@@ -273,6 +273,9 @@ def weekly_report(end_date: Optional[str] = None,
         else:
             body_trades = "暂无数据"
 
+        # ---- 决策质量（AI 闭环：命中率/置信度校准/风控拒绝分布/信号有效性）----
+        body_quality = _sec_decision_quality(conn, monday.isoformat(), end_d.isoformat())
+
         content_lines = [
             f"# 周度复盘报告 {iso_year}-W{iso_week:02d}（{monday.isoformat()} ~ {end_d.isoformat()}）",
             "",
@@ -294,6 +297,10 @@ def weekly_report(end_date: Optional[str] = None,
             "",
             body_trades,
             "",
+            "## 决策质量（AI 闭环）",
+            "",
+            body_quality,
+            "",
             "## 附注",
             "",
         ]
@@ -311,6 +318,50 @@ def weekly_report(end_date: Optional[str] = None,
     finally:
         if own:
             conn.close()
+
+
+def _sec_decision_quality(conn: sqlite3.Connection, start: str, end: str) -> str:
+    """决策→结果闭环质量统计（此前周报归因完全不覆盖 AI 决策质量）。
+
+    - 方向命中率（backfill_decision_outcomes 回填的 direction_hit）；
+    - 置信度校准：高置信组 vs 低置信组命中率对比；
+    - 风控拒绝次数（risk_event）；
+    - 信号有效性（review/signal_eval.evaluate，样本不足自动标注）。
+    """
+    lines: List[str] = []
+    row = conn.execute(
+        "SELECT COUNT(*), SUM(direction_hit=1), AVG(confidence), "
+        "SUM(confidence>=0.7 AND direction_hit=1), SUM(confidence>=0.7 AND "
+        "direction_hit IS NOT NULL) FROM decision "
+        "WHERE trade_date BETWEEN ? AND ? AND direction_hit IS NOT NULL",
+        (start, end)).fetchone()
+    n, hits, avg_conf, hi_hits, hi_n = row
+    if not n:
+        lines.append("- 本周无已回填方向的 buy/sell 决策（尚未产生成交或结果未到回填窗口）")
+    else:
+        hits = int(hits or 0)
+        lines.append(f"- 方向命中：{hits}/{n}（胜率 {hits / n:.0%}）"
+                     f"｜平均置信度 {'n/a' if avg_conf is None else '%.2f' % float(avg_conf)}")
+        if hi_n:
+            lines.append(f"- 置信度校准：conf≥0.7 组命中 {int(hi_hits or 0)}/{int(hi_n)}"
+                         f"（{int(hi_hits or 0) / int(hi_n):.0%}）——若长期不高于低置信组，"
+                         f"说明自报置信度缺乏区分度，应收紧置信度门槛")
+    rej = conn.execute(
+        "SELECT COUNT(*) FROM risk_event WHERE rule IN ('risk_check','risk_check_reconfirm') "
+        "AND substr(ts,1,10) BETWEEN ? AND ?", (start, end)).fetchone()[0]
+    if rej:
+        lines.append(f"- 风控拦截 {rej} 次（详见看板 risk_event）")
+    try:
+        from review.signal_eval import evaluate
+        ev = evaluate(conn)
+        import json as _json
+        lines.append("- 信号有效性（样本不足时仅供参考）：")
+        lines.append("  ```json")
+        lines.append("  " + _json.dumps(ev, ensure_ascii=False)[:800])
+        lines.append("  ```")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"- 信号有效性评估失败：{type(e).__name__}: {e}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- CLI

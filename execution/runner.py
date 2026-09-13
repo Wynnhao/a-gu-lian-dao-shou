@@ -760,8 +760,7 @@ def propose_db(conn: sqlite3.Connection, run_date: Optional[str] = None,
     """
     now = now or datetime.now()
     if run_date is None:
-        row = conn.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()
-        run_date = row[0] if row and row[0] else now.strftime("%Y-%m-%d")
+        run_date = now.strftime("%Y-%m-%d")  # 决策口径统一：今天=预期执行日
     ids = [r[0] for r in conn.execute(
         "SELECT id FROM decision WHERE run_date=? AND status='proposed' ORDER BY id",
         (run_date,)).fetchall()]
