@@ -1,7 +1,8 @@
 #!/bin/bash
 # A股镰刀手 · 一键启动控制台（双击运行；控制台在后台常驻，关掉窗口不影响）
 cd "$(dirname "$0")" || exit 1
-PY="$(command -v python3)"
+# 解释器选择：项目 venv 优先（依赖锁定见 requirements.txt），回退 PATH 上的 python3
+if [ -x ".venv/bin/python3" ]; then PY="$PWD/.venv/bin/python3"; else PY="$(command -v python3)"; fi
 PORT=8317
 URL="http://127.0.0.1:$PORT/"
 
@@ -26,5 +27,5 @@ fi
 
 open "$URL"
 echo "🌐 已在浏览器打开 $URL"
-echo "（停止控制台: pkill -f webapp/server.py）"
+echo "（停止控制台: pkill -f \"$PWD/webapp/server.py\"）"
 exit 0

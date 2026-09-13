@@ -20,6 +20,8 @@ coverage/
 
 # ---------- Runtime data (运行时生成，不入仓) ----------
 data/*.db
+data/*.db-shm
+data/*.db-wal
 data/*.sqlite
 data/*.sqlite3
 logs/*.log
@@ -27,6 +29,9 @@ logs/*.json
 logs/orders/
 logs/reports/
 logs/session/
+logs/quotes/
+logs/backup/
+logs/state/
 
 # ---------- OS ----------
 .DS_Store

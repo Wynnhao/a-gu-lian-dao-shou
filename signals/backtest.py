@@ -107,9 +107,9 @@ def _limit_up_price(prev_close: float, code: str) -> float:
 
 
 def _per_year(nav: pd.Series) -> dict:
-    """分年度收益拆解。"""
+    """分年度收益拆解（index 为 YYYY-MM-DD 字符串）。"""
     out = {}
-    for y, seg in nav.groupby(nav.index.year):
+    for y, seg in nav.groupby([str(x)[:4] for x in nav.index]):
         if len(seg) < 2:
             continue
         out[str(y)] = round(float(seg.iloc[-1] / seg.iloc[0] - 1.0), 4)

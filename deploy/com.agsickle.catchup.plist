@@ -8,8 +8,8 @@
     <string>A股镰刀手 兜底补跑：机器漏开错过的定时任务，唤醒后合并补跑（每30分钟尝试，无事即秒退）</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/Xcode.app/Contents/Developer/usr/bin/python3</string>
-        <string>/Users/xuwenhao/Desktop/A股镰刀手/pipeline/catchup.py</string>
+        <string>/bin/zsh</string>
+        <string>/Users/xuwenhao/Desktop/A股镰刀手/deploy/run_catchup.sh</string>
     </array>
     <key>StartInterval</key>
     <integer>1800</integer>
