@@ -1,6 +1,6 @@
 # A股镰刀手 · 项目索引
 
-> A股 AI 模拟交易系统 v1.2 ｜ paper 模拟盘（不接实盘）｜ 规则引擎硬裁决 + LLM 决策 + 人工闸门
+> A股 AI 模拟交易系统 v1.3 ｜ paper 模拟盘（不接实盘）｜ 规则引擎硬裁决 + LLM 决策 + 人工闸门 + 市场环境总闸
 > 状态：**P6 模拟盘试运行就绪**（代码与功能完整性审查已通过，见 docs/代码审查报告.md）
 > 本文件是全项目导航索引；总体设计见 [技术方案.md](技术方案.md)
 
@@ -12,9 +12,11 @@
 |---|---|
 | 打开看板 | 双击 **`启动控制台.command`**（或 `python3 webapp/server.py` → http://127.0.0.1:8317） |
 | 看门狗安装/卸载 | 双击 **`看门狗开关.command`**（按当前状态自动切换；装好后需一次性授权，步骤脚本会打印） |
-| 跑测试 | `python3 tests/run_all.py`（9 个文件 136 用例，全部离线，聚合入口；也可逐个直跑） |
+| 跑测试 | `python3 tests/run_all.py`（10 个文件 158 用例，全部离线，聚合入口；也可逐个直跑） |
 | 重建前端 | `cd webapp/frontend && npm run build`（产物 → webapp/dist，Storybook: `npm run storybook`） |
 | 补跑漏掉的任务 | `python3 pipeline/catchup.py`（幂等，随时可跑；4 个 cron 首步也会自动跑它） |
+| 回填信号全史 | `python3 -m signals.signals --backfill`（逐日重算 signal 表，幂等；score 口径变更后必须重跑） |
+| 回补中证800宇宙 | `python3 -m data.universe800`（腾讯源，幂等可续跑；回测宇宙去幸存者化） |
 
 ## 每日节奏（交易日，4 个 ZCode cron 已建）
 
@@ -43,7 +45,7 @@ A股镰刀手/
 │   └── com.agsickle.catchup.plist  # launchd 看门狗定义（看门狗开关脚本安装它）
 │
 ├── data/                     # ── 数据层 ──
-│   ├── fetcher.py            # 行情增量入库（东财主源+腾讯兜底；退避熔断/量纲归一/官方涨跌幅/前复权列；盘中防半根bar）
+│   ├── fetcher.py            # 行情增量入库（东财主源+腾讯兜底；退避熔断/量纲归一/官方涨跌幅/前复权OHLC列；指数日线H/L；盘中防半根bar）
 │   ├── news.py               # 资讯采集（个股新闻+公告+市场快讯与宏观日历并行，去重幂等）
 │   ├── macro.py              # 指数日线 + PE/PB 历史分位（乐咕乐股，多源降级）
 │   ├── quotes.py             # 盘中实时行情（腾讯批量主源+东财兜底，30s TTL，快照审计 logs/quotes/）
@@ -52,8 +54,8 @@ A股镰刀手/
 │
 ├── signals/                  # ── 信号层 ──
 │   ├── factors.py            # 因子库：MA/RSI/ATR/动量/换手分位/涨跌停幅度（纯函数）
-│   ├── signals.py            # 信号计算 → signal 表（双 profile：reversal_lowvol 默认/momentum；复权价优先）
-│   ├── backtest.py           # 回测（可成交口径+统一成本+双profile对比+分年度）→ logs/backtest_result.json
+│   ├── signals.py            # 信号计算 → signal 表（双 profile：reversal_lowvol 截面 rank 打分/momentum 时序；复权价优先；--backfill 全史回填）
+│   ├── backtest.py           # 回测（复权价+可成交口径+统一成本+生产同源 score+双profile对比）→ logs/backtest_result.json
 │   ├── dynpool.py            # 动态池读写（按日留痕，当前成员=最新刷新行）
 │   ├── movers.py             # 异动池：五规则筛异动（涨幅/放量/振幅/加速/新高新低，全市场快照优先+降级链）
 │   └── hot.py                # 热门池：题材关键词计数+个股新闻突增+概念板块榜（TTL缓存）
@@ -64,7 +66,8 @@ A股镰刀手/
 │
 ├── risk/                     # ── 风控层 ──
 │   ├── blacklist.py          # 黑名单（上市<60日/ST/N次新）+ 数据健康检查
-│   ├── engine.py             # 19条硬规则裁决（仓位/价格/T+1/涨跌停/时段/次数/kill熔断/止损/概念集中度/流动性/往返），所有下单必经
+│   ├── regime.py             # 市场环境总闸（RSRS三档+二八轮动→动态总仓位cap）+ 波动率目标仓位 + ATR自适应止损线
+│   ├── engine.py             # 19条硬规则裁决（仓位/动态总闸/价格/T+1/涨跌停/时段/次数/kill熔断/ATR自适应止损/概念集中度/流动性/往返），所有下单必经
 │   └── notify.py             # 主动通知（macOS 通知中心+webhook：kill/回读失败/成交失败/pending）
 │
 ├── execution/                # ── 执行层 ──
@@ -82,7 +85,7 @@ A股镰刀手/
 ├── review/                   # ── 复盘层 ──
 │   ├── daily.py              # 盯市(portfolio_state) + 每日复盘报告（含决策结果回填 t1_ret/方向）logs/reports/YYYY-MM-DD.md
 │   ├── weekly.py             # 周报：vs 沪深300 + 简化归因 + 决策质量章节（命中率/置信度校准）
-│   └── signal_eval.py        # 信号有效性评估：因子 RankIC / score 五分位 / 入池后胜率
+│   └── signal_eval.py        # 信号有效性评估：因子 RankIC / score 五分位 / 滚动IC / profile 切换判据
 │
 ├── webapp/                   # ── Web 控制台 ──
 │   ├── server.py             # stdlib 后端（22 GET + 2 POST 端点；127.0.0.1:8317；GET/POST 均校验 Host，写接口三重来源防护）
@@ -92,10 +95,10 @@ A股镰刀手/
 │   │   └── dist/             # 构建产物（server 优先服务）
 │   └── static/               # 旧版前端（已被 dist 替代，保留备用）
 │
-├── tests/                    # 9 个测试文件 136 用例（python3 tests/run_all.py 聚合直跑，全离线）
-│   ├── test_risk_engine.py(34) test_execution.py(25) test_signals.py(21) test_webapp.py(4)
-│   ├── test_ai_pipeline.py(17) test_review.py(15) test_news_macro.py(7) test_quotes.py(7)
-│   └── test_movers_hot.py(6)；run_all.py 为聚合入口
+├── tests/                    # 10 个测试文件 158 用例（python3 tests/run_all.py 聚合直跑，全离线）
+│   ├── test_risk_engine.py(39) test_regime.py(11) test_execution.py(25) test_signals.py(27)
+│   ├── test_ai_pipeline.py(17) test_review.py(15) test_webapp.py(4) test_news_macro.py(7)
+│   ├── test_quotes.py(7) test_movers_hot.py(6)；run_all.py 为聚合入口
 │
 ├── logs/                     # 运行产物（全部可删，自动重建）
 │   ├── reports/              # 日报 YYYY-MM-DD.md / 周报 YYYY-Www.md / 盘中扫描 intraday-*.md
@@ -106,8 +109,8 @@ A股镰刀手/
 │   └── backtest_result.json  # 最新回测结果
 │
 ├── docs/                     # ── 文档 ──
-│   ├── 决策策略与工作流.md      # 决策包构成/LLM规则/19条裁决/全链路工作流/兜底机制（看板内嵌渲染）
-│   ├── 策略库.md              # 19 个策略（GitHub开源+大赛复盘+因子，带来源URL与兼容度分级）
+│   ├── 决策策略与工作流.md      # v1.3 决策包构成/LLM规则/19条裁决/市场环境总闸/profile切换判据（看板内嵌渲染）
+│   ├── 策略库.md              # 19 个策略（带来源URL与兼容度分级）+ §10 落地状态与实证结果
 │   ├── 代码审查报告.md         # 2026-09-13 全面审查：P0=0，P1×3已修，回测前视修正说明
 │   └── 优化修复纪要.md         # 2026-09-13 多维审查（数据/风控/信号/AI/工程）40+ 项修复清单与遗留项
 │
@@ -137,11 +140,13 @@ A股镰刀手/
 
 | 段 | 内容 |
 |---|---|
-| risk 新增 | stop_loss_pct(单票止损8%) / max_concept_weight(概念集中度45%) / max_amount_share(流动性1%) |
+| risk 新增 | stop_loss_pct(止损基础线8%) / atr_stop_mult(2.0，ATR自适应止损=max(8%,2×ATR%)) / max_concept_weight(概念集中度45%) / max_amount_share(流动性1%) |
+| regime / vol_target | 市场环境总闸：RSRS(18日H/L回归,600日标准分,±1)三档(满配80%/半配50%/避险20%) + 二八20日动量皆弱→避险；波动率目标(年化30%,净值≥21样本) |
+| universe_member | 回测宇宙成员留痕（中证800成分快照；宇宙票不进 stock_info） |
 | execution 新增 | slippage_bps(滑点10) / volume_participation_cap(成交量参与1%) / sim_limit_halt(停板模拟) |
 | notify | enabled/osascript/webhook_url —— kill、回读失败、成交失败、pending 生成推送 |
 | data | start_date / source_cooldown_min / source_max_fail —— 采集与熔断 |
-| signals | profile: reversal_lowvol（默认）或 momentum
+| signals | profile: reversal_lowvol（默认，截面 rank 打分）或 momentum（时序）
 
 ## 看板 API 索引（webapp/server.py，全部 JSON）
 
@@ -162,6 +167,7 @@ A股镰刀手/
 ## 当前状态与 P6 前待办
 
 - ✅ P1~P5 全部落地；2026-09-13 多维审查 40+ 项修复完成（见 docs/优化修复纪要.md）；136 测试全绿；账本干净基线（¥1,000,000 空仓）
-- ⏳ 待办 1：一次性人工操作——①看门狗授权（双击看门狗开关后按打印步骤）；②`python3 -m data.audit --fix` 修复存量量纲；③东财解封后跑 `python3 data/fetcher.py` 回填前复权列
+- ✅ 2026-09-14 策略库审查落地：score 截面化+signal 全史回填（18,946 样本）+复权 OHLC 全库覆盖（腾讯源）+市场环境总闸+ATR 自适应止损+profile 切换判据+中证800 宇宙回补（详见 docs/策略库.md §10）
+- ⏳ 待办 1：一次性人工操作——①看门狗授权（双击看门狗开关后按打印步骤）；②`python3 -m data.audit --fix` 修复存量量纲；③东财解封后跑 `python3 data/fetcher.py`（腾讯源已回填复权列，东财恢复后再跑一次统一口径）
 - ⏳ 待办 2：同花顺实机演练 3 次（按 execution/runbook_ths.md）；mode=ui 已被代码层硬拒，演练需 AGSICKLE_ALLOW_UI=1
 - ▶ 就绪后进入 **P6：连续 20 交易日模拟盘试运行**（验收口径见技术方案 §5.5；决策质量/信号有效性统计链路已就绪）

@@ -69,7 +69,7 @@ def _recent_trade_dates(conn, n: int = BACKFILL_WINDOW) -> List[str]:
 def _is_trading_day(conn, d: date) -> bool:
     """交易日判断：交易日历优先，缺失退化 weekday（此前节假日照常跑流水线）。"""
     try:
-        from data.calendar import is_trading_day
+        from data.trade_cal import is_trading_day
         return is_trading_day(conn, d)
     except Exception:  # noqa: BLE001
         return d.weekday() < 5
@@ -167,7 +167,7 @@ def catch_up(now: Optional[datetime] = None) -> int:
                 _say("  ↳ 补跑 %s 失败: %r" % (td, e))
         # 回补窗口之外的缺失日显式警告（此前静默漏补）
         try:
-            from data.calendar import recent_trade_days
+            from data.trade_cal import recent_trade_days
             older = [d for d in recent_trade_days(conn, 60)
                      if d < today_str and d < (min(tds) if tds else today_str)]
             missing_old = [d for d in older

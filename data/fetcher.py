@@ -537,6 +537,11 @@ def upsert_info(item: dict, conn: sqlite3.Connection):
 
 def run():
     conn = get_conn()
+    try:  # 交易日历缓存（best-effort，失败退化 weekday 判断）
+        from data.trade_cal import ensure_calendar
+        ensure_calendar(conn)
+    except Exception as e:  # noqa: BLE001
+        log.warning("交易日历初始化跳过: %s", repr(e)[:80])
     for item in CFG["watchlist"]:
         code = item["code"]
         try:

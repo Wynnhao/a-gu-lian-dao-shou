@@ -335,10 +335,13 @@ def load_and_save(json_path, run_date: Optional[str] = None,
                                   ensure_ascii=False)
         else:
             snapshot = text
+        # 引用核验锚定 bundle 内容（此前误传决策文件原文，理由必然命中，核验形同虚设）
+        anchor_text = json.dumps(bundle_obj, ensure_ascii=False) \
+            if bundle_obj is not None else ""
         ids = save_decisions(conn, data, snapshot, run_date,
                              trade_date=run_date, model=model,
                              prompt_version=PROMPT_VERSION,
-                             bundle_text=text)
+                             bundle_text=anchor_text)
         statuses = dict(conn.execute(
             "SELECT status, COUNT(*) FROM decision WHERE id IN (%s) GROUP BY status"
             % ",".join("?" * len(ids)), ids).fetchall()) if ids else {}
