@@ -153,6 +153,11 @@ def fetch_all_market_spot() -> Optional[List[dict]]:
     约 5500+ 只候选（字段为英文 code/name/zdf/zf/zxj/turnover；列名与 em 不一致，
     调用方 compute_market_movers 需做兼容）。腾讯快照也是"上一交易日盘后"口径。
     """
+    # 测试逃生门：短路全市场快照网络面（调用时读 env），调用方降级自选池口径
+    import os
+    if os.environ.get("AGSICKLE_DISABLE_SPOT") == "1":
+        log.info("AGSICKLE_DISABLE_SPOT=1，跳过全市场快照")
+        return None
     import time
     import akshare as ak
 

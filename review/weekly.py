@@ -21,6 +21,7 @@ BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
+import os
 import sqlite3
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -310,7 +311,9 @@ def weekly_report(end_date: Optional[str] = None,
             content_lines.append("- 无")
         content_lines.append("")
 
-        target_dir = Path(out_dir) if out_dir is not None else (BASE / "logs" / "reports")
+        # 报告目录调用时读 env（测试隔离 AGSICKLE_REPORTS_DIR；与 daily.py 同模式）
+        target_dir = Path(out_dir) if out_dir is not None else Path(
+            os.environ.get("AGSICKLE_REPORTS_DIR") or (BASE / "logs" / "reports"))
         target_dir.mkdir(parents=True, exist_ok=True)
         path = target_dir / f"{iso_year}-W{iso_week:02d}.md"
         path.write_text("\n".join(content_lines), encoding="utf-8")

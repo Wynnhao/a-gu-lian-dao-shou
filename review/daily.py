@@ -21,6 +21,7 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 import json
+import os
 import sqlite3
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -500,7 +501,9 @@ def generate_daily_report(trade_date: Optional[str] = None,
             lines.append(body)
             lines.append("")
 
-        target_dir = Path(out_dir) if out_dir is not None else (BASE / "logs" / "reports")
+        # 报告目录调用时读 env（测试隔离 AGSICKLE_REPORTS_DIR；与 fetcher.AGSICKLE_DB 同模式）
+        target_dir = Path(out_dir) if out_dir is not None else Path(
+            os.environ.get("AGSICKLE_REPORTS_DIR") or (BASE / "logs" / "reports"))
         target_dir.mkdir(parents=True, exist_ok=True)
         # P0 修复：trade_date 早于今日时绝不覆写昨日日报，写 PENDING 兜底；
         # postclose 已做此校验，这里是兜底保护（其它入口如 catchup 调到这里）。

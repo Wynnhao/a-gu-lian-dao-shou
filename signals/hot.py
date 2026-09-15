@@ -169,6 +169,10 @@ def board_hot(top_n: int = 8, force: bool = False) -> List[dict]:
     if not force and (_time.monotonic() - _board_cache["ts"]) < _BOARD_TTL:
         return _board_cache["rows"]
     _board_cache["ts"] = _time.monotonic()
+    # 测试逃生门：短路板块榜网络面（调用时读 env）
+    import os
+    if os.environ.get("AGSICKLE_DISABLE_SPOT") == "1":
+        return _board_cache["rows"]
     try:
         import akshare as ak
         df = ak.stock_board_concept_name_em()
