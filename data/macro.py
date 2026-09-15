@@ -2,6 +2,7 @@
 import argparse
 import logging
 import logging.handlers
+import os
 import sys
 import time
 from datetime import date
@@ -229,6 +230,10 @@ def _valuation_one(code: str, conn, years: int = 5) -> dict:
 
 def fetch_index_valuation(codes=None, years: int = 5) -> dict:
     """各指数估值分位入库，单指数失败降级（价格分位口径），返回 {code: 摘要dict}。"""
+    # 测试逃生门：短路指数估值网络面（调用时读 env）
+    if os.environ.get("AGSICKLE_DISABLE_MACRO") == "1":
+        log.info("AGSICKLE_DISABLE_MACRO=1，跳过指数估值采集")
+        return {}
     if codes is None:
         codes = list(INDEX_CODES)
     conn = get_conn()

@@ -28,8 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from data.fetcher import get_conn
 from risk.blacklist import check_blacklist, health_check
-from risk.engine import (RiskContext, Verdict, check, record_event, apply_kill_switch,
-                         limit_price)
+from risk.engine import (RiskContext, Verdict, check, record_event, apply_kill_switch)
 from risk.notify import notify
 from execution.paper import PaperBroker, compute_fees
 

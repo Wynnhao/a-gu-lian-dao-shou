@@ -16,6 +16,7 @@
 import json
 import logging
 import logging.handlers
+import os
 import sqlite3
 import time
 from datetime import datetime, date, timedelta
@@ -149,7 +150,9 @@ _MIGRATIONS = [
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(BASE / CFG["db_path"], timeout=15)
+    # AGSICKLE_DB：测试逃生门，子进程黑盒测试用它把 DB 隔离到临时库
+    db_file = os.environ.get("AGSICKLE_DB") or BASE / CFG["db_path"]
+    conn = sqlite3.connect(db_file, timeout=15)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=15000")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -612,6 +615,10 @@ def upsert_info(item: dict, conn: sqlite3.Connection):
 
 
 def run():
+    # 测试逃生门：短路整个日线采集网络面（调用时读 env，沿用 AGSICKLE_DISABLE_* 模式）
+    if os.environ.get("AGSICKLE_DISABLE_FETCHER") == "1":
+        log.info("AGSICKLE_DISABLE_FETCHER=1，跳过日线采集")
+        return
     conn = get_conn()
     try:  # 交易日历缓存（best-effort，失败退化 weekday 判断）
         from data.trade_cal import ensure_calendar

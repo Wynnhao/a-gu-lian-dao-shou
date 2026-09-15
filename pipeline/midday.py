@@ -11,6 +11,7 @@ LLM（会话）读取该文件后做增量决策：证据无显著变化必须�
 """
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -24,7 +25,8 @@ from data import quotes                    # noqa: E402
 from data.news import fetch_all, get_recent_news  # noqa: E402
 from execution import runner               # noqa: E402
 
-SESSION_DIR = BASE / "logs" / "session"
+# 测试隔离：AGSICKLE_SESSION_DIR 覆盖会话产物目录（import 期读 env，与 runner.ORDERS_DIR 同模式）
+SESSION_DIR = Path(os.environ.get("AGSICKLE_SESSION_DIR") or (BASE / "logs" / "session"))
 
 
 def _latest_run_date(conn) -> str:

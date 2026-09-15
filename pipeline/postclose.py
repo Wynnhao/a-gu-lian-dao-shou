@@ -8,6 +8,7 @@ if str(BASE) not in sys.path:
 import argparse
 import logging
 import logging.handlers
+import os
 from datetime import date, datetime
 from typing import Optional
 
@@ -27,7 +28,8 @@ if not log.handlers:
 log.propagate = False
 
 
-REPORTS_DIR = BASE / "logs" / "reports"
+# 测试隔离：AGSICKLE_REPORTS_DIR 覆盖产物目录（import 期读 env，与 runner.ORDERS_DIR 同模式）
+REPORTS_DIR = Path(os.environ.get("AGSICKLE_REPORTS_DIR") or (BASE / "logs" / "reports"))
 
 
 def _write_pending(trade_date: str, today_iso: str) -> Path:

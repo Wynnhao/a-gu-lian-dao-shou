@@ -8,6 +8,7 @@
 import json
 import logging
 import logging.handlers
+import os
 import re
 import time
 from datetime import datetime
@@ -145,6 +146,16 @@ def get_live_prices(codes: List[str], force: bool = False) -> Dict[str, dict]:
     """
     global _last_fetch
     codes = [str(c) for c in codes]
+    # 测试逃生门：AGSICKLE_MOCK_QUOTES=<path.json> 指向 {code: quote_dict} 快照，
+    # 黑盒测试用它打桩实时行情，绝不出网（调用时读 env）。
+    mock_path = os.environ.get("AGSICKLE_MOCK_QUOTES")
+    if mock_path:
+        try:
+            data = json.loads(Path(mock_path).read_text(encoding="utf-8"))
+            return {c: data[c] for c in codes if c in data}
+        except (OSError, ValueError, KeyError) as e:
+            log.warning("MOCK_QUOTES 读取失败 %s: %s", mock_path, e)
+            return {}
     now = time.monotonic()
     if not force and _last_fetch is not None and (now - _last_fetch) < TTL_SECONDS:
         hit = {c: _cache[c][0] for c in codes if c in _cache}

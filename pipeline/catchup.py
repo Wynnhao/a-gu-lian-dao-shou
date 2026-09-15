@@ -23,6 +23,7 @@ LLM 决策缺失的安全语义：当天没有决策 = 当天不交易（fail-sa
 退出码：0=无可补或已补齐；1=部分补跑失败（详见输出）；2=盘中触发过 kill。
 """
 import fcntl
+import os
 import subprocess
 import sys
 from datetime import date, datetime, timedelta
@@ -36,9 +37,11 @@ if str(BASE) not in sys.path:
 from data import fetcher                       # noqa: E402
 from review import daily, weekly               # noqa: E402
 
-REPORTS_DIR = BASE / "logs" / "reports"
-SESSION_DIR = BASE / "logs" / "session"
-STATE_DIR = BASE / "logs" / "state"
+# 测试隔离：AGSICKLE_REPORTS_DIR/SESSION_DIR 覆盖产物目录（import 期读 env，
+# 与 runner.ORDERS_DIR 同模式）；STATE_DIR 承载心跳/锁文件，一并可隔离
+REPORTS_DIR = Path(os.environ.get("AGSICKLE_REPORTS_DIR") or (BASE / "logs" / "reports"))
+SESSION_DIR = Path(os.environ.get("AGSICKLE_SESSION_DIR") or (BASE / "logs" / "session"))
+STATE_DIR = Path(os.environ.get("AGSICKLE_STATE_DIR") or (BASE / "logs" / "state"))
 HEARTBEAT_FILE = STATE_DIR / "catchup_heartbeat"
 LOCK_FILE = BASE / "logs" / ".catchup.lock"
 LOG_TAG = "[catchup]"

@@ -12,6 +12,7 @@
 """
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -29,7 +30,8 @@ from risk.engine import (record_event, stop_loss_breaches,  # noqa: E402
                          stop_loss_line)
 from risk.notify import notify             # noqa: E402
 
-REPORTS_DIR = BASE / "logs" / "reports"
+# 测试隔离：AGSICKLE_REPORTS_DIR 覆盖产物目录（import 期读 env，与 runner.ORDERS_DIR 同模式）
+REPORTS_DIR = Path(os.environ.get("AGSICKLE_REPORTS_DIR") or (BASE / "logs" / "reports"))
 
 
 def _pending_drift(conn, now: datetime) -> list:

@@ -4,6 +4,7 @@ import json
 import logging
 import logging.handlers
 import math
+import os
 import sqlite3
 import sys
 import time
@@ -267,6 +268,10 @@ def fetch_market_news(conn=None, since=None, limit: int = 15) -> int:
 
 def fetch_all(since=None) -> dict:
     """watchlist 全部 code + 市场级 + 公告，逐个 try/except 降级，返回 {来源: 新增条数}。"""
+    # 测试逃生门：短路新闻/公告网络面（调用时读 env）
+    if os.environ.get("AGSICKLE_DISABLE_NEWS") == "1":
+        log.info("AGSICKLE_DISABLE_NEWS=1，跳过新闻采集")
+        return {}
     conn = get_conn()
     result = {}
     for item in CFG["watchlist"]:

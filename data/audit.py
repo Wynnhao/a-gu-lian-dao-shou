@@ -15,6 +15,7 @@ volume（与「手」差 100 倍）、首行 pct_chg 丢真值——fetch_log �
 import argparse
 import logging
 import logging.handlers
+import os
 import sqlite3
 import time
 from datetime import datetime
@@ -29,7 +30,9 @@ if not log.handlers:
     log.addHandler(logging.StreamHandler())
 log.propagate = False
 
-BACKUP_DIR = BASE / "logs" / "backup"
+# 测试隔离：AGSICKLE_BACKUP_DIR 覆盖备份目录（import 期读 env，与 runner.ORDERS_DIR 同模式）
+# ——堵住 postclose→audit(backup=True) 在测试里向真实 logs/backup 写 VACUUM 快照的缺口
+BACKUP_DIR = Path(os.environ.get("AGSICKLE_BACKUP_DIR") or (BASE / "logs" / "backup"))
 BACKUP_KEEP = 30
 
 # 停板幅度按代码前缀：创业/科创 ±20%（300/301/302/688/689，302 为创业板新代码段），
