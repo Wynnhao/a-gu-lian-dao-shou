@@ -23,7 +23,7 @@ from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
-from risk.engine import record_event
+from risk.engine import limit_pct, record_event
 
 FULL_CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
 EXEC_CFG_DEFAULT = dict(FULL_CFG.get("execution", {}))
@@ -135,7 +135,7 @@ class PaperBroker:
         if self.cfg.get("sim_limit_halt", True) and price > 0:
             pc = self.prev_close(conn, code)
             if pc:
-                pct = 0.20 if str(code).startswith(("30", "68")) else 0.10
+                pct = limit_pct(code)  # 停板幅度统一走风控引擎口径（含北交所30%）
                 if side == "buy" and price > _limit_price(pc, pct, True) + 1e-9:
                     raise _Reject("买价 %.2f 超涨停价，涨停无法成交" % price)
                 if side == "sell" and price < _limit_price(pc, pct, False) - 1e-9:
@@ -183,12 +183,22 @@ class PaperBroker:
             return True
         return False
 
-    def unlock_t_plus_1(self, conn: sqlite3.Connection) -> int:
-        """T+1 解锁：avail_shares 同步为 shares（供盘前流水线在每个交易日开盘前调用）。"""
-        cur = conn.execute("UPDATE position SET avail_shares=shares")
+    def unlock_t_plus_1(self, conn: sqlite3.Connection,
+                        as_of: Optional[str] = None) -> int:
+        """T+1 解锁：avail_shares 同步为 shares，但 as_of 当日买入的部分除外。
+
+        盘前流水线在每个交易日开盘前调用。显式扣除当日买入，防止盘中补跑
+        盘前流水线把当天刚买入的仓位提前解锁（破坏 T+1）。
+        """
+        d = as_of or datetime.now().strftime("%Y-%m-%d")
+        cur = conn.execute(
+            "UPDATE position SET avail_shares = MAX(shares - COALESCE("
+            "(SELECT SUM(t.shares) FROM trade t WHERE t.code = position.code "
+            "AND t.side = 'buy' AND t.trade_date = ?), 0), 0)", (d,))
         conn.commit()
         if cur.rowcount:
-            log.info("unlock_t_plus_1: %d 只持仓可卖数量已同步为持股数", cur.rowcount)
+            log.info("unlock_t_plus_1: %d 只持仓可卖数量已同步（扣除 %s 当日买入）",
+                     cur.rowcount, d)
         return cur.rowcount
 
     # ------------------------------------------------------------ 行情

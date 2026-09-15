@@ -124,11 +124,11 @@ def main(argv=None) -> int:
         if issues:
             log.warning("【今日只出报告不下单】数据健康异常: %s", "；".join(issues))
 
-        # 5. T+1 解锁：隔夜后昨日买入全部可卖
+        # 5. T+1 解锁：隔夜后昨日买入全部可卖（当日买入除外——盘中补跑不得提前解锁）
         try:
-            cur = conn.execute("UPDATE position SET avail_shares=shares")
-            conn.commit()
-            log.info("步骤5 T+1 解锁完成，更新 %d 行", cur.rowcount if cur.rowcount else 0)
+            from execution.paper import PaperBroker
+            n = PaperBroker().unlock_t_plus_1(conn)
+            log.info("步骤5 T+1 解锁完成，更新 %d 行", n)
         except Exception as e:
             log.error("步骤5 T+1 解锁 FAIL（继续）: %s", repr(e))
 

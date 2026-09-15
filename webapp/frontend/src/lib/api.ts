@@ -124,6 +124,8 @@ export interface ConceptStock {
   close: number | null;
   pct_chg: number | null;
   bar_date: string | null;
+  amount?: number | null;
+  source?: string | null;
   score: number | null;
   ma_trend?: string;
   rsi_14?: number | null;
@@ -149,6 +151,7 @@ export interface DynPoolRow {
   reasons: string[];
   strength: number;
   added_date: string;
+  mode?: string;
 }
 
 export interface DynamicPools {
@@ -158,6 +161,28 @@ export interface DynamicPools {
   boards: { board: string; pct_chg: number }[];
   dates: Record<string, string[]>;
   updated_at: string | null;
+}
+
+export interface DataStatus {
+  generated_at: string;
+  latest_bar_date: string | null;
+  watchlist_total: number;
+  watchlist_lagging: { code: string; name: string; latest_bar_date: string | null }[];
+  indexes: { index_code: string; latest_date: string | null }[];
+  pools: { pool: string; added_date: string | null; mode: string; count: number }[];
+  signal: { as_of: string | null; rows: number };
+  decision: { run_date: string | null; rows_latest: number };
+  sources_30d: { source: string | null; rows: number; latest_date: string | null }[];
+  recent_fails: { code: string; run_at: string; detail: string }[];
+  audit: {
+    total?: number;
+    kinds?: Record<string, number>;
+    sample?: { kind: string; code: string; date: string; detail: string }[];
+    checked_at?: string;
+    error?: string;
+  };
+  session: { run_date: string | null; bundle_mtime: string | null; decision: boolean };
+  quotes_audit: { latest_file: string | null; age_min: number | null };
 }
 
 export interface Decision {

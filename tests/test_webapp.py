@@ -140,6 +140,20 @@ def test_report_missing_is_404():
     assert st == 404, st
 
 
+@test
+def test_data_status_endpoint():
+    """数据状态总览：空库也应 200，且各分节键齐全（新鲜度/源/体检/会话）。"""
+    st, body = SRV.get("/api/data_status")
+    assert st == 200, (st, body[:200])
+    d = json.loads(body)
+    for k in ("generated_at", "latest_bar_date", "watchlist_total", "watchlist_lagging",
+              "indexes", "pools", "signal", "decision", "sources_30d",
+              "recent_fails", "audit", "session", "quotes_audit"):
+        assert k in d, k
+    assert d["audit"].get("total") == 0          # 空库体检应为 0 问题
+    assert [p["pool"] for p in d["pools"]] == ["movers", "hot_theme", "hot_stock"]
+
+
 def _setup():
     global SRV
     SRV = Server()

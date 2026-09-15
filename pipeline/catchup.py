@@ -11,6 +11,9 @@
 - 历史缺失日的盯市 + 日报（+周五周报）——纯 DB/文件操作，可完全自动；
 - 盘中兜底（交易日 9:00-15:00）：盘前 bundle 过期则重跑盘前流水线；
   11:00 后午间包缺失则重跑午评准备；有持仓则跑尾盘级 kill 安全网扫描；
+- 盘后当日补全（交易日 15:10 后）：postclose 因当日日线未出而写 PENDING 退出后，
+  日线一旦到位（fetcher 每 30 分钟自动补）即重跑 postclose 完成当日盯市/日报，
+  并清除 PENDING 兜底文件——保证"每天日线当天收盘后补完"；
 - 动态池刷新（锚点滞后于最新交易日时）。
 
 LLM 决策缺失的安全语义：当天没有决策 = 当天不交易（fail-safe），不自动伪造。
@@ -231,6 +234,28 @@ def catch_up(now: Optional[datetime] = None) -> int:
                 except Exception as e:  # noqa: BLE001
                     failures += 1
                     _say("  ↳ 动态池刷新失败: %r" % e)
+
+        # ---- 4) 盘后当日补全：收盘后日线已到但盯市/日报未完成 ----
+        # 场景：postclose 15:30 跑时数据源还没出当日日线 → 写 PENDING 退出(exit=2)；
+        # 此后 fetcher 每半小时把日线补上了，但没有节点重跑当日盯市/日报，
+        # 当天复盘就一直缺（2026-09-15 实测）。这里闭环：日线到位后重跑 postclose。
+        after_close = (now.hour, now.minute) >= (15, 10)
+        if trading_day and after_close and latest_td == today_str:
+            ps = conn.execute(
+                "SELECT note FROM portfolio_state WHERE date=?", (today_str,)).fetchone()
+            state_ok = bool(ps and ("价格日期=%s" % today_str) in (ps[0] or ""))
+            pending_stale = (REPORTS_DIR / ("PENDING-" + today_str + ".md")).is_file()
+            if pending_stale or not state_ok:
+                _say("步骤4 盘后当日补全（日线已到 %s，盯市/日报未完成）→ 重跑 postclose"
+                     % today_str)
+                if not _run_script("pipeline/postclose.py", timeout=900):
+                    failures += 1
+                else:
+                    try:
+                        (REPORTS_DIR / ("PENDING-" + today_str + ".md")).unlink()
+                        _say("  ↳ PENDING 兜底文件已清除（数据已补齐）")
+                    except OSError:
+                        pass
     finally:
         conn.close()
 

@@ -184,12 +184,45 @@ def _session():
 
 
 _fail_counts: dict = {}   # source -> 连续失败次数
-_blocked_until: dict = {}  # source -> 解禁时间戳（连续失败达到上限后冷却）
+_blocked_until: dict = {}  # source -> 解禁时间戳（epoch 秒，墙钟；跨进程持久）
+
+# 熔断状态落盘：fetcher 总在短命进程里跑（launchd/catchup 每30分钟拉起一次），
+# 纯进程内 dict 的冷却期跨不过进程边界，死源每个周期都被重新探测 SOURCE_MAX_FAIL 次
+#（09-15 em 全天封禁当日即复现）。冷却状态写 logs/state/source_health.json，
+# 新进程 import 时载入未过期的冷却项；墙钟时间戳保证跨进程语义一致。
+_BREAKER_FILE = BASE / "logs" / "state" / "source_health.json"
+
+
+def _load_breaker() -> dict:
+    """读取落盘的冷却状态，自动丢弃已过期项；文件缺失/损坏视为无冷却。"""
+    try:
+        raw = json.loads(_BREAKER_FILE.read_text(encoding="utf-8"))
+        now = time.time()
+        return {str(k): float(v) for k, v in raw.items() if float(v) > now}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+
+def _save_breaker() -> None:
+    """冷却状态原子落盘（tmp+replace）；失败仅告警，不影响主流程。"""
+    try:
+        _BREAKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        live = {k: v for k, v in _blocked_until.items() if v > now}
+        tmp = _BREAKER_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(live), encoding="utf-8")
+        tmp.replace(_BREAKER_FILE)
+    except OSError as e:
+        log.warning("熔断状态落盘失败: %s", e)
+
+
+_blocked_until.update(_load_breaker())  # import 期恢复上一进程留下的冷却期
 
 
 def source_blocked(source: str) -> bool:
-    """熔断：某数据源连续失败 SOURCE_MAX_FAIL 次后冷却 SOURCE_COOLDOWN_MIN 分钟。"""
-    return time.monotonic() < _blocked_until.get(source, 0.0)
+    """熔断：某数据源连续失败 SOURCE_MAX_FAIL 次后冷却 SOURCE_COOLDOWN_MIN 分钟
+    （状态落盘，跨进程/跨运行周期生效）。"""
+    return time.time() < _blocked_until.get(source, 0.0)
 
 
 def _mark_source(source: str, ok: bool):
@@ -199,8 +232,9 @@ def _mark_source(source: str, ok: bool):
     n = _fail_counts.get(source, 0) + 1
     _fail_counts[source] = n
     if n >= SOURCE_MAX_FAIL:
-        _blocked_until[source] = time.monotonic() + SOURCE_COOLDOWN_MIN * 60
-        log.warning("数据源 %s 连续失败 %d 次，冷却 %d 分钟",
+        _blocked_until[source] = time.time() + SOURCE_COOLDOWN_MIN * 60
+        _save_breaker()
+        log.warning("数据源 %s 连续失败 %d 次，冷却 %d 分钟（已落盘，跨进程生效）",
                     source, n, SOURCE_COOLDOWN_MIN)
 
 
@@ -217,7 +251,7 @@ def call_ak(source: str, fn, *args, retries: int = 2, **kw):
         except Exception as e:  # noqa: BLE001
             last = e
             if i < retries:
-                time.sleep(2 ** i)  # 2s/4s 退避
+                time.sleep(2 ** i)  # 1s/2s 退避
     _mark_source(source, False)
     raise last
 
@@ -337,6 +371,10 @@ def fetch_daily(code: str, conn: sqlite3.Connection) -> int:
     # 导致该半根 bar 永不被重取覆盖——窗口内一律截到昨日。
     if _market_data_window():
         end = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
+    # 今日 bar 是否真的缺失：已入库时增量起点 last+1 > end，双源返回空是正常
+    # 幂等重跑，不能当"全源失败"误报（2026-09-15 重跑实测误写 empty_today）。
+    today_str = date.today().strftime("%Y-%m-%d")
+    today_missing = (last or "") < today_str
 
     df, src = None, ""
     for src_name, fn in (("em", _hist_em), ("tx", _hist_tx)):
@@ -348,7 +386,23 @@ def fetch_daily(code: str, conn: sqlite3.Connection) -> int:
         if df is not None and not df.empty:
             src = src_name
             break
+        # P0 修复：返回空 df 也得落日志（之前 em fail 看不到 tx 是否也是空的）
+        log.warning("%s via %s returned empty df (start=%s end=%s)",
+                    code, src_name, start, end)
     if df is None or df.empty:
+        # P0 修复：今日全源失败要 fail-loud——em+tx 都返回空时写 fetch_log.status='empty_today'
+        # 供 webapp HealthPanel 红警；postclose 会沿用昨日盯市（fail-open）。
+        # 仅在今日 bar 确实缺失时报；幂等重跑（今日已有 bar）静默返回 0。
+        if end == today_str.replace("-", "") and today_missing:
+            log.error("今日日线全源失败: %s end=%s — daily_bar 不会更新，盯市/决策将沿用昨日",
+                      code, end)
+            try:
+                conn.execute(
+                    "INSERT INTO fetch_log VALUES (?,?,?,?,?)",
+                    (code, datetime.now().isoformat(timespec="seconds"),
+                     "empty_today", 0, "em+tx both empty"))
+            except Exception as e:  # noqa: BLE001
+                log.warning("fetch_log empty_today 写盘失败: %s", repr(e)[:120])
         return 0
 
     # 首行 pct_chg：东财官方列已带；腾讯源由库内前收盘推算（除息日口径也正确），
@@ -488,17 +542,39 @@ def _index_tx(code: str, start: str, end: str) -> pd.DataFrame:
     return out[(out["date"] >= pd.Timestamp(start)) & (out["date"] <= pd.Timestamp(end))]
 
 
+def _index_sina(code: str, start: str, end: str) -> pd.DataFrame:
+    """新浪指数日线（ak.stock_zh_index_daily，em/tx 双挂时的第三兜底）。
+
+    em/tx 都在 09-15 当日返回空时，新浪源通常仍能拿到上一交易日盘后数据；
+    速度约 0.2s/指数，比 em/tx 快得多。注意：列名是 date/open/high/low/close/volume。
+    """
+    sym = INDEX_TX_SYMBOL.get(code)
+    if sym is None:
+        raise ValueError(f"index {code} 无新浪 symbol 映射")
+    df = call_ak("sina", ak.stock_zh_index_daily, symbol=sym)
+    if df is None or df.empty:
+        return df
+    out = pd.DataFrame({
+        "date": pd.to_datetime(df["date"]),
+        "close": pd.to_numeric(df["close"], errors="coerce"),
+        "high": pd.to_numeric(df["high"], errors="coerce"),
+        "low": pd.to_numeric(df["low"], errors="coerce"),
+    })
+    return out[(out["date"] >= pd.Timestamp(start)) & (out["date"] <= pd.Timestamp(end))]
+
+
 def ensure_index_daily(conn: sqlite3.Connection, code: str,
                        start: str = "20180101") -> int:
-    """保障指数日线（含 high/low）最新：东财优先、腾讯兜底、都挂则沿用库内。
+    """保障指数日线（含 high/low）最新：东财主源 → 腾讯 → 新浪三档兜底。
 
     regime（二八轮动/RSRS）与回测基准共用；幂等 INSERT OR REPLACE。
+    P1 修复：加新浪 sina 兜底（em/tx 持续失败场景仍可拉到上一日数据）。
     """
     end = date.today().strftime("%Y%m%d")
     if _market_data_window():
         end = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
     df, src = None, ""
-    for src_name, fn in (("em", _index_em), ("tx", _index_tx)):
+    for src_name, fn in (("em", _index_em), ("tx", _index_tx), ("sina", _index_sina)):
         try:
             got = fn(code, start, end)
         except Exception as e:  # noqa: BLE001
@@ -509,7 +585,7 @@ def ensure_index_daily(conn: sqlite3.Connection, code: str,
             df, src = got, src_name
             break
     if df is None or df.empty:
-        log.warning("index %s 两个源均不可用，沿用库内已有数据", code)
+        log.warning("index %s 三个源均不可用，沿用库内已有数据", code)
         return 0
     rows = [(code, r["date"].strftime("%Y-%m-%d"),
              float(r["close"]) if pd.notna(r["close"]) else None,

@@ -502,6 +502,19 @@ def generate_daily_report(trade_date: Optional[str] = None,
 
         target_dir = Path(out_dir) if out_dir is not None else (BASE / "logs" / "reports")
         target_dir.mkdir(parents=True, exist_ok=True)
+        # P0 修复：trade_date 早于今日时绝不覆写昨日日报，写 PENDING 兜底；
+        # postclose 已做此校验，这里是兜底保护（其它入口如 catchup 调到这里）。
+        today_iso = date.today().isoformat()
+        if trade_date < today_iso:
+            pending_path = target_dir / f"PENDING-{today_iso}.md"
+            pending_path.write_text(
+                "# 待清算日报 %s\n\n"
+                "> generate_daily_report 检测到 trade_date=%s < today=%s\n\n"
+                "- 为避免覆写历史日报，已改写本兜底文件。\n"
+                "- 跑 `python -m pipeline.catchup --date %s` 补数据后再重跑 postclose。\n"
+                % (today_iso, trade_date, today_iso, today_iso),
+                encoding="utf-8")
+            return pending_path
         path = target_dir / f"{trade_date}.md"
         path.write_text("\n".join(lines), encoding="utf-8")
         return path

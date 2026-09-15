@@ -546,7 +546,7 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120) -> str:
     if not movers_rows and not themes and not stocks:
         lines.append("（无动态池数据）")
     lines += ["",
-              "> 注意：动态池内非自选池标的仅可输出 watch（观察），buy/sell 仍限自选池 30 只；"
+              "> 注意：动态池内非自选池标的仅可输出 watch（观察），buy/sell 仍限自选池（config.watchlist）；"
               "黑名单票仅展示（blacklist 标注），不可交易。"]
     lines.append("")
 

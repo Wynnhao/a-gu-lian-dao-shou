@@ -248,7 +248,11 @@ def test_legal_board_20pct_limit_boundary():
     """创业板 20% 涨跌停边界：昨收 10.00 → 涨停 12.00；11.99 过、12.00 拒。"""
     assert limit_pct("300750") == 0.20
     assert limit_pct("688801") == 0.20
+    assert limit_pct("689009") == 0.20   # 科创CDR：68 前缀覆盖
     assert limit_pct("600519") == 0.10
+    assert limit_pct("430047") == 0.30   # 北交所（2026-09-15 审查修复补齐）
+    assert limit_pct("830799") == 0.30
+    assert limit_pct("920002") == 0.30
     # 11.99（涨停价下方 1 分）且偏离实时价 12.00 仅 0.083% → 通过
     v = check(mk_dec("buy", "300750", 11.99, 100), mk_ctx(), CFG)
     assert v.approved, v.violations

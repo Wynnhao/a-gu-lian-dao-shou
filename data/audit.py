@@ -32,10 +32,11 @@ log.propagate = False
 BACKUP_DIR = BASE / "logs" / "backup"
 BACKUP_KEEP = 30
 
-# 停板幅度按代码前缀：创业/科创 ±20%，北交所 ±30%，其余主板 ±10%（ST 不区分，
-# 超 ±5% 会被主板规则误报——用 10% 上限 + audit 报告人工确认，不做静默修正）
+# 停板幅度按代码前缀：创业/科创 ±20%（300/301/302/688/689，302 为创业板新代码段），
+# 北交所 ±30%，其余主板 ±10%（ST 不区分，超 ±5% 会被主板规则误报——用 10% 上限 +
+# audit 报告人工确认，不做静默修正）
 def _limit_pct(code: str) -> float:
-    if code.startswith(("300", "301", "688", "689")):
+    if code.startswith(("300", "301", "302", "688", "689")):
         return 20.5
     if code.startswith(("83", "87", "88", "43", "92")):
         return 30.5
@@ -57,19 +58,34 @@ def _norm_volume(volume, amount, close):
 
 
 def check_db(conn: sqlite3.Connection, limit: int = 200) -> list:
-    """全表逐行体检，返回问题清单 [{kind, code, date, detail}]（最多 limit 条）。"""
+    """全表逐行体检，返回问题清单 [{kind, code, date, detail}]（最多 limit 条）。
+
+    pct_out_of_range 三类豁免（2026-09-15 人工复核 145 条历史告警后落地，误报清零：
+    123 条除权除息假跌 + 13 条 302 段口径误判 + 9 条新股无限制日，无一条真数据错误）：
+    - 上市前 5 个交易日：全面注册制各板块均无涨跌幅限制（前提是全史回补、
+      库内首行≈上市日；老票回补起点晚于上市时此豁免不必要但无害）；
+    - 除权除息日：腾讯源 pct_chg 按未复权昨收自算，送转/分红日呈假暴跌——
+      前复权涨跌幅仍在停板内的行视为除权假跌（qfq 缺失时保守照报）；
+    - 302 创业板新段按 ±20% 判（此前只认 300/301/688/689）。
+    """
     issues = []
     rows = conn.execute(
-        "SELECT code, trade_date, open, high, low, close, volume, amount, pct_chg "
+        "SELECT code, trade_date, open, high, low, close, volume, amount, pct_chg, close_qfq "
         "FROM daily_bar ORDER BY code, trade_date").fetchall()
-    first_date = {}
-    for code, td, o, h, l, c, v, amt, pct in rows:
+    first_date, prev_qfq, row_no = {}, {}, {}
+    for code, td, o, h, l, c, v, amt, pct, cq in rows:
+        n = row_no.setdefault(code, 0)
         first_date.setdefault(code, td)
+        prev_cq = prev_qfq.get(code)
+        prev_qfq[code] = cq   # 本行处理完后即下一行的「上一行」（bad_close continue 也要更新）
+        row_no[code] = n + 1
         ctx = {"kind": "", "code": code, "date": td, "detail": ""}
         def flag(kind, detail):
             ctx2 = dict(ctx)
             ctx2.update(kind=kind, detail=detail)
             issues.append(ctx2)
+            # P1 修复：每条 issue 落日志，pipeline WARN「详见 logs/audit.log」才能真「详见」
+            log.warning("数据问题 [%s] %s %s: %s", kind, code, td, detail)
         if c is None or c <= 0:
             flag("bad_close", f"close={c}")
             continue
@@ -79,7 +95,12 @@ def check_db(conn: sqlite3.Connection, limit: int = 200) -> list:
         if pct is not None and td != first_date[code]:
             lp = _limit_pct(code)
             if abs(pct) > lp:
-                flag("pct_out_of_range", f"pct_chg={pct} 超过停板幅度±{lp}%")
+                if n <= 4:
+                    pass  # 上市前 5 个交易日无涨跌幅限制
+                elif cq and prev_cq and abs((cq / prev_cq - 1) * 100) <= lp:
+                    pass  # 除权假跌：前复权后真实涨跌幅在停板内
+                else:
+                    flag("pct_out_of_range", f"pct_chg={pct} 超过停板幅度±{lp}%")
         if amt and amt > 0 and v is not None and v > 0:
             implied = amt / c
             shares = v * 100  # 假定库内已是「手」
@@ -87,7 +108,11 @@ def check_db(conn: sqlite3.Connection, limit: int = 200) -> list:
                 flag("volume_unit_suspect",
                      f"volume={v}(手?) amount/close={implied:.0f}股, "
                      f"偏差 {shares / implied:.2f}x")
-    return issues[:limit], issues and len(issues) or 0
+    # P1 修复：原 `issues and len(issues) or 0` 在 issues 超 limit 时
+    # 返回的是原列表的全量长度（与 issues[:limit] 截断后不一致），
+    # 导致 pipeline WARN 文案「数据体检发现 N 个问题」与 by_kind 之和偏差。
+    # 改成 `min(len(issues), limit)`，与 by_kind 上限统一为 limit。
+    return issues[:limit], min(len(issues), limit) if issues else 0
 
 
 def fix_volume_units(conn: sqlite3.Connection) -> int:
@@ -128,19 +153,19 @@ def backup_db(conn: sqlite3.Connection) -> Path:
     return path
 
 
-def run(fix: bool = False, backup: bool = False) -> dict:
+def run(fix: bool = False, backup: bool = False, limit: int = 200) -> dict:
     from data.fetcher import get_conn
     conn = get_conn()
     try:
         if fix:
             fix_volume_units(conn)
-        issues, total = check_db(conn)
+        issues, total = check_db(conn, limit=limit)
         by_kind = {}
         for it in issues:
             by_kind[it["kind"]] = by_kind.get(it["kind"], 0) + 1
         if backup:
             backup_db(conn)
-        return {"total": total, "by_kind": by_kind, "issues": issues}
+        return {"total": total, "by_kind": by_kind, "issues": issues, "limit": limit}
     finally:
         conn.close()
 
@@ -155,7 +180,8 @@ def main():
     for it in r["issues"][:30]:
         print(f"  [{it['kind']}] {it['code']} {it['date']}: {it['detail']}")
     if r["total"] > 30:
-        print(f"  ... 共 {r['total']} 条，详见 logs/audit.log")
+        # P1 修复：明示 limit 截断，避免「800 个」与 by_kind「200」偏差困惑
+        print(f"  ... 本次扫描 limit={r['limit']}，已显示前 30 条；完整明细详见 logs/audit.log")
 
 
 if __name__ == "__main__":

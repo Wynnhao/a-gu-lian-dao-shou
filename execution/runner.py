@@ -23,13 +23,13 @@ import logging.handlers
 import os
 import sqlite3
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from typing import Any, Dict, List, Optional, Tuple
 
 from data.fetcher import get_conn
 from risk.blacklist import check_blacklist, health_check
 from risk.engine import (RiskContext, Verdict, check, record_event, apply_kill_switch,
-                         limit_pct, limit_price)
+                         limit_price)
 from risk.notify import notify
 from execution.paper import PaperBroker, compute_fees
 
@@ -150,7 +150,9 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
             from data.quotes import get_live_prices, is_trading_time
             if is_trading_time(now):
                 live_quotes = get_live_prices(sorted(codes))
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            # 盯市退化必须有痕可查：否则止损/回撤类风控基于昨收价失真时无任何线索
+            log.warning("实时行情获取失败，风控盯市退回昨收价: %s", e)
             live_quotes = {}
     latest_prices: Dict[str, float] = {}
     for code in sorted(codes):
@@ -696,6 +698,18 @@ def confirm(conn: sqlite3.Connection, decision_id: int, confirmed_by: str = "hum
                      % (decision_id, run_date, now.strftime("%Y-%m-%d")), decision_id)
         print("[confirm] decision#%d 状态 -> expired（决策日 %s ≠ 今日，需重新决策）"
               % (decision_id, run_date))
+        return None
+    # 当日 TTL：pending 文件的 valid_until（run_dateT15:05，见 _write_pending）此前
+    # 只写不读，收盘后确认只能靠重跑风控的"非交易时段"规则巧合兜底——这里把 TTL
+    # 落地为显式闸门（边界含 15:05:00，与"有效至 15:05"一致）
+    if run_date and now.time() > dtime(15, 5):
+        _set_status(conn, decision_id, "expired")
+        _remove_pending(decision_id, orders_dir)
+        record_event(conn, "pending_expired",
+                     "decision#%d 超当日 15:05 TTL 确认被拒（now=%s）"
+                     % (decision_id, now.strftime("%H:%M:%S")), decision_id)
+        print("[confirm] decision#%d 状态 -> expired（已过当日 15:05 有效期，需重新决策）"
+              % decision_id)
         return None
     ctx = build_context(conn, now)
     v = check(decision, ctx, CFG.get("risk", {}))

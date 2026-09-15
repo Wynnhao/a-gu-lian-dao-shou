@@ -32,6 +32,10 @@ logs/session/
 logs/quotes/
 logs/backup/
 logs/state/
+logs/review_html/
+
+# ---------- ZCode 本地 ----------
+.zcode/
 
 # ---------- OS ----------
 .DS_Store

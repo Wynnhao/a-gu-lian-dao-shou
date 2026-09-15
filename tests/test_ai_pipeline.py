@@ -12,6 +12,7 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 import json
+from datetime import datetime, timedelta
 import sqlite3
 
 from data.fetcher import DDL
@@ -205,11 +206,15 @@ def test_build_bundle_empty_tables_degrades():
 
 
 def test_build_bundle_with_data():
+    # daily_bar 日期取"昨天"：health_check 的滞后容差是自然日 3 天，
+    # 写死日期会让本用例每周二以后必挂（lag>3 误报数据滞后）
+    bar_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     conn = make_conn()
     conn.execute("INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
                  " volume, amount, pct_chg, turnover) VALUES "
-                 "('600519','2026-09-11',1,1,1,1,1,1,0,0)")
-    conn.execute("INSERT INTO signal VALUES ('600519','2026-09-11','{\"ma_trend\":\"up\"}',0.7)")
+                 "('600519',?,1,1,1,1,1,1,0,0)", (bar_date,))
+    # signal 与日线同日：bundle 按最新 bar 日期取信号截面
+    conn.execute("INSERT INTO signal VALUES ('600519',?, '{\"ma_trend\":\"up\"}',0.7)", (bar_date,))
     conn.execute("INSERT INTO index_valuation VALUES ('000300','2026-09-11',12,0.5,1.3,0.6,4000)")
     conn.execute("INSERT INTO portfolio_state VALUES ('2026-09-11',900000,100000,1000000,0,0,'t')")
     conn.commit()
@@ -220,7 +225,7 @@ def test_build_bundle_with_data():
     assert b["signals"][0]["code"] == "600519" and b["signals"][0]["signals"]["ma_trend"] == "up"
     assert b["macro"]["000300"]["pe"] == 12 and b["macro"]["000300"]["pe_pct"] == 0.5
     assert b["portfolio_state"]["total"] == 1000000.0
-    assert b["data_quality"] == {"600519": "2026-09-11"}
+    assert b["data_quality"] == {"600519": bar_date}
     conn.close()
 
 

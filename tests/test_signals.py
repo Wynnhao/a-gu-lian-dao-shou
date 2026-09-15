@@ -109,8 +109,11 @@ def test_turnover_pct_midpoint():
 def test_limit_pct_by_board():
     assert limit_pct("300750") == 0.20
     assert limit_pct("688801") == 0.20
+    assert limit_pct("689009") == 0.20   # 科创CDR：68 前缀覆盖
     assert limit_pct("600519") == 0.10
     assert limit_pct("000001") == 0.10
+    assert limit_pct("830799") == 0.30   # 北交所（与 risk.engine 口径对齐）
+    assert limit_pct("920002") == 0.30
 
 
 # ---------- score profiles（reversal_lowvol 截面 / momentum 时序） ----------

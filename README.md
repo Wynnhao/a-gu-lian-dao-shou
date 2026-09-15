@@ -38,7 +38,7 @@
 A股镰刀手/
 ├── README.md                 ← 本索引
 ├── 技术方案.md                # 总体设计、分阶段计划、验收标准（§5）与当前状态（§7）
-├── config.json               # 全局配置：watchlist(30只·概念标签)/blacklist_rules/risk/pools/execution
+├── config.json               # 全局配置：watchlist(82只·8题材组×10+2未分组)/blacklist_rules/risk/pools/execution
 ├── 启动控制台.command          # 双击启动看板（后台常驻+自动开浏览器）
 ├── 看门狗开关.command          # 双击安装/卸载漏开机兜底看门狗（launchd，自动切换状态）
 ├── deploy/
@@ -150,7 +150,7 @@ A股镰刀手/
 
 ## 看板 API 索引（webapp/server.py，全部 JSON）
 
-核心：`/api/overview`（总览+持仓）· `/api/workflow`（十段流水线+决策追踪链）· `/api/concepts`（概念分组）· `/api/dynamic_pools`（异动/热门池）· `/api/equity_curve` · `/api/candles?code=` · `/api/signals` · `/api/decisions` · `/api/trades` · `/api/risk_events` · `/api/pending` · `/api/news` · `/api/macro(-_history)` · `/api/health` · `/api/reports` + `/api/report?file=` · `/api/logs?name=` · `/api/sessions` + `/api/session` · `/api/backtest` · `/api/doc?name=`
+核心：`/api/overview`（总览+持仓）· `/api/data_status`（数据状态：新鲜度/数据源用量/体检摘要）· `/api/workflow`（十段流水线+决策追踪链）· `/api/concepts`（概念分组）· `/api/dynamic_pools`（异动/热门池）· `/api/equity_curve` · `/api/candles?code=` · `/api/signals` · `/api/decisions` · `/api/trades` · `/api/risk_events` · `/api/pending` · `/api/news` · `/api/macro(-_history)` · `/api/health` · `/api/reports` + `/api/report?file=` · `/api/logs?name=` · `/api/sessions` + `/api/session` · `/api/backtest` · `/api/doc?name=`
 写操作（仅此两个，有三重来源防护）：`POST /api/confirm`、`POST /api/reject`
 
 ## 关键文档

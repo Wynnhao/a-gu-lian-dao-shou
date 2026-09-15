@@ -127,6 +127,25 @@ def test_movers_quiet_stock_not_selected():
 
 
 @test
+def test_movers_exdiv_day_no_fake_alerts():
+    """除权日（原始 -25% vs 复权 +1%）：涨幅/急跌/新低不再假异动（2026-09-15 复核修复）。"""
+    conn = _mem()
+    _seed_stock(conn, "600519", "贵州茅台", days=70,
+                last_close=75.0, last_pct=-25.0, last_vol=1000)
+    # 给最后两行补 close_qfq：除权因子使复权涨幅仅 +1%（真实走势平稳）
+    tds = [r[0] for r in conn.execute(
+        "SELECT trade_date FROM daily_bar WHERE code='600519' ORDER BY trade_date")]
+    conn.execute("UPDATE daily_bar SET close_qfq=100.0 WHERE code='600519' AND trade_date=?",
+                 (tds[-2],))
+    conn.execute("UPDATE daily_bar SET close_qfq=101.0 WHERE code='600519' AND trade_date=?",
+                 (tds[-1],))
+    conn.commit()
+    hits = [r for r in mv.compute_watchlist_movers(conn) if r["code"] == "600519"]
+    assert not hits, "除权日不应因假跌/假新低入池: %s" % (hits and hits[0]["reason"])
+    conn.close()
+
+
+@test
 def test_hot_theme_keyword_count():
     conn = _mem()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

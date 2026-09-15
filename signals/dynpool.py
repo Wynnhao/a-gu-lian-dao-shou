@@ -57,6 +57,20 @@ def current_pool(conn: sqlite3.Connection, pool: str,
             reasons = [reason] if reason else []
         out.append({"code": code, "name": name, "reasons": reasons,
                     "strength": strength, "added_date": added, "mode": mode or ""})
+    # 名称兜底（读时修复，不改历史行）：宇宙票不进 stock_info，早年写入可能以代码充当名称
+    need = [r["code"] for r in out if not r["name"] or r["name"] == r["code"]]
+    if need:
+        ph = ",".join("?" * len(need))
+        nm = dict(conn.execute(
+            f"SELECT code, name FROM stock_info WHERE code IN ({ph})", need).fetchall())
+        for code, name in conn.execute(
+                f"SELECT code, name FROM universe_member "
+                f"WHERE code IN ({ph}) AND as_of=(SELECT MAX(as_of) FROM universe_member)",
+                need).fetchall():
+            nm.setdefault(code, name)
+        for r in out:
+            if nm.get(r["code"]):
+                r["name"] = nm[r["code"]]
     return sorted(out, key=lambda r: -float(r.get("strength") or 0.0))
 
 

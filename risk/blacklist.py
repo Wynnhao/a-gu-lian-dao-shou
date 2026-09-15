@@ -1,11 +1,14 @@
 """风控：黑名单过滤 + 数据健康检查。"""
 import json
+import logging
 import sqlite3
 from datetime import date
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
 CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+
+log = logging.getLogger("risk.blacklist")
 
 
 def check_blacklist(conn: sqlite3.Connection) -> dict:
@@ -17,8 +20,15 @@ def check_blacklist(conn: sqlite3.Connection) -> dict:
     for code, name, first in rows:
         reasons = []
         if first:
-            days = (today - date.fromisoformat(first)).days
-            if days < rules["min_listed_days"]:
+            # 脏日期兜底：此前 fromisoformat 直接崩，且 confirm（人工闸门）与
+            # signals 计算链路调用本函数无 try/except，一条脏数据即全局硬崩
+            try:
+                days = (today - date.fromisoformat(str(first).strip())).days
+            except ValueError:
+                log.warning("stock_info %s first_trade_date=%r 非法，跳过上市天数判断",
+                            code, first)
+                days = None
+            if days is not None and days < rules["min_listed_days"]:
                 reasons.append(f"上市仅{days}天 < {rules['min_listed_days']}天")
         if rules["exclude_st"] and ("ST" in name or "st" in name):
             reasons.append("ST标的")

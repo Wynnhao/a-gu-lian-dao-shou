@@ -98,5 +98,11 @@ def turnover_pct(turnover, window: int = 250) -> Optional[float]:
 
 
 def limit_pct(code: str) -> float:
-    """涨跌停幅度：创业板(30)/科创板(68) 0.20，其余 0.10。"""
-    return 0.20 if str(code).startswith(("30", "68")) else 0.10
+    """涨跌停幅度：创业板(30)/科创板(68，含689 CDR) 0.20，北交所(43/83/87/88/92) 0.30，
+    其余主板 0.10。与 risk.engine.limit_pct / data/audit._limit_pct 口径对齐。"""
+    code = str(code)
+    if code.startswith(("30", "68")):
+        return 0.20
+    if code.startswith(("43", "83", "87", "88", "92")):
+        return 0.30
+    return 0.10

@@ -83,9 +83,14 @@ def in_trading_session(now: datetime) -> bool:
 
 
 def limit_pct(code: str) -> float:
-    """涨跌停幅度：创业板(30)/科创板(68) 20%，其余 10%。"""
+    """涨跌停幅度：创业板(30)/科创板(68，含689 CDR) 20%，北交所(43/83/87/88/92) 30%，
+    其余主板 10%。北交所口径与 data/audit._limit_pct 对齐（2026-09-15 审查修复）。"""
     code = str(code)
-    return 0.20 if code.startswith(("30", "68")) else 0.10
+    if code.startswith(("30", "68")):
+        return 0.20
+    if code.startswith(("43", "83", "87", "88", "92")):
+        return 0.30
+    return 0.10
 
 
 def _position_mv(ctx: RiskContext, code: str) -> float:

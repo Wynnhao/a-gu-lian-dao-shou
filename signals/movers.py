@@ -6,7 +6,7 @@
 2. 自选池模式（兜底，必有）：daily_bar 日线口径计算五类异动规则。
 
 所有阈值来自 config.pools.movers。异动票仅"纳入评估"（watch 资格），
-buy/sell 仍限自选池 30 只——晋升自选池必须人工改 config。
+buy/sell 仍限自选池（config.watchlist）——晋升自选池必须人工改 config。
 """
 import json
 import logging
@@ -42,6 +42,15 @@ def _wl_codes() -> List[str]:
     return [str(w["code"]) for w in cfg.get("watchlist", [])]
 
 
+def _limit_band(code: str) -> float:
+    """停板幅度%（与 risk.engine/data.audit 口径一致）：创业/科创 20，北交所 30，主板 10。"""
+    if code.startswith(("300", "301", "302", "688", "689")):
+        return 20.0
+    if code.startswith(("43", "83", "87", "88", "92")):
+        return 30.0
+    return 10.0
+
+
 # ---------------------------------------------------------------- 自选池模式
 
 def compute_watchlist_movers(conn: sqlite3.Connection,
@@ -65,22 +74,32 @@ def compute_watchlist_movers(conn: sqlite3.Connection,
         if td != as_of:
             continue  # 只看最新交易日有数据的票
         hist = conn.execute(
-            "SELECT trade_date, close, high, low, volume, pct_chg FROM daily_bar "
+            "SELECT trade_date, close, high, low, volume, pct_chg, close_qfq FROM daily_bar "
             "WHERE code=? ORDER BY trade_date DESC LIMIT 61", (code,)).fetchall()
         if len(hist) < 6:
             continue
         today = hist[0]
-        _, close, high, low, volume, pct_chg = today
+        _, close, high, low, volume, pct_chg, cq = today
         prev_close = hist[1][1]
+        prev_cq = hist[1][6]
         if not close or not prev_close:
             continue
         name_row = conn.execute(
             "SELECT name FROM stock_info WHERE code=?", (code,)).fetchone()
         name = name_row[0] if name_row else code
+        # 除权除息日判定：腾讯源 pct_chg 按未复权昨收自算，送转/分红日呈假暴跌/假新低。
+        # 原始涨跌幅与前复权涨跌幅显著背离、且复权后在停板内 → 除权日，跨除权日的
+        # ①涨幅/③振幅/④动量/⑤新高低全部失真，当日跳过（②放量与价格复权无关，保留）。
+        # qfq 缺失（未回补）时按非除权日处理，行为与旧版一致。
+        exdiv = False
+        if cq and prev_cq and pct_chg is not None:
+            qfq_pct = (cq / prev_cq - 1) * 100
+            exdiv = (abs(pct_chg) - abs(qfq_pct) > 1.0
+                     and abs(qfq_pct) <= _limit_band(code))
         reasons: List[str] = []
         strength = 0.0
         # ① 涨幅异动
-        if pct_chg is not None and abs(pct_chg) >= c.get("pct_chg", 5.0):
+        if pct_chg is not None and not exdiv and abs(pct_chg) >= c.get("pct_chg", 5.0):
             reasons.append("涨幅%+.2f%%" % pct_chg)
             strength += min(abs(pct_chg) / 10.0, 2.0)
         # ② 放量（相对前20日均量）
@@ -91,26 +110,28 @@ def compute_watchlist_movers(conn: sqlite3.Connection,
                 reasons.append("放量%.1f倍" % (volume / avg_v))
                 strength += min(volume / avg_v / 5.0, 1.5)
         # ③ 振幅
-        if high and low and prev_close and (high - low) / prev_close * 100 >= c.get("amplitude", 7.0):
+        if not exdiv and high and low and prev_close and (high - low) / prev_close * 100 >= c.get("amplitude", 7.0):
             reasons.append("振幅%.1f%%" % ((high - low) / prev_close * 100))
             strength += 1.0
         # ④ 5日加速
-        m5 = sum(h[5] or 0 for h in hist[:5])
-        if m5 >= c.get("mom5_up", 12.0):
-            reasons.append("5日+%+.1f%%" % m5)
-            strength += min(m5 / 20.0, 1.5)
-        elif m5 <= c.get("mom5_down", -10.0):
-            reasons.append("5日%+.1f%%（急跌）" % m5)
-            strength += min(abs(m5) / 20.0, 1.5)
+        if not exdiv:
+            m5 = sum(h[5] or 0 for h in hist[:5])
+            if m5 >= c.get("mom5_up", 12.0):
+                reasons.append("5日+%+.1f%%" % m5)
+                strength += min(m5 / 20.0, 1.5)
+            elif m5 <= c.get("mom5_down", -10.0):
+                reasons.append("5日%+.1f%%（急跌）" % m5)
+                strength += min(abs(m5) / 20.0, 1.5)
         # ⑤ 60日新高/新低（不含今日）
-        past_high = [h[2] for h in hist[1:60] if h[2]]
-        past_low = [h[3] for h in hist[1:60] if h[3]]
-        if past_high and close >= max(past_high):
-            reasons.append("创60日新高")
-            strength += 1.2
-        elif past_low and close <= min(past_low):
-            reasons.append("创60日新低")
-            strength += 1.2
+        if not exdiv:
+            past_high = [h[2] for h in hist[1:60] if h[2]]
+            past_low = [h[3] for h in hist[1:60] if h[3]]
+            if past_high and close >= max(past_high):
+                reasons.append("创60日新高")
+                strength += 1.2
+            elif past_low and close <= min(past_low):
+                reasons.append("创60日新低")
+                strength += 1.2
         if reasons:
             out.append({"code": code, "name": name,
                         "reason": reasons, "strength": round(strength, 2),
@@ -125,16 +146,79 @@ def compute_watchlist_movers(conn: sqlite3.Connection,
 # ---------------------------------------------------------------- 全市场模式
 
 def fetch_all_market_spot() -> Optional[List[dict]]:
-    """东财全市场快照（一次拉全部A股）。失败返回 None（调用方降级自选池模式）。"""
-    try:
-        import akshare as ak
-        df = ak.stock_zh_a_spot_em()
-        need = {"代码", "名称", "最新价", "涨跌幅", "量比", "成交额"}
-        if df is None or df.empty or not need.issubset(set(df.columns)):
+    """全市场快照：东财主源 → 腾讯兜底。失败返回 None（调用方降级自选池模式）。
+
+    P1 修复 1:加指数退避 30s/60s/120s 三次重试。
+    P1 修复 2:em 持续 RemoteDisconnected 时，腾讯 stock_zh_a_spot_tx 可兜底返回
+    约 5500+ 只候选（字段为英文 code/name/zdf/zf/zxj/turnover；列名与 em 不一致，
+    调用方 compute_market_movers 需做兼容）。腾讯快照也是"上一交易日盘后"口径。
+    """
+    import time
+    import akshare as ak
+
+    def _norm_tx(rows: List[dict]) -> List[dict]:
+        """腾讯 spot (英文字段) → em 快照 (中文字段) 列名映射，喂给 compute_market_movers。
+
+        单位换算：腾讯 turnover 为「万元」，em 成交额为「元」（amount_floor=5e7 按
+        元口径），不换算会把 17.5亿 误当 17.5万 全部筛掉（2026-09-15 实测入池 0 只）。
+        """
+        out = []
+        for r in rows:
+            code = str(r.get("code") or "")
+            if code.startswith(("sh", "sz", "bj")):
+                code = code[2:]
+            turnover = _to_float(r.get("turnover"))
+            out.append({
+                "代码": code,
+                "名称": r.get("name") or "",
+                "最新价": _to_float(r.get("zxj")),
+                "涨跌幅": _to_float(r.get("zdf")),
+                "量比": _to_float(r.get("lb")),
+                "成交额": turnover * 10000.0 if turnover is not None else None,
+                "振幅": _to_float(r.get("zf")),
+            })
+        return out
+
+    def _to_float(v) -> Optional[float]:
+        try:
+            return float(v) if v not in (None, "", "-") else None
+        except (TypeError, ValueError):
             return None
-        return df.to_dict("records")
+
+    # ---- 主源：东财 stock_zh_a_spot_em（中文列名）----
+    delays = [0, 30, 60, 120]
+    em_need = {"代码", "名称", "最新价", "涨跌幅", "量比", "成交额"}
+    last_err = None
+    for i, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            df = ak.stock_zh_a_spot_em()
+            if df is None or df.empty or not em_need.issubset(set(df.columns)):
+                last_err = ValueError("em empty or missing columns")
+                log.warning("全市场快照(em)第 %d 次返回空/缺列", i + 1)
+                continue
+            if i > 0:
+                log.info("全市场快照(em)第 %d 次重试成功", i + 1)
+            return df.to_dict("records")
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            log.warning("全市场快照(em)第 %d 次失败: %s", i + 1, repr(e)[:120])
+            continue
+
+    # ---- 兜底：腾讯 stock_zh_a_spot_tx（英文字段，~5500 行，约 8s）----
+    log.warning("全市场快照(em)全失败（%d 次），降级到腾讯 spot_tx: %s",
+                len(delays), repr(last_err)[:120])
+    try:
+        df = ak.stock_zh_a_spot_tx()
+        if df is None or df.empty:
+            log.warning("全市场快照(tx) 返回空，降级自选池口径")
+            return None
+        rows = _norm_tx(df.to_dict("records"))
+        log.info("全市场快照(tx) 兜底成功 %d 行", len(rows))
+        return rows
     except Exception as e:  # noqa: BLE001
-        log.warning("全市场快照不可用（降级自选池口径）: %s", repr(e)[:120])
+        log.warning("全市场快照(tx) 也失败: %s", repr(e)[:120])
         return None
 
 
@@ -222,6 +306,9 @@ def refresh(conn: sqlite3.Connection, as_of: Optional[str] = None,
                 r["in_watchlist"] = True
     else:
         rows = compute_watchlist_movers(conn, as_of=day)
+        top_n = int(_cfg().get("top_n", 20))
+        if len(rows) > top_n:
+            rows = rows[:top_n]  # 兜底口径同样受池子容量约束，与全市场口径一致
         mode = "watchlist"
     n = dynpool.upsert_pool_rows(conn, "movers", rows, day, mode=mode)
     log.info("异动池刷新 mode=%s 入池 %d 只（as_of=%s）", mode, n, day)

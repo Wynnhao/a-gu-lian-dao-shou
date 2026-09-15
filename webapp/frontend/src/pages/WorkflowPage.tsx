@@ -2,7 +2,9 @@ import { useMemo } from "react";
 import { ExternalLink } from "lucide-react";
 import { ChartCard } from "@/components/ChartCard";
 import { DecisionTable, TradeMiniCard } from "@/components/DecisionTable";
+import { DataStatusPanel } from "@/components/DataStatusPanel";
 import { EChart } from "@/components/EChart";
+import { Inspect } from "@/components/Inspector";
 import { EmptyState } from "@/components/EmptyState";
 import { ErrorBar } from "@/components/ErrorBar";
 import { MarkdownView } from "@/components/MarkdownView";
@@ -255,7 +257,20 @@ export function OverviewPage({ onNavigate }: { onNavigate?: (p: "workflow") => v
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
         <StatTile
           label="总资产"
-          value={fmtMoney(ov?.total)}
+          value={
+            <Inspect
+              info={{
+                title: "组合总资产",
+                value: fmtMoney(ov?.total),
+                unit: "元",
+                asOf: ov?.as_of,
+                source: "portfolio_state 表 · review/daily.py 盯市",
+                caliber: "盯市口径：现金 + 持仓市值（持仓按最新收盘价计）",
+              }}
+            >
+              {fmtMoney(ov?.total)}
+            </Inspect>
+          }
           unit="元"
           sub={<>期初 {fmtMoney(ov?.start_cash, 0)}</>}
           note="盯市 · 最新收盘"
@@ -295,6 +310,9 @@ export function OverviewPage({ onNavigate }: { onNavigate?: (p: "workflow") => v
           note="相对净值高点"
         />
       </div>
+
+      {/* 数据状态：新鲜度/数据源/体检一屏可见（口径自证） */}
+      <DataStatusPanel />
 
       {/* 流水线状态速览 */}
       <Panel

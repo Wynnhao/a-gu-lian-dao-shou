@@ -192,8 +192,25 @@ def test_t_plus_1_buy_today_avail_unchanged():
         "SELECT shares, avail_shares FROM position WHERE code='600519'").fetchone()
     assert (sh, avail) == (100, 0)                    # T+1：当日新买不计入 avail
     assert b.sell(conn, "600519", "贵州茅台", 1500.0, 1) is None  # 当日不可卖
+    b.unlock_t_plus_1(conn)                           # 当日补跑盘前：当日买入不得提前解锁
+    _, avail = conn.execute(
+        "SELECT shares, avail_shares FROM position WHERE code='600519'").fetchone()
+    assert avail == 0
+    b.unlock_t_plus_1(conn, as_of=NEXT_DAY)           # 次日盘前解锁后才可卖
+    assert b.sell(conn, "600519", "贵州茅台", 1500.0, 1, trade_date=NEXT_DAY)["ok"]
+
+
+def test_t_plus_1_unlock_keeps_yesterday_buy_sellable():
+    """常规路径：昨日买入在今日盘前解锁后全部可卖（当日买入扣除只作用于当天买单）。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    b = PaperBroker(EXEC_CFG)
+    b.buy(conn, "000001", "平安银行", 11.0, 100, trade_date=YDAY)
+    b.buy(conn, "000001", "平安银行", 11.2, 100)      # 当日再买 100 股
     b.unlock_t_plus_1(conn)
-    assert b.sell(conn, "600519", "贵州茅台", 1500.0, 1, trade_date=NEXT_DAY)["ok"]  # 解锁后可卖
+    sh, avail = conn.execute(
+        "SELECT shares, avail_shares FROM position WHERE code='000001'").fetchone()
+    assert (sh, avail) == (200, 100)                  # 只有昨日 100 股解锁
 
 
 def test_buy_insufficient_cash_rejected():
@@ -216,7 +233,7 @@ def test_sell_over_avail_rejected():
     b = PaperBroker(EXEC_CFG)
     b.buy(conn, "000001", "平安银行", 11.0, 100)
     assert b.sell(conn, "000001", "平安银行", 11.0, 1) is None        # avail=0
-    b.unlock_t_plus_1(conn)
+    b.unlock_t_plus_1(conn, as_of=NEXT_DAY)                           # 次日盘前解锁
     assert b.sell(conn, "000001", "平安银行", 11.0, 101) is None      # 超 avail
     assert b.sell(conn, "601318", "中国平安", 54.83, 100) is None     # 无持仓
     assert len(trade_rows(conn)) == 1                                 # 只有买入那笔
@@ -359,6 +376,31 @@ def test_propose_gate_writes_pending_then_confirm_executes():
         assert st == "executed"
         assert runner.list_pending(orders) == []       # pending 文件已清理
         assert runner.confirm(conn, 1, now=NOW10, orders_dir=orders) is None  # 重复确认拒绝
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_confirm_same_day_after_ttl_expired():
+    """当日 15:05 TTL（pending valid_until 的执行端）：收盘后确认当日单 -> expired。
+
+    此前 valid_until 只写不读，收盘后确认只能靠重跑风控的「非交易时段」规则兜底。
+    """
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        d = mk_decision("buy", "000001", 11.0, 100)
+        v = runner.propose(conn, d, now=NOW10, orders_dir=orders)
+        assert v.approved and v.violations == []
+        late = datetime.combine(_BASE, time(15, 30))   # 当日 15:30（TTL 已过）
+        res = runner.confirm(conn, 1, confirmed_by="测试", now=late, orders_dir=orders)
+        assert res is None
+        st = conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0]
+        assert st == "expired"
+        assert runner.list_pending(orders) == []       # pending 已清理
+        ev = conn.execute("SELECT COUNT(*) FROM risk_event WHERE "
+                          "rule='pending_expired'").fetchone()[0]
+        assert ev >= 1
     finally:
         shutil.rmtree(orders, ignore_errors=True)
 
