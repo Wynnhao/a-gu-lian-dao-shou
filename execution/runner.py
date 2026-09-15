@@ -26,13 +26,14 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, time as dtime
 from typing import Any, Dict, List, Optional, Tuple
 
+from common.config import snapshot
 from data.fetcher import get_conn
 from risk.blacklist import check_blacklist, health_check
 from risk.engine import (RiskContext, Verdict, check, record_event, apply_kill_switch)
 from risk.notify import notify
 from execution.paper import PaperBroker, compute_fees
 
-CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+CFG = snapshot()  # 统一配置层：import 期冻结（set_gate 原地 mutate 的测试手法保持可用）
 ORDERS_DIR = Path(os.environ.get("AGSICKLE_ORDERS_DIR") or (BASE / "logs" / "orders"))
 STATE_DIR = Path(os.environ.get("AGSICKLE_STATE_DIR") or (BASE / "logs" / "state"))
 KILL_STATE_FILE = STATE_DIR / "kill.json"

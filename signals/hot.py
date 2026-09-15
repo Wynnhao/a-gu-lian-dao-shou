@@ -21,6 +21,7 @@ BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
+from common.config import load  # noqa: E402
 from signals import dynpool  # noqa: E402
 
 log = logging.getLogger("hot")
@@ -46,15 +47,13 @@ THEMES: Dict[str, tuple] = {
 
 
 def _cfg() -> dict:
-    return json.loads((BASE / "config.json").read_text(encoding="utf-8")) \
-        .get("pools", {}).get("hot", {})
+    return load().get("pools", {}).get("hot", {})
 
 
 def _concept_map(conn: sqlite3.Connection) -> Dict[str, List[str]]:
     """概念标签 -> 该组自选票列表（来自 config watchlist[].concepts）。"""
-    cfg = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
     m: Dict[str, List[str]] = {}
-    for w in cfg.get("watchlist", []):
+    for w in load().get("watchlist", []):
         for t in w.get("concepts") or []:
             m.setdefault(t, []).append(str(w["code"]))
     return m

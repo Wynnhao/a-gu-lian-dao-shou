@@ -21,6 +21,7 @@ BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
+from common.config import load  # noqa: E402
 from signals import dynpool  # noqa: E402
 
 logging.basicConfig(
@@ -33,13 +34,11 @@ log = logging.getLogger("movers")
 
 
 def _cfg() -> dict:
-    return json.loads((BASE / "config.json").read_text(encoding="utf-8")) \
-        .get("pools", {}).get("movers", {})
+    return load().get("pools", {}).get("movers", {})
 
 
 def _wl_codes() -> List[str]:
-    cfg = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
-    return [str(w["code"]) for w in cfg.get("watchlist", [])]
+    return [str(w["code"]) for w in load().get("watchlist", [])]
 
 
 def _limit_band(code: str) -> float:

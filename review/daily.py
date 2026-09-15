@@ -26,9 +26,10 @@ import sqlite3
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from common.config import snapshot
 from data.fetcher import get_conn
 
-CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+CFG = snapshot()  # 统一配置层：import 期冻结 + 硬键校验 fail-fast
 START_CASH = float(CFG.get("execution", {}).get("paper_start_cash", 1000000.0))
 
 # 不影响资金/持股还原的成交状态（未成交、已撤单）

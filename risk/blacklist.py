@@ -2,11 +2,17 @@
 import json
 import logging
 import sqlite3
+import sys
 from datetime import date
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
-CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
+from common.config import snapshot  # noqa: E402
+
+CFG = snapshot()
 
 log = logging.getLogger("risk.blacklist")
 

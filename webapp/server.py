@@ -64,7 +64,8 @@ if str(BASE) not in sys.path:
 _dist = Path(__file__).resolve().parent / "dist"       # 新前端构建产物优先
 STATIC_DIR = _dist if (_dist / "index.html").is_file() \
     else Path(__file__).resolve().parent / "static"
-CONFIG_PATH = BASE / "config.json"
+from common import config as _common_config  # noqa: E402
+CONFIG_PATH = _common_config.CONFIG_PATH  # 默认与统一配置层同源；test_webapp 可替换此属性注入
 LOGS_DIR = BASE / "logs"
 REPORTS_DIR = LOGS_DIR / "reports"
 SESSION_DIR = LOGS_DIR / "session"
@@ -92,18 +93,13 @@ _CONFIG_CACHE: Dict[str, Any] = {"mtime": None, "cfg": {}}
 
 
 def load_config() -> dict:
-    """读 config.json（按 mtime 缓存——此前每个请求多次读盘）。"""
-    try:
-        mtime = CONFIG_PATH.stat().st_mtime
-    except OSError:
-        return {}
-    if _CONFIG_CACHE["mtime"] != mtime:
-        try:
-            _CONFIG_CACHE["cfg"] = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            _CONFIG_CACHE["mtime"] = mtime
-        except Exception:
-            return {}
-    return _CONFIG_CACHE["cfg"]
+    """读 config.json（mtime 缓存热读；坏 JSON 保留旧缓存下次重试）。
+
+    转发 common.config.load——语义与原实现逐行一致；CONFIG_PATH/_CONFIG_CACHE
+    模块属性保留为 test_webapp 注入 hook（运行时读取，替换即生效）。
+    """
+    from common.config import load
+    return load(path=CONFIG_PATH, cache=_CONFIG_CACHE)
 
 
 def db_file() -> Path:

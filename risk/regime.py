@@ -40,6 +40,8 @@ BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
+from common.config import load  # noqa: E402
+
 _DEFAULTS = {
     "enabled": True,
     "rsrs_index": "000300",
@@ -75,7 +77,7 @@ def _cfg(root: Optional[dict]) -> Tuple[dict, dict]:
 
 def _static_total_cap(root: Optional[dict]) -> float:
     try:
-        cfg = root or json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+        cfg = root or load()  # 统一配置层热读；失败回退缺省（fail-open 语义保留）
         return float(cfg.get("risk", {}).get("max_total_weight", 0.80))
     except Exception:  # noqa: BLE001
         return 0.80

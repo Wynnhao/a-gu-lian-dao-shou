@@ -37,6 +37,7 @@ from typing import Tuple
 
 import pandas as pd
 
+from common.config import load as config_load
 from common.market import limit_pct as market_limit_pct
 from data.fetcher import get_conn
 from signals.factors import atr_series
@@ -335,9 +336,8 @@ def main():
     base["slippage_sensitivity_annual"] = sens
 
     try:
-        cfg = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
-        results["selected_profile"] = cfg.get("signals", {}).get("profile",
-                                                                 "reversal_lowvol")
+        results["selected_profile"] = config_load().get("signals", {}).get(
+            "profile", "reversal_lowvol")
     except Exception:  # noqa: BLE001
         results["selected_profile"] = "reversal_lowvol"
 

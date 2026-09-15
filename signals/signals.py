@@ -38,6 +38,7 @@ from typing import Optional
 
 import pandas as pd
 
+from common.config import load  # noqa: E402
 from data.fetcher import get_conn  # noqa: E402
 from risk.blacklist import check_blacklist  # noqa: E402
 from signals.factors import atr, ma, mom, rsi, turnover_pct  # noqa: E402
@@ -63,8 +64,7 @@ TURN20_WINDOW = 20
 def profile() -> str:
     """当前 score profile（config.signals.profile，缺省 reversal_lowvol）。"""
     try:
-        cfg = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
-        p = cfg.get("signals", {}).get("profile", "reversal_lowvol")
+        p = load().get("signals", {}).get("profile", "reversal_lowvol")
         return p if p in PROFILES else "reversal_lowvol"
     except Exception:  # noqa: BLE001
         return "reversal_lowvol"

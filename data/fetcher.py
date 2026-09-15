@@ -31,8 +31,9 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))  # 本脚本被 catchup 当子进程直接跑，需能找到 common/
 
 from common import market as _market  # noqa: E402
+from common.config import snapshot  # noqa: E402
 
-CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+CFG = snapshot()  # 统一配置层：import 期冻结 + 硬键校验 fail-fast
 
 logging.basicConfig(
     level=logging.INFO,

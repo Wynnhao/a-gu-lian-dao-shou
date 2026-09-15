@@ -25,11 +25,12 @@ import sqlite3
 from datetime import date, datetime
 from typing import Optional, Tuple
 
+from common.config import load, snapshot
 from data.fetcher import get_conn
 from data.news import get_recent_news
 from risk.blacklist import check_blacklist, health_check
 
-CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+CFG = snapshot()  # 统一配置层：import 期冻结 + 硬键校验 fail-fast
 WATCHLIST = CFG.get("watchlist", [])
 START_CASH = float(CFG.get("execution", {}).get("paper_start_cash", 1000000.0))
 PRICE_GUARD_PCT = float(CFG.get("risk", {}).get("price_guard_pct", 0.02))
@@ -94,10 +95,9 @@ def _pct(v) -> str:
 
 
 def _signals_profile() -> str:
-    """当前 score profile（直接读 config，避免为此引入 signals 导入链）。"""
+    """当前 score profile（热读 config，避免为此引入 signals 导入链）。"""
     try:
-        p = json.loads((BASE / "config.json").read_text(encoding="utf-8")) \
-            .get("signals", {}).get("profile", "reversal_lowvol")
+        p = load().get("signals", {}).get("profile", "reversal_lowvol")
         return p if p in ("reversal_lowvol", "momentum") else "reversal_lowvol"
     except Exception:
         return "reversal_lowvol"

@@ -18,9 +18,10 @@ BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
+from common.config import snapshot  # noqa: E402
 from data.fetcher import get_conn  # noqa: E402
 
-CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+CFG = snapshot()  # 统一配置层：import 期冻结 + 硬键校验 fail-fast
 
 log = logging.getLogger("news")
 log.setLevel(logging.INFO)

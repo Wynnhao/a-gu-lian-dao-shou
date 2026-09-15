@@ -14,10 +14,11 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from common.config import snapshot
 from data.fetcher import get_conn
 from risk.blacklist import check_blacklist
 
-CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+CFG = snapshot()  # 统一配置层（批1迁移：消除 import 冻结的裸 json.loads 坏味道）
 RISK_CFG = CFG.get("risk", {})
 WATCHLIST_CODES = [str(x["code"]) for x in CFG.get("watchlist", [])]
 MAX_SINGLE_WEIGHT = float(RISK_CFG.get("max_single_weight", 0.20))

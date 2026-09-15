@@ -9,10 +9,15 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import urllib.request
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
+from common.config import snapshot  # noqa: E402
 
 log = logging.getLogger("notify")
 
@@ -23,8 +28,7 @@ def _cfg() -> dict:
     global _CFG
     if _CFG is None:
         try:
-            _CFG = json.loads((BASE / "config.json").read_text(
-                encoding="utf-8")).get("notify", {})
+            _CFG = snapshot().get("notify", {})  # 统一配置层快照；失败回退 {}（容错分级保留）
         except Exception as e:  # noqa: BLE001
             log.warning("notify 配置读取失败: %s", repr(e))
             _CFG = {}

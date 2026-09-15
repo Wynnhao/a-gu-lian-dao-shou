@@ -582,9 +582,9 @@ def apply_kill_switch(conn: sqlite3.Connection, kill_until: Optional[datetime],
 
 
 def load_cfg(path: Optional[str] = None) -> dict:
-    """读取 config.json 的 risk 段（只读，不修改）。"""
-    p = Path(path) if path else BASE / "config.json"
-    return json.loads(p.read_text(encoding="utf-8"))["risk"]
+    """读取配置的 risk 段（只读，不修改；CLI demo 用）。"""
+    from common.config import snapshot
+    return snapshot(path=Path(path) if path else None)["risk"]
 
 
 def _demo_ctx(**over) -> RiskContext:

@@ -24,9 +24,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # limit_price 为 common/market.py 唯一口径（engine re-export）；「超板才拒(>)」的
 # 调用点策略留在本模块（红线2，与 engine「到板即拒(≥)」不同）
+from common.config import snapshot
 from risk.engine import limit_pct, limit_price, record_event
 
-FULL_CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+FULL_CFG = snapshot()  # 统一配置层：import 期冻结（test 注入仍可原地 mutate）
 EXEC_CFG_DEFAULT = dict(FULL_CFG.get("execution", {}))
 
 # 与 review/daily.py 一致的“有效成交”过滤（未成交/已撤单不影响资金与持仓）
