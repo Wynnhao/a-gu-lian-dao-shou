@@ -13,6 +13,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from data import fetcher
+from data import repo
 from review import daily, weekly
 
 log = logging.getLogger("pipeline.postclose")
@@ -73,7 +74,7 @@ def _postclose_stop_loss_check(conn, now: datetime) -> list:
     from risk.notify import notify
     from risk.regime import stop_loss_line as _line, latest_atr_pct as _atr
 
-    codes = [r[0] for r in conn.execute("SELECT code FROM stock_info").fetchall()]
+    codes = repo.all_codes(conn)
     if not codes:
         log.info("步骤2.5 止损自检：stock_info 为空，跳过")
         return []

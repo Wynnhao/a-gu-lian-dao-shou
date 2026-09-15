@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from common.config import snapshot
+from data import repo
 from data.fetcher import get_conn
 from risk.blacklist import check_blacklist
 
@@ -273,19 +274,14 @@ def save_decisions(conn: sqlite3.Connection, decisions, input_snapshot: str,
             status = "report_only"
             log.warning("decision %s %s 理由未能锚定输入包内容，降级 report_only",
                         d["code"], d["action"])
-        cur = conn.execute(
-            "INSERT INTO decision (run_date, code, action, target_weight, confidence, "
-            "reasons, risk_notes, input_snapshot, status, created_at, "
-            "trade_date, model, prompt_version) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (run_date, d["code"], d["action"], d["target_weight"], d["confidence"],
-             json.dumps(d["reasons"], ensure_ascii=False),
-             json.dumps(d["risk_notes"], ensure_ascii=False),
-             input_snapshot, status, now, trade_date, model, prompt_version))
-        ids.append(int(cur.lastrowid))
+        new_id = repo.insert_decision(
+            conn, d, run_date, status=status, input_snapshot=input_snapshot,
+            trade_date=trade_date, model=model, prompt_version=prompt_version,
+            created_at=now)
+        ids.append(new_id)
         log.info("decision#%d run_date=%s trade_date=%s %s %s weight=%s conf=%.2f "
                  "status=%s model=%s pv=%s",
-                 cur.lastrowid, run_date, trade_date, d["code"], d["action"],
+                 new_id, run_date, trade_date, d["code"], d["action"],
                  d["target_weight"], float(d["confidence"]), status, model, prompt_version)
     conn.commit()
     if skipped:

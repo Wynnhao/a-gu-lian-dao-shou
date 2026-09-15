@@ -22,6 +22,7 @@ BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
+from data import repo                     # noqa: E402
 from data.fetcher import get_conn          # noqa: E402
 from data import quotes                    # noqa: E402
 from execution import runner               # noqa: E402
@@ -69,7 +70,7 @@ def main() -> int:
     conn = get_conn()
     try:
         # 1) 强制刷新实时行情（TTL 失效，确保 14:50 价格是新鲜的）
-        codes = [r[0] for r in conn.execute("SELECT code FROM stock_info").fetchall()]
+        codes = repo.all_codes(conn)
         live = quotes.get_live_prices([str(c) for c in codes], force=True)
 
         # 2) 实时价上下文 + 回撤

@@ -20,6 +20,7 @@ BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
+from data import repo                     # noqa: E402
 from data.fetcher import get_conn          # noqa: E402
 from data import quotes                    # noqa: E402
 from data.news import fetch_all, get_recent_news  # noqa: E402
@@ -47,7 +48,7 @@ def main() -> int:
     try:
         run_date = _latest_run_date(conn)
         # 1) 实时行情（强刷）
-        codes = [str(r[0]) for r in conn.execute("SELECT code FROM stock_info").fetchall()]
+        codes = repo.all_codes(conn)
         live = quotes.get_live_prices(codes, force=True)
 
         # 2) 09:00 以来新增资讯（网络失败降级）

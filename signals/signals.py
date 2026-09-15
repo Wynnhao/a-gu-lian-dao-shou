@@ -39,6 +39,7 @@ from typing import Optional
 import pandas as pd
 
 from common.config import load  # noqa: E402
+from data import repo  # noqa: E402
 from data.fetcher import get_conn  # noqa: E402
 from risk.blacklist import check_blacklist  # noqa: E402
 from signals.factors import atr, ma, mom, rsi, turnover_pct  # noqa: E402
@@ -307,8 +308,7 @@ def compute_all(as_of: Optional[str] = None, conn=None) -> list:
     c = conn or get_conn()
     t0 = time.time()
     pool = pd.read_sql("SELECT * FROM daily_bar", c)
-    codes = [str(r[0]) for r in c.execute(
-        "SELECT code FROM stock_info ORDER BY code").fetchall()]
+    codes = sorted(repo.all_codes(c))
     bl = check_blacklist(c)
     by_code = _pool_by_code(pool)
 
@@ -347,8 +347,7 @@ def backfill_history(conn=None, start: Optional[str] = None,
     c = conn or get_conn()
     t0 = time.time()
     pool = pd.read_sql("SELECT * FROM daily_bar", c)
-    codes = [str(r[0]) for r in c.execute(
-        "SELECT code FROM stock_info ORDER BY code").fetchall()]
+    codes = sorted(repo.all_codes(c))
     bl = check_blacklist(c)
     by_code = _pool_by_code(pool)
 

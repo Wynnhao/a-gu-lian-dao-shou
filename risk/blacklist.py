@@ -11,6 +11,7 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 from common.config import snapshot  # noqa: E402
+from data import repo  # noqa: E402
 
 CFG = snapshot()
 
@@ -46,9 +47,7 @@ def check_blacklist(conn: sqlite3.Connection) -> dict:
 
 def health_check(conn: sqlite3.Connection) -> list:
     """数据健康检查：最新数据是否为最近一个交易日、行数是否异常。"""
-    latest = conn.execute(
-        "SELECT MAX(trade_date) FROM daily_bar"
-    ).fetchone()[0]
+    latest = repo.latest_trade_date(conn)
     issues = []
     if not latest:
         return ["daily_bar 为空"]

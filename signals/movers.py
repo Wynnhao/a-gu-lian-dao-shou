@@ -22,6 +22,7 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 from common.config import load  # noqa: E402
+from data import repo  # noqa: E402
 from signals import dynpool  # noqa: E402
 
 logging.basicConfig(
@@ -62,11 +63,9 @@ def compute_watchlist_movers(conn: sqlite3.Connection,
         bl = {code: ok for code, (ok, _) in check_blacklist(conn).items()}
     except Exception:  # noqa: BLE001
         bl = {}
-    rows = conn.execute(
-        "SELECT code, MAX(trade_date) FROM daily_bar GROUP BY code").fetchall()
-    if not rows:
+    latest_map = repo.latest_dates_by_code(conn)
+    if not latest_map:
         return []
-    latest_map = {code: td for code, td in rows}
     as_of = as_of or max(latest_map.values())
     out: List[dict] = []
     for code, td in latest_map.items():
@@ -293,8 +292,7 @@ def refresh(conn: sqlite3.Connection, as_of: Optional[str] = None,
     reason 不换 strength，两口径强度上限 3.5 vs ~7.2 不可比）。
     """
     if as_of is None:
-        row = conn.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()
-        as_of = row[0] if row and row[0] else datetime.now().strftime("%Y-%m-%d")
+        as_of = repo.latest_trade_date(conn) or datetime.now().strftime("%Y-%m-%d")
     day = as_of
     spot = fetch_all_market_spot() if market_mode else None
     if spot is not None:

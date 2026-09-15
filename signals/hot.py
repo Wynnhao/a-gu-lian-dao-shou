@@ -22,6 +22,7 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 from common.config import load  # noqa: E402
+from data import repo  # noqa: E402
 from signals import dynpool  # noqa: E402
 
 log = logging.getLogger("hot")
@@ -123,7 +124,7 @@ def compute_hot_stocks(conn: sqlite3.Connection) -> List[dict]:
         bl_ok = {c: ok for c, (ok, _) in check_blacklist(conn).items()}
     except Exception:
         bl_ok = {}
-    codes = [r[0] for r in conn.execute("SELECT code FROM stock_info").fetchall()]
+    codes = repo.all_codes(conn)
     for code in codes:
         if bl_ok.get(code, True) is False:
             continue  # 黑名单票不进热门池（N/ST/次新）
@@ -197,8 +198,7 @@ def refresh(conn: sqlite3.Connection, as_of: Optional[str] = None) -> dict:
     as_of 默认取 daily_bar 最新交易日（审查P2：与 movers 锚点一致，周末不产生错位脏数据）。
     """
     if as_of is None:
-        row = conn.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()
-        day = row[0] if row and row[0] else datetime.now().strftime("%Y-%m-%d")
+        day = repo.latest_trade_date(conn) or datetime.now().strftime("%Y-%m-%d")
     else:
         day = as_of
     themes = compute_hot_themes(conn)

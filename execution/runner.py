@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, time as dtime
 from typing import Any, Dict, List, Optional, Tuple
 
 from common.config import snapshot
+from data import repo
 from data.fetcher import get_conn
 from risk.blacklist import check_blacklist, health_check
 from risk.engine import (RiskContext, Verdict, check, record_event, apply_kill_switch)
@@ -139,7 +140,7 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
     cash, positions, total_equity, prev_closes = broker.portfolio(conn)
 
     codes = set(positions)
-    for (c,) in conn.execute("SELECT code FROM stock_info").fetchall():
+    for c in repo.all_codes(conn):
         codes.add(str(c))
     # 实时行情：交易时段批量拉一次（闭市/禁用/失败自动回退日线收盘）
     live_quotes: Dict[str, dict] = {}
@@ -172,9 +173,8 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
         "SELECT COUNT(*) FROM trade WHERE trade_date=? AND status IN ('filled','submitted')",
         (today,)).fetchone()[0])
     today_sold = {r[0] for r in conn.execute(
-        "SELECT DISTINCT code FROM trade WHERE trade_date=? AND side='sell' AND " 
-        "(status IS NULL OR status NOT IN ('rejected','cancelled','canceled','pending'))",
-        (today,)).fetchall()}
+        "SELECT DISTINCT code FROM trade WHERE trade_date=? AND side='sell' AND "
+        + repo.TRADE_EFFECTIVE_SQL, (today,)).fetchall()}
 
     # 近5交易日换手：daily_bar 最近5日 ∪ 今天（当日 bar 盘后才入库，
     # 漏掉今天会低估当日换手、放行超限交易）
@@ -193,10 +193,8 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
 
     # 峰值只取最近 250 行：一条坏数据/测试 seed 行此前会永久抬高峰值，
     # 导致误 kill 或回撤永远 ≥8% 而锁死
-    peak_row = conn.execute(
-        "SELECT MAX(total) FROM (SELECT total FROM portfolio_state "
-        "ORDER BY date DESC LIMIT 250)").fetchone()
-    peak_equity = max(float(peak_row[0] or 0.0), float(total_equity))
+    peak_window = repo.peak_total(conn, window=250)
+    peak_equity = max(float(peak_window or 0.0), float(total_equity))
 
     # kill 停机期：logs/state/kill.json 为权威（支持人工 resume/extend），
     # 文件缺失时回退 risk_event 白名单推导（kill_switch/kill_manual/kill_extend）
@@ -271,28 +269,13 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
 
 def _insert_decision(conn: sqlite3.Connection, decision: dict, run_date: str) -> int:
     """决策落库（status=proposed），input_snapshot 存决策 JSON 全文，返回新 id。"""
-    cur = conn.execute(
-        "INSERT INTO decision (run_date, code, action, target_weight, confidence,"
-        " reasons, risk_notes, input_snapshot, status, created_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (run_date, decision.get("code"), decision.get("action"),
-         decision.get("target_weight"), decision.get("confidence"),
-         json.dumps(decision.get("reasons", []), ensure_ascii=False),
-         json.dumps(decision.get("risk_notes", []), ensure_ascii=False),
-         json.dumps(decision, ensure_ascii=False), "proposed",
-         datetime.now().isoformat(timespec="seconds")))
+    decision_id = repo.insert_decision(conn, decision, run_date)
     conn.commit()
-    return int(cur.lastrowid)
+    return decision_id
 
 
 def _parse_json_list(raw: Any) -> List[str]:
-    if raw is None or str(raw).strip() == "":
-        return []
-    try:
-        v = json.loads(raw)
-    except (TypeError, ValueError):
-        return [str(raw)]
-    return [str(x) for x in v] if isinstance(v, list) else [str(v)]
+    return repo.parse_json_list(raw)
 
 
 def _decision_from_row(row: tuple) -> dict:
@@ -328,9 +311,7 @@ def _decision_from_row(row: tuple) -> dict:
 
 
 def _get_decision(conn: sqlite3.Connection, decision_id: int) -> Optional[Tuple[tuple, dict]]:
-    row = conn.execute(
-        "SELECT id, run_date, code, action, target_weight, confidence, reasons, risk_notes,"
-        " input_snapshot, status FROM decision WHERE id=?", (decision_id,)).fetchone()
+    row = repo.get_decision_row(conn, decision_id)
     if not row:
         return None
     return row, _decision_from_row(row)
@@ -849,7 +830,7 @@ def status(conn: sqlite3.Connection, date_str: Optional[str] = None) -> dict:
         print("  无")
     for p in pend:
         print("  %s" % p)
-    ks = conn.execute("SELECT MAX(total) FROM portfolio_state").fetchone()[0]
+    ks = repo.peak_total(conn)
     print("  （portfolio_state 历史峰值 total=%.2f）" % float(ks or 0))
     return {"date": day, "cash": cash, "total": total, "positions": positions,
             "pending": [str(p) for p in pend]}

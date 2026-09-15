@@ -26,6 +26,7 @@ import sqlite3
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from data import repo
 from data.fetcher import get_conn
 
 FETCHER = Callable[[str, str], Any]  # (start_yyyymmdd, end_yyyymmdd) -> DataFrame(date, close)
@@ -46,8 +47,7 @@ def _fmt_pct(v: Optional[float]) -> str:
 
 
 def latest_trade_date(conn: sqlite3.Connection) -> str:
-    row = conn.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()
-    return row[0] if row and row[0] else date.today().isoformat()
+    return repo.latest_trade_date(conn) or date.today().isoformat()
 
 
 def _close_on_or_before(conn: sqlite3.Connection, code: str, trade_date: str) -> Optional[Tuple[str, float]]:

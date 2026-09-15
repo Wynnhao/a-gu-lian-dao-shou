@@ -27,13 +27,13 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from common.config import snapshot
+from data import repo
 from data.fetcher import get_conn
 
 CFG = snapshot()  # 统一配置层：import 期冻结 + 硬键校验 fail-fast
 START_CASH = float(CFG.get("execution", {}).get("paper_start_cash", 1000000.0))
 
 # 不影响资金/持股还原的成交状态（未成交、已撤单）
-_TRADE_OK = "(status IS NULL OR status NOT IN ('rejected','cancelled','canceled','pending'))"
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -44,8 +44,7 @@ def today_str() -> str:
 
 def latest_trade_date(conn: sqlite3.Connection) -> str:
     """daily_bar 中最新交易日（周末/节假日跑报告时避免拿到空数据）。"""
-    row = conn.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()
-    return row[0] if row and row[0] else today_str()
+    return repo.latest_trade_date(conn) or today_str()
 
 
 def _close_on_or_before(conn: sqlite3.Connection, code: str, trade_date: str) -> Optional[Tuple[str, float, Optional[float]]]:
@@ -79,18 +78,8 @@ def _fmt_pct(v: Optional[float]) -> str:
 
 
 def _parse_json_list(raw: Optional[str]) -> List[str]:
-    """decision.reasons / risk_notes 为 JSON 数组串，解析失败时退化为原文。"""
-    if raw is None or str(raw).strip() == "":
-        return []
-    try:
-        v = json.loads(raw)
-    except Exception:
-        text = str(raw)
-        lines = [ln.strip("-• ").strip() for ln in text.splitlines() if ln.strip()]
-        return lines or [text]
-    if isinstance(v, list):
-        return [str(x) for x in v]
-    return [str(v)]
+    """decision.reasons / risk_notes 为 JSON 数组串；解析失败按 markdown bullet 拆行（日报渲染增强）。"""
+    return repo.parse_json_list(raw, split_bullets=True)
 
 
 def _connect(conn: Optional[sqlite3.Connection]) -> Tuple[sqlite3.Connection, bool]:
@@ -144,14 +133,7 @@ def mark_to_market(trade_date: Optional[str] = None, conn: Optional[sqlite3.Conn
             })
 
         # ---- 现金还原 ----
-        flows = conn.execute(
-            "SELECT side, COALESCE(SUM(amount), 0.0) FROM trade "
-            f"WHERE trade_date<=? AND {_TRADE_OK} GROUP BY side",
-            (trade_date,),
-        ).fetchall()
-        flow_map: Dict[str, float] = {}
-        for side, amt in flows:
-            flow_map[side] = float(amt)
+        flow_map: Dict[str, float] = repo.cash_flows(conn, as_of=trade_date)
         has_flows = ("buy" in flow_map) or ("sell" in flow_map)
         if has_flows:
             cash = START_CASH - flow_map.get("buy", 0.0) + flow_map.get("sell", 0.0)
@@ -163,10 +145,7 @@ def mark_to_market(trade_date: Optional[str] = None, conn: Optional[sqlite3.Conn
         total = cash + market_value
 
         # ---- 回撤（历史 peak）----
-        peak_row = conn.execute(
-            "SELECT MAX(total) FROM portfolio_state WHERE date < ?", (trade_date,)
-        ).fetchone()
-        peak = peak_row[0] if peak_row else None
+        peak = repo.peak_total(conn, before=trade_date)
         drawdown = 0.0
         if peak is not None and float(peak) > 0:
             drawdown = max(0.0, 1.0 - total / float(peak))
@@ -225,14 +204,8 @@ def _per_code_day_pnl(conn: sqlite3.Connection, trade_date: str) -> Dict[str, Op
         "SELECT code, shares FROM position WHERE shares > 0"
     ).fetchall():
         shares = int(shares)
-        buy_sh = conn.execute(
-            f"SELECT COALESCE(SUM(shares),0) FROM trade WHERE trade_date=? AND code=? AND side='buy' AND {_TRADE_OK}",
-            (trade_date, code),
-        ).fetchone()[0]
-        sell_sh = conn.execute(
-            f"SELECT COALESCE(SUM(shares),0) FROM trade WHERE trade_date=? AND code=? AND side='sell' AND {_TRADE_OK}",
-            (trade_date, code),
-        ).fetchone()[0]
+        buy_sh = repo.day_side_shares(conn, trade_date, code, "buy")
+        sell_sh = repo.day_side_shares(conn, trade_date, code, "sell")
         shares_prev = shares - int(buy_sh) + int(sell_sh)
 
         cur = _close_on_or_before(conn, code, trade_date)

@@ -35,6 +35,7 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 from data import fetcher                       # noqa: E402
+from data import repo                          # noqa: E402
 from review import daily, weekly               # noqa: E402
 
 # 测试隔离：AGSICKLE_REPORTS_DIR/SESSION_DIR 覆盖产物目录（import 期读 env，
@@ -62,8 +63,7 @@ def _heartbeat() -> None:
 
 
 def _latest_trade_date(conn) -> Optional[str]:
-    row = conn.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()
-    return row[0] if row and row[0] else None
+    return repo.latest_trade_date(conn)
 
 
 def _recent_trade_dates(conn, n: int = BACKFILL_WINDOW) -> List[str]:
@@ -155,8 +155,7 @@ def catch_up(now: Optional[datetime] = None) -> int:
         for td in tds:
             if td >= today_str:
                 continue
-            has_state = conn.execute(
-                "SELECT 1 FROM portfolio_state WHERE date=?", (td,)).fetchone()
+            has_state = repo.has_state(conn, td)
             report = REPORTS_DIR / (td + ".md")
             if has_state and report.is_file():
                 continue
@@ -177,9 +176,7 @@ def catch_up(now: Optional[datetime] = None) -> int:
             older = [d for d in recent_trade_days(conn, 60)
                      if d < today_str and d < (min(tds) if tds else today_str)]
             missing_old = [d for d in older
-                           if not conn.execute(
-                               "SELECT 1 FROM portfolio_state WHERE date=?",
-                               (d,)).fetchone()
+                           if not repo.has_state(conn, d)
                            and not (REPORTS_DIR / (d + ".md")).is_file()]
             if missing_old:
                 _say("⚠ 回补窗口(%d交易日)外仍有 %d 个缺失日（最早 %s），请手动补齐"
@@ -244,8 +241,7 @@ def catch_up(now: Optional[datetime] = None) -> int:
         # 当天复盘就一直缺（2026-09-15 实测）。这里闭环：日线到位后重跑 postclose。
         after_close = (now.hour, now.minute) >= (15, 10)
         if trading_day and after_close and latest_td == today_str:
-            ps = conn.execute(
-                "SELECT note FROM portfolio_state WHERE date=?", (today_str,)).fetchone()
+            ps = repo.state_on(conn, today_str)
             state_ok = bool(ps and ("价格日期=%s" % today_str) in (ps[0] or ""))
             pending_stale = (REPORTS_DIR / ("PENDING-" + today_str + ".md")).is_file()
             if pending_stale or not state_ok:

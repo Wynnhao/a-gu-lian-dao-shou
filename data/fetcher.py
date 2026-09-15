@@ -22,6 +22,7 @@ import sys
 import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
+from typing import Optional
 
 import akshare as ak
 import pandas as pd
@@ -32,6 +33,7 @@ if str(BASE) not in sys.path:
 
 from common import market as _market  # noqa: E402
 from common.config import snapshot  # noqa: E402
+from data import repo  # noqa: E402
 
 CFG = snapshot()  # 统一配置层：import 期冻结 + 硬键校验 fail-fast
 
@@ -156,13 +158,11 @@ _MIGRATIONS = [
 ]
 
 
-def get_conn() -> sqlite3.Connection:
-    # AGSICKLE_DB：测试逃生门，子进程黑盒测试用它把 DB 隔离到临时库
-    db_file = os.environ.get("AGSICKLE_DB") or BASE / CFG["db_path"]
-    conn = sqlite3.connect(db_file, timeout=15)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=15000")
-    conn.execute("PRAGMA synchronous=NORMAL")
+_MIGRATED_FOR: Optional[str] = None  # 进程级：该库路径已完成 DDL+迁移（换库自动重跑）
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    """建表 + 增量迁移（幂等）。get_conn 进程内首连自动执行，通常无需手动调用。"""
     conn.executescript(DDL)
     for table, col, sql in _MIGRATIONS:
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -172,6 +172,24 @@ def get_conn() -> sqlite3.Connection:
             except sqlite3.OperationalError:
                 pass  # 并发下另一进程已加列
     conn.commit()
+
+
+def get_conn() -> sqlite3.Connection:
+    # AGSICKLE_DB：测试逃生门，子进程黑盒测试用它把 DB 隔离到临时库
+    db_file = os.environ.get("AGSICKLE_DB") or BASE / CFG["db_path"]
+    conn = sqlite3.connect(db_file, timeout=15)
+    # Row 同时支持 row[0]/row["name"]——repo 层与 webapp 风格统一，对既有 tuple
+    # 索引风格向后兼容（Phase 4 连接层统一）
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    # DDL 从「每连接重跑」改为进程内首连一次（此前短命 pipeline 每连接跑 15 条 DDL）
+    global _MIGRATED_FOR
+    db_key = str(db_file)
+    if _MIGRATED_FOR != db_key:
+        init_db(conn)
+        _MIGRATED_FOR = db_key
     return conn
 
 
@@ -367,9 +385,7 @@ def _market_data_window(now=None) -> bool:
 
 def fetch_daily(code: str, conn: sqlite3.Connection) -> int:
     """增量拉取单只股票日K（东财优先，腾讯兜底），返回新增行数。"""
-    last = conn.execute(
-        "SELECT MAX(trade_date) FROM daily_bar WHERE code=?", (code,)
-    ).fetchone()[0]
+    last = repo.latest_bar_date(conn, code)
     start = START_DATE
     if last:
         start = (pd.Timestamp(last) + pd.Timedelta(days=1)).strftime("%Y%m%d")
@@ -415,12 +431,10 @@ def fetch_daily(code: str, conn: sqlite3.Connection) -> int:
     # 首行 pct_chg：东财官方列已带；腾讯源由库内前收盘推算（除息日口径也正确），
     # 无前收（历史首行）才退化为窗口内自算并记 0。
     if "pct_chg" not in df.columns or df["pct_chg"].isna().any():
-        prev = conn.execute(
-            "SELECT close FROM daily_bar WHERE code=? ORDER BY trade_date DESC LIMIT 1",
-            (code,)).fetchone()
+        prev = repo.latest_close(conn, code)
         computed = df["close"].pct_change() * 100
         if prev:
-            first_pct = (float(df["close"].iloc[0]) / float(prev[0]) - 1) * 100
+            first_pct = (float(df["close"].iloc[0]) / float(prev) - 1) * 100
             computed.iloc[0] = first_pct
         if "pct_chg" not in df.columns:
             df["pct_chg"] = computed
@@ -452,9 +466,7 @@ def backfill_qfq(code: str, conn: sqlite3.Connection) -> int:
     腾讯 tx_qfq 兜底（自带前复权 OHLC）。失败静默跳过：因子层自动回退不复权
     close，audit 会提示补跑。
     """
-    last_qfq = conn.execute(
-        "SELECT MAX(trade_date) FROM daily_bar WHERE code=? AND close_qfq IS NOT NULL",
-        (code,)).fetchone()[0]
+    last_qfq = repo.latest_bar_date(conn, code, qfq_only=True)
     start = START_DATE
     if last_qfq:
         start = (pd.Timestamp(last_qfq) - pd.Timedelta(days=7)).strftime("%Y%m%d")

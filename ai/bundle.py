@@ -26,6 +26,7 @@ from datetime import date, datetime
 from typing import Optional, Tuple
 
 from common.config import load, snapshot
+from data import repo
 from data.fetcher import get_conn
 from data.news import get_recent_news
 from risk.blacklist import check_blacklist, health_check
@@ -58,8 +59,7 @@ log.propagate = False
 
 def _latest_trade_date(conn: sqlite3.Connection) -> str:
     """daily_bar 最新交易日；表空时退回今天（调用方负责据此提示数据缺失）。"""
-    row = conn.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()
-    return row[0] if row and row[0] else date.today().isoformat()
+    return repo.latest_trade_date(conn) or date.today().isoformat()
 
 
 def _trim_news(items: list, content_len: int = 120) -> list:
@@ -243,9 +243,7 @@ def build_bundle(run_date: Optional[str] = None,
 
         # ---- 组合状态（持仓补现价/市值/浮盈/权重/止损参考价）----
         try:
-            ps_row = c.execute(
-                "SELECT date, cash, market_value, total, drawdown, kill_switch, note "
-                "FROM portfolio_state ORDER BY date DESC LIMIT 1").fetchone()
+            ps_row = repo.latest_state(c)
             total_equity = _f(ps_row[3]) if ps_row else None
             pos_rows = c.execute(
                 "SELECT code, name, shares, avail_shares, cost, updated_at "
@@ -290,9 +288,7 @@ def build_bundle(run_date: Optional[str] = None,
             bundle["positions"] = []
             bundle["positions_error"] = f"持仓读取失败：{type(e).__name__}: {e}"
         try:
-            row = c.execute(
-                "SELECT date, cash, market_value, total, drawdown, kill_switch, note "
-                "FROM portfolio_state ORDER BY date DESC LIMIT 1").fetchone()
+            row = repo.latest_state(c)
             bundle["portfolio_state"] = (None if row is None else {
                 "date": row[0], "cash": _f(row[1]), "market_value": _f(row[2]),
                 "total": _f(row[3]), "drawdown": _f(row[4]),
@@ -333,8 +329,7 @@ def build_bundle(run_date: Optional[str] = None,
 
         # ---- 数据质量（各票最新bar日期）----
         try:
-            dq = {r[0]: r[1] for r in c.execute(
-                "SELECT code, MAX(trade_date) FROM daily_bar GROUP BY code ORDER BY code").fetchall()}
+            dq = dict(sorted(repo.latest_dates_by_code(c).items()))
             bundle["data_quality"] = dq
             if not dq:
                 bundle["data_quality_missing"] = "daily_bar 为空（行情拉取全失败或尚未初始化）"

@@ -35,6 +35,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 
+from data import repo
 from data.fetcher import (_market_data_window, _norm_volume, call_ak, get_conn)
 
 logging.basicConfig(level=logging.INFO)
@@ -87,12 +88,10 @@ def upsert_code(conn, code: str, start: str, end: str) -> int:
     lcol = qfq["low"] if "low" in qfq.columns else pd.Series([None] * len(qfq))
     qfq_close = {pd.Timestamp(d).strftime("%Y-%m-%d"): (c, h, l)
                  for d, c, h, l in zip(qfq["date"], qfq["close"], hcol, lcol)}
-    prev = conn.execute(
-        "SELECT close FROM daily_bar WHERE code=? ORDER BY trade_date DESC LIMIT 1",
-        (code,)).fetchone()
+    prev = repo.latest_close(conn, code)
     pct = raw["close"].pct_change() * 100
     if prev:
-        pct.iloc[0] = (float(raw["close"].iloc[0]) / float(prev[0]) - 1) * 100
+        pct.iloc[0] = (float(raw["close"].iloc[0]) / float(prev) - 1) * 100
     rows = []
     for _, r in raw.iterrows():
         d = pd.Timestamp(r["date"]).strftime("%Y-%m-%d")
@@ -133,8 +132,7 @@ def main(argv=None) -> int:
         if args.limit:
             cons = cons[:args.limit]
 
-        global_max = conn.execute(
-            "SELECT MAX(trade_date) FROM daily_bar").fetchone()[0]
+        global_max = repo.latest_trade_date(conn)
         end = date.today().strftime("%Y%m%d")
         if _market_data_window():
             end = (date.today() - timedelta(days=1)).strftime("%Y%m%d")

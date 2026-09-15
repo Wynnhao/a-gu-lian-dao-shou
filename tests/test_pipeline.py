@@ -97,6 +97,7 @@ def _seed_db(with_today: bool) -> str:
     is_trading_day 都把今天判为交易日（周末跑测试不秒退）。
     """
     conn = sqlite3.connect(os.environ["AGSICKLE_DB"])
+    conn.row_factory = sqlite3.Row  # 与生产 fetcher.get_conn 一致
     conn.executescript(DDL)
     today = date.today()
     today_str = today.isoformat()

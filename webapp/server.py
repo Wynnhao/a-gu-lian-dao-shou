@@ -65,6 +65,7 @@ _dist = Path(__file__).resolve().parent / "dist"       # 新前端构建产物�
 STATIC_DIR = _dist if (_dist / "index.html").is_file() \
     else Path(__file__).resolve().parent / "static"
 from common import config as _common_config  # noqa: E402
+from data import repo  # noqa: E402
 CONFIG_PATH = _common_config.CONFIG_PATH  # 默认与统一配置层同源；test_webapp 可替换此属性注入
 LOGS_DIR = BASE / "logs"
 REPORTS_DIR = LOGS_DIR / "reports"
@@ -103,6 +104,10 @@ def load_config() -> dict:
 
 
 def db_file() -> Path:
+    # AGSICKLE_DB：与 fetcher.get_conn 同款测试隔离逃生门（黑盒测试指向临时库）
+    env = os.environ.get("AGSICKLE_DB")
+    if env:
+        return Path(env)
     cfg = load_config()
     p = Path(str(cfg.get("db_path") or "data/market.db"))
     if not p.is_absolute():
@@ -733,20 +738,18 @@ def api_workflow(conn: sqlite3.Connection, qs: dict) -> dict:
         "日报 %s；总资产 %s" % (rts.strftime("%m-%d %H:%M") if rts else "未生成",
                                fnum(ps["total"]) if ps else "—"), _iso(rts)))
 
-    # 决策追踪链
+    # 决策追踪链（批量查询 O(1)：此前每条 trace 做 2 次子查询，30s 轮询下是主要 DB 开销）
+    ev_by = repo.events_by_decisions(conn, d_ids)
+    tr_by = repo.trade_by_decisions(conn, d_ids)
     traces: List[dict] = []
     for d in decs:
-        ev = q_all(conn, "SELECT ts, rule, detail FROM risk_event WHERE decision_id=? ORDER BY ts",
-                   (d["id"],))
-        t = q_one(conn, "SELECT id, side, price, shares, amount, status, confirmed_by "
-                        "FROM trade WHERE decision_id=? ORDER BY id LIMIT 1", (d["id"],))
         traces.append({
             "id": d["id"], "code": d["code"], "action": d["action"],
             "target_weight": d["target_weight"], "confidence": d["confidence"],
             "status": d["status"], "created_at": d["created_at"],
             "reasons": parse_json_field(d["reasons"], []),
-            "risk_events": ev,
-            "trade": t,
+            "risk_events": ev_by.get(d["id"], []),
+            "trade": tr_by.get(d["id"]),
             "pending": (ORDERS_DIR / str(run_date) / ("pending_%d.json" % d["id"])).is_file(),
         })
     ks = q_one(conn, "SELECT kill_switch, drawdown FROM portfolio_state "

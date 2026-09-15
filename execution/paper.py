@@ -25,13 +25,12 @@ from typing import Any, Dict, List, Optional, Tuple
 # limit_price 为 common/market.py 唯一口径（engine re-export）；「超板才拒(>)」的
 # 调用点策略留在本模块（红线2，与 engine「到板即拒(≥)」不同）
 from common.config import snapshot
+from data import repo
 from risk.engine import limit_pct, limit_price, record_event
 
 FULL_CFG = snapshot()  # 统一配置层：import 期冻结（test 注入仍可原地 mutate）
 EXEC_CFG_DEFAULT = dict(FULL_CFG.get("execution", {}))
 
-# 与 review/daily.py 一致的“有效成交”过滤（未成交/已撤单不影响资金与持仓）
-_EFFECTIVE = "(status IS NULL OR status NOT IN ('rejected','cancelled','canceled','pending'))"
 
 
 def _exec_logger(name: str) -> logging.Logger:
@@ -119,9 +118,7 @@ class PaperBroker:
         3. 流动性：下单金额 > 最新日线成交额 × volume_participation_cap → 拒绝。
         """
         if decision_id is not None:
-            dup = conn.execute(
-                "SELECT 1 FROM trade WHERE decision_id=? AND " + _EFFECTIVE + " LIMIT 1",
-                (decision_id,)).fetchone()
+            dup = repo.has_effective_trade(conn, decision_id)
             if dup:
                 record_event(conn, "duplicate_decision",
                              "decision#%s 已有成交，拒绝重复执行（%s %s x%d）"
@@ -156,18 +153,14 @@ class PaperBroker:
 
     def cash(self, conn: sqlite3.Connection) -> float:
         """当前现金：期初资金 − Σ买入amount + Σ卖出amount（仅有效成交，与复盘口径一致）。"""
-        rows = conn.execute(
-            "SELECT side, COALESCE(SUM(amount), 0.0) FROM trade "
-            "WHERE side IN ('buy','sell') AND " + _EFFECTIVE + " GROUP BY side").fetchall()
-        flow = {s: float(a) for s, a in rows}
+        flow = repo.cash_flows(conn)
         return _r2(self.start_cash - flow.get("buy", 0.0) + flow.get("sell", 0.0))
 
     def ensure_account(self, conn: sqlite3.Connection) -> bool:
         """position 表与 portfolio_state 当日行都为空时初始化现金=paper_start_cash。"""
         n_pos = conn.execute("SELECT COUNT(*) FROM position").fetchone()[0]
         today = date.today().isoformat()
-        has_today = conn.execute(
-            "SELECT 1 FROM portfolio_state WHERE date=?", (today,)).fetchone()
+        has_today = repo.has_state(conn, today)
         if n_pos == 0 and not has_today:
             conn.execute(
                 "INSERT INTO portfolio_state (date, cash, market_value, total, drawdown,"
@@ -202,10 +195,7 @@ class PaperBroker:
                      live: bool = True) -> Optional[float]:
         """该票"当前价"：交易时段内优先实时行情（腾讯/东财），闭市、被禁用或
         行情不可用时回退 daily_bar 最新收盘。无任何数据返回 None。"""
-        row = conn.execute(
-            "SELECT close FROM daily_bar WHERE code=? ORDER BY trade_date DESC LIMIT 1",
-            (code,)).fetchone()
-        close = float(row[0]) if row and row[0] is not None else None
+        close = repo.latest_close(conn, code)
         if not live:
             return close
         p = self._live_quote_price(code)
@@ -231,10 +221,7 @@ class PaperBroker:
 
     def prev_close(self, conn: sqlite3.Connection, code: str) -> Optional[float]:
         """前一交易日收盘（涨跌停基准用）。"""
-        row = conn.execute(
-            "SELECT close FROM daily_bar WHERE code=? ORDER BY trade_date DESC LIMIT 1 OFFSET 1",
-            (code,)).fetchone()
-        return float(row[0]) if row and row[0] is not None else None
+        return repo.latest_close(conn, code, offset=1)
 
     # ------------------------------------------------------------ 买卖
 
@@ -282,14 +269,12 @@ class PaperBroker:
 
         order_id = "PAPER-%s" % datetime.now().strftime("%Y%m%d%H%M%S%f")
         td = trade_date or date.today().isoformat()
-        cur = conn.execute(
-            "INSERT INTO trade (trade_date, code, name, side, price, shares, amount,"
-            " order_id, status, decision_id, shots, confirmed_by, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (td, code, name, "buy", exec_price, shares, fees["amount"], order_id,
-             "filled", decision_id, "[]", confirmed_by, now_iso))
+        tid = repo.insert_trade(
+            conn, trade_date=td, code=code, name=name, side="buy", price=exec_price,
+            shares=shares, amount=fees["amount"], order_id=order_id,
+            decision_id=decision_id, confirmed_by=confirmed_by, created_at=now_iso)
         conn.commit()
-        res = {"ok": True, "trade_id": int(cur.lastrowid), "order_id": order_id,
+        res = {"ok": True, "trade_id": tid, "order_id": order_id,
                "code": code, "name": name, "side": "buy", "price": exec_price,
                "requested_price": price,
                "slippage_bps": float(self.cfg.get("slippage_bps", 0) or 0),
@@ -350,14 +335,12 @@ class PaperBroker:
 
         order_id = "PAPER-%s" % datetime.now().strftime("%Y%m%d%H%M%S%f")
         td = trade_date or date.today().isoformat()
-        cur = conn.execute(
-            "INSERT INTO trade (trade_date, code, name, side, price, shares, amount,"
-            " order_id, status, decision_id, shots, confirmed_by, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (td, code, name, "sell", exec_price, shares, fees["amount"], order_id,
-             "filled", decision_id, "[]", confirmed_by, now_iso))
+        tid = repo.insert_trade(
+            conn, trade_date=td, code=code, name=name, side="sell", price=exec_price,
+            shares=shares, amount=fees["amount"], order_id=order_id,
+            decision_id=decision_id, confirmed_by=confirmed_by, created_at=now_iso)
         conn.commit()
-        res = {"ok": True, "trade_id": int(cur.lastrowid), "order_id": order_id,
+        res = {"ok": True, "trade_id": tid, "order_id": order_id,
                "code": code, "name": name or row[0], "side": "sell", "price": exec_price,
                "requested_price": price,
                "slippage_bps": float(self.cfg.get("slippage_bps", 0) or 0),
@@ -413,9 +396,8 @@ class PaperBroker:
         buy_sh = buy_gross = 0
         last_day: Optional[str] = None
         same_day_buy = 0
-        for (r_tdate, r_side, r_price, r_shares, r_amount, r_status) in conn.execute(
-                "SELECT trade_date, side, price, shares, amount, status FROM trade"
-                " WHERE code=? AND " + _EFFECTIVE + " ORDER BY id", (code,)).fetchall():
+        for (r_tdate, r_side, r_price, r_shares, r_amount, r_status) in \
+                repo.effective_trades(conn, code):
             n_eff += 1
             f = compute_fees(r_side, float(r_price), int(r_shares), self.cfg)
             if r_side == "buy":
@@ -474,10 +456,7 @@ class PaperBroker:
                 "cash": _r2(ledger_cash), "expected": fees}
 
     def _sold_shares(self, conn: sqlite3.Connection, code: str) -> int:
-        row = conn.execute(
-            "SELECT COALESCE(SUM(shares),0) FROM trade WHERE code=? AND side='sell' AND "
-            + _EFFECTIVE, (code,)).fetchone()
-        return int(row[0])
+        return repo.sold_shares(conn, code)
 
     def _readback_fail(self, conn: sqlite3.Connection, trade_id: int,
                        decision_id: Optional[int], problems: List[str]) -> dict:
@@ -504,8 +483,7 @@ class PaperBroker:
             positions[code] = {"name": name or code, "shares": int(shares),
                                "avail_shares": int(avail), "cost": float(cost or 0.0)}
         codes = set(positions)
-        for (c,) in conn.execute("SELECT code FROM stock_info").fetchall():
-            codes.add(str(c))
+        codes.update(repo.all_codes(conn))
         prev_closes: Dict[str, float] = {}
         total_equity = cash
         for code in sorted(codes):

@@ -54,6 +54,7 @@ NEXT_DAY = (_BASE + timedelta(days=1)).isoformat()           # 次日（解锁�
 
 def fresh_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row  # 与生产 fetcher.get_conn 一致（Phase 4 连接层统一）
     conn.executescript(DDL)
     return conn
 
@@ -250,7 +251,7 @@ def test_ensure_account_initializes_once():
     today = date.today().isoformat()
     row = conn.execute("SELECT cash, total, kill_switch FROM portfolio_state WHERE date=?",
                        (today,)).fetchone()
-    assert row == (1000000.0, 1000000.0, 0)
+    assert tuple(row) == (1000000.0, 1000000.0, 0)  # Row → tuple 比较（row_factory 统一后）
     assert b.ensure_account(conn) is False            # 当日已有行，不重复初始化
 
 
