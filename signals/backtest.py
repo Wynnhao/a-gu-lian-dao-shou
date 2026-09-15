@@ -37,6 +37,7 @@ from typing import Tuple
 
 import pandas as pd
 
+from common.market import limit_pct as market_limit_pct
 from data.fetcher import get_conn
 from signals.factors import atr_series
 from signals.signals import score_reversal_lowvol_xs
@@ -119,8 +120,9 @@ def _metrics(nav: pd.Series) -> Tuple[float, float, float]:
 
 
 def _limit_up_price(prev_close: float, code: str) -> float:
-    pct = 0.20 if str(code).startswith(("30", "68")) else 0.10
-    return float(prev_close) * (1 + pct)
+    # pct 走 common/market.py 唯一口径（此前内联第五处缺北交所 30% 分支）；
+    # 裸乘法保留——换 Decimal 会微变 tradable 边界（market.py 红线5）
+    return float(prev_close) * (1 + market_limit_pct(code))
 
 
 def _per_year(nav: pd.Series) -> dict:

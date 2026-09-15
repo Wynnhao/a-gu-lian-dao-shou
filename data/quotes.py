@@ -10,6 +10,7 @@ import logging
 import logging.handlers
 import os
 import re
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,12 @@ from typing import Dict, List, Optional
 import requests
 
 BASE = Path(__file__).resolve().parent.parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
+# 分钟级行情门控时段唯一口径（Phase 2 收敛）：薄壳 re-export，paper/runner 的
+# 「from data.quotes import is_trading_time」懒加载路径零改动
+from common.market import is_trading_time  # noqa: F401,E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,15 +51,6 @@ def _exchange_prefix(code: str) -> Optional[str]:
     if code.startswith(("0", "3")):
         return "sz"
     return None
-
-
-def is_trading_time(now: Optional[datetime] = None) -> bool:
-    """A股连续竞价时段：周一~五 9:30-11:30 / 13:00-15:00（与风控规则口径一致）。"""
-    now = now or datetime.now()
-    if now.weekday() >= 5:
-        return False
-    hm = now.hour * 100 + now.minute
-    return (930 <= hm <= 1130) or (1300 <= hm <= 1500)
 
 
 def _audit_snapshot(quotes: Dict[str, dict]) -> None:

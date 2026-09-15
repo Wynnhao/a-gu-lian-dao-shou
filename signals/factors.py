@@ -1,9 +1,18 @@
 """因子库：MA/RSI(Wilder)/ATR(Wilder)/动量/换手率分位/涨跌停幅度的纯函数，输入 pd.Series 或 numpy array，输出 float，数据长度不足返回 None。"""
 import math
+import sys
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+
+BASE = Path(__file__).resolve().parent.parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
+# 涨跌停幅度唯一口径（Phase 2 收敛：生产代码已不使用，仅 tests 引用——re-export 保持路径）
+from common.market import limit_pct  # noqa: F401
 
 
 def _arr(x) -> np.ndarray:
@@ -95,14 +104,3 @@ def turnover_pct(turnover, window: int = 250) -> Optional[float]:
     w = a[-window:]
     cur = float(w[-1])
     return float((w <= cur).mean())
-
-
-def limit_pct(code: str) -> float:
-    """涨跌停幅度：创业板(30)/科创板(68，含689 CDR) 0.20，北交所(43/83/87/88/92) 0.30，
-    其余主板 0.10。与 risk.engine.limit_pct / data/audit._limit_pct 口径对齐。"""
-    code = str(code)
-    if code.startswith(("30", "68")):
-        return 0.20
-    if code.startswith(("43", "83", "87", "88", "92")):
-        return 0.30
-    return 0.10

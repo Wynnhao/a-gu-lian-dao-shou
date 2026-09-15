@@ -20,23 +20,17 @@ import logging
 import logging.handlers
 import sqlite3
 from datetime import date, datetime
-from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
-from risk.engine import limit_pct, record_event
+# limit_price 为 common/market.py 唯一口径（engine re-export）；「超板才拒(>)」的
+# 调用点策略留在本模块（红线2，与 engine「到板即拒(≥)」不同）
+from risk.engine import limit_pct, limit_price, record_event
 
 FULL_CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
 EXEC_CFG_DEFAULT = dict(FULL_CFG.get("execution", {}))
 
 # 与 review/daily.py 一致的“有效成交”过滤（未成交/已撤单不影响资金与持仓）
 _EFFECTIVE = "(status IS NULL OR status NOT IN ('rejected','cancelled','canceled','pending'))"
-
-
-def _limit_price(pc: float, pct: float, up: bool) -> float:
-    """停板价（与风控引擎同口径：Decimal 四舍五入到分）。"""
-    q = Decimal(str(pc)) * (Decimal("1") + Decimal(str(pct)) if up
-                            else Decimal("1") - Decimal(str(pct)))
-    return float(q.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def _exec_logger(name: str) -> logging.Logger:
@@ -136,9 +130,9 @@ class PaperBroker:
             pc = self.prev_close(conn, code)
             if pc:
                 pct = limit_pct(code)  # 停板幅度统一走风控引擎口径（含北交所30%）
-                if side == "buy" and price > _limit_price(pc, pct, True) + 1e-9:
+                if side == "buy" and price > limit_price(pc, pct, True) + 1e-9:
                     raise _Reject("买价 %.2f 超涨停价，涨停无法成交" % price)
-                if side == "sell" and price < _limit_price(pc, pct, False) - 1e-9:
+                if side == "sell" and price < limit_price(pc, pct, False) - 1e-9:
                     raise _Reject("卖价 %.2f 低于跌停价，跌停无法成交" % price)
         cap = float(self.cfg.get("volume_participation_cap", 0) or 0)
         if cap > 0:

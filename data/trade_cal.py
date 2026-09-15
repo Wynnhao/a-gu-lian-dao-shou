@@ -1,8 +1,9 @@
 """交易日历：新浪历史交易日表缓存到 trade_calendar，查询失败退化为 weekday 判断。
 
 此前节假日全靠 weekday 硬判断：国庆/春节的周一会照常跑流水线、用陈旧价出决策。
-接入日历后 premarket/catchup/风控时段判断统一引用本模块；日历拉取失败不阻塞
-主流程（降级为 weekday，与旧行为一致，audit/health 会标注日历未覆盖）。
+接入日历后 premarket/catchup 的交易日判断引用本模块（风控时段判断用的是
+risk.engine 的秒级时段窗，与本模块无关）；日历拉取失败不阻塞主流程
+（降级为 weekday，与旧行为一致，audit/health 会标注日历未覆盖）。
 """
 import logging
 import sqlite3

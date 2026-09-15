@@ -17,11 +17,16 @@ import logging
 import logging.handlers
 import os
 import sqlite3
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
+from common import market as _market  # noqa: E402
 
 log = logging.getLogger("audit")
 log.setLevel(logging.INFO)
@@ -35,29 +40,24 @@ log.propagate = False
 BACKUP_DIR = Path(os.environ.get("AGSICKLE_BACKUP_DIR") or (BASE / "logs" / "backup"))
 BACKUP_KEEP = 30
 
-# 停板幅度按代码前缀：创业/科创 ±20%（300/301/302/688/689，302 为创业板新代码段），
-# 北交所 ±30%，其余主板 ±10%（ST 不区分，超 ±5% 会被主板规则误报——用 10% 上限 +
-# audit 报告人工确认，不做静默修正）
+# 停板幅度：common/market.py 唯一口径 × 100，+0.5pp 是「百分数舍入容差」而非 ST
+# 容差——audit 不区分 ST（超 ±5% 会被 10% 上限误报，靠报告人工确认，不做静默修正）
 def _limit_pct(code: str) -> float:
-    if code.startswith(("300", "301", "302", "688", "689")):
-        return 20.5
-    if code.startswith(("83", "87", "88", "43", "92")):
-        return 30.5
-    return 10.5
+    return _market.limit_pct(code) * 100 + 0.5
 
 
 def _norm_volume(volume, amount, close):
-    """与 fetcher 同款判定：返回归一为「手」的 volume；无法判定返回 None。"""
+    """审计口径量纲归一：判别核心在 common/market.py；无法判定返回 None（体检报问题）
+    ——与 fetcher 薄壳的原值回退不同（红线4）。"""
     try:
         v, amt, c = float(volume), float(amount), float(close)
     except (TypeError, ValueError):
         return None
     if v <= 0 or amt <= 0 or c <= 0:
         return None
-    implied = amt / c
-    if abs(v - implied) <= abs(v * 100 - implied):
-        return round(v / 100.0, 2)  # 原值是「股」
-    return v                         # 原值已是「手」
+    if _market.volume_unit_is_lots(v, amt, c):
+        return v                         # 原值已是「手」
+    return round(v / 100.0, 2)           # 原值是「股」
 
 
 def check_db(conn: sqlite3.Connection, limit: int = 200) -> list:

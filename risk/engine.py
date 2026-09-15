@@ -10,9 +10,13 @@ if str(BASE) not in sys.path:
 import json
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, time as dtime
-from decimal import Decimal, ROUND_HALF_UP
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+
+# 市场口径唯一权威实现（common/market.py，Phase 2 收敛）：limit_pct/limit_price/
+# in_trading_session 本体已移入，此处 re-export 保持 paper/tests 的 import 路径不破
+from common.market import (SESSION_AM, SESSION_PM, in_trading_session,  # noqa: F401
+                           is_trading_time, limit_pct, limit_price)
 
 # ---------------- 数据结构 ----------------
 
@@ -69,29 +73,8 @@ class Verdict:
 
 
 # ---------------- 工具函数 ----------------
-
-SESSION_AM = (dtime(9, 30), dtime(11, 30))
-SESSION_PM = (dtime(13, 0), dtime(15, 0))
-
-
-def in_trading_session(now: datetime) -> bool:
-    """是否处于 A 股连续竞价时段（周一~周五 09:30-11:30 / 13:00-15:00，边界含）。"""
-    if now.weekday() >= 5:
-        return False
-    t = now.time()
-    return SESSION_AM[0] <= t <= SESSION_AM[1] or SESSION_PM[0] <= t <= SESSION_PM[1]
-
-
-def limit_pct(code: str) -> float:
-    """涨跌停幅度：创业板(30)/科创板(68，含689 CDR) 20%，北交所(43/83/87/88/92) 30%，
-    其余主板 10%。北交所口径与 data/audit._limit_pct 对齐（2026-09-15 审查修复）。"""
-    code = str(code)
-    if code.startswith(("30", "68")):
-        return 0.20
-    if code.startswith(("43", "83", "87", "88", "92")):
-        return 0.30
-    return 0.10
-
+# （SESSION_AM/PM、in_trading_session、limit_pct、limit_price 已收敛至 common/market.py，
+#  模块顶部 re-export——本文件不再有本地定义）
 
 def _position_mv(ctx: RiskContext, code: str) -> float:
     """单票持仓市值（优先实时价，缺实时价退回成本价）。"""
@@ -107,16 +90,6 @@ def _effective_shares(order: dict, v: Verdict) -> int:
     """手数规整后的委托数量（未规整则取原始数量）。"""
     src = v.adjusted_order if v.adjusted_order is not None else order
     return int(round(float(src.get("shares", 0) or 0)))
-
-
-def limit_price(pc: float, pct: float, up: bool) -> float:
-    """停板价：Decimal 四舍五入到分（交易所口径）。
-
-    此前用 round()（银行家舍入），.005 边界会与交易所差 1 分钱。
-    """
-    q = Decimal(str(pc)) * (Decimal("1") + Decimal(str(pct)) if up
-                            else Decimal("1") - Decimal(str(pct)))
-    return float(q.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def _build_kill_orders(ctx: RiskContext) -> Tuple[List[dict], List[str]]:

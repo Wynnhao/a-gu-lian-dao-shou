@@ -18,6 +18,7 @@ import logging
 import logging.handlers
 import os
 import sqlite3
+import sys
 import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -26,6 +27,11 @@ import akshare as ak
 import pandas as pd
 
 BASE = Path(__file__).resolve().parent.parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))  # 本脚本被 catchup 当子进程直接跑，需能找到 common/
+
+from common import market as _market  # noqa: E402
+
 CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
 
 logging.basicConfig(
@@ -262,21 +268,18 @@ def call_ak(source: str, fn, *args, retries: int = 2, **kw):
 # ---------------------------------------------------------------- 量纲归一
 
 def _norm_volume(volume, amount, close):
-    """把任意源的成交量归一为「手」；依据 amount/close 的隐含股数判断原单位。
+    """把任意源的成交量归一为「手」；判别核心在 common/market.py。
 
     腾讯源文档称 volume 为股、实测部分票按手返回，逐行判定比按源判定可靠；
-    amount/close 缺失或两者都无法区分时原值返回，交由 data/audit.py 兜底。
+    判定失败（含非法输入）原值返回，交由 data/audit.py 兜底（红线4 的回退差异）。
     """
     try:
-        v, amt, c = float(volume), float(amount), float(close)
+        v = float(volume)
     except (TypeError, ValueError):
         return volume
-    if v <= 0 or amt <= 0 or c <= 0:
-        return volume
-    implied = amt / c  # ≈ 成交股数
-    if abs(v - implied) <= abs(v * 100 - implied):
-        return round(v / 100.0, 2)   # 原值是「股」→ 换成手
-    return v                          # 原值已是「手」
+    if _market.volume_unit_is_lots(v, amount, close):
+        return v
+    return round(v / 100.0, 2)   # 原值是「股」→ 换成手
 
 
 # ---------------------------------------------------------------- 行情源
