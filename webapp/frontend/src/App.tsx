@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { TopBar, type PageKey } from "@/components/layout/TopBar";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { InspectorProvider } from "@/components/Inspector";
 import { LiveProvider, RefreshProvider } from "@/lib/refresh";
 import { ThemeProvider } from "@/lib/theme";
@@ -55,15 +56,18 @@ export default function App() {
               <div className="flex h-screen min-w-[1100px] flex-col bg-background">
                 <TopBar page={page} onPage={goto} />
                 <main className="min-h-0 flex-1 overflow-y-auto p-3">
-                  {page === "workflow" && <WorkflowPage />}
-                  {page === "overview" && <OverviewPage onNavigate={goto} />}
-                  {page === "signals" && <SignalsPage />}
-                  {page === "groups" && <GroupsPage />}
-                  {page === "decisions" && <DecisionsPage />}
-                  {page === "gate" && <TradesGatePage />}
-                  {page === "news" && <NewsMacroPage />}
-                  {page === "reports" && <ReportsLogsPage />}
-                  {page === "strategy" && <StrategyLibPage />}
+                  {/* 页面级兜底：单页渲染异常只降级该页，TopBar 仍可切换其他页 */}
+                  <ErrorBoundary label="页面">
+                    {page === "workflow" && <WorkflowPage />}
+                    {page === "overview" && <OverviewPage onNavigate={goto} />}
+                    {page === "signals" && <SignalsPage />}
+                    {page === "groups" && <GroupsPage />}
+                    {page === "decisions" && <DecisionsPage />}
+                    {page === "gate" && <TradesGatePage />}
+                    {page === "news" && <NewsMacroPage />}
+                    {page === "reports" && <ReportsLogsPage />}
+                    {page === "strategy" && <StrategyLibPage />}
+                  </ErrorBoundary>
                 </main>
               </div>
             </div>

@@ -1007,11 +1007,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     # ---- 输出
-    def _send_bytes(self, status: int, body: bytes, ctype: str) -> None:
+    def _send_bytes(self, status: int, body: bytes, ctype: str,
+                    cache_control: str = "no-store") -> None:
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        # /api/* 维持 no-store（实时数据）；静态资源按文件性质拆分（_serve_static）
+        self.send_header("Cache-Control", cache_control)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -1041,7 +1043,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
         suffix = target.suffix.lower()
         ctype = MIME_OVERRIDE.get(suffix) or mimetypes.guess_type(target.name)[0] \
             or "application/octet-stream"
-        self._send_bytes(200, target.read_bytes(), ctype)
+        # 缓存拆分（Phase 5）：vite 产物 /assets/* 自带 content-hash → 一年 immutable；
+        # index.html → no-cache 协商缓存（ETag 304，改版即刻生效）；API 维持 no-store
+        if rel.startswith("assets/"):
+            cache_control = "public, max-age=31536000, immutable"
+        else:
+            cache_control = "no-cache"
+        etag = '"%x-%x"' % (int(target.stat().st_mtime), target.stat().st_size)
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", cache_control)
+            self.end_headers()
+            return
+        body = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", cache_control)
+        self.send_header("ETag", etag)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     # ---- 路由
     _ALLOWED_HOSTS = ("127.0.0.1", "localhost")
