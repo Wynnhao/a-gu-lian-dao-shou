@@ -279,6 +279,10 @@ def fetch_snapshot(codes: List[str], index_codes: Optional[List[str]] = None
     - **绝不写 _audit_snapshot jsonl**（录制数据落点是 minute_snapshot 表，防双写）；
     - 独立冷却（recorder_health.json），不动 fetcher 的 akshare 熔断器；
     - 同样绝不写 daily_bar（本模块红线不变）。
+    - 字段索引口径注记（C-ARC 补修3，Sprint4 落地核验/协同点6）：本函数自带
+      f[3]/f[4]/f[6]/f[37] 解析、与 _fetch_tencent 互不改动；扩展字段（卖一档/
+      流通市值/涨跌停）口径以 Sprint4 W-A4 对 _fetch_tencent 的实测重映射
+      （ask1=f[19]/f[20]、float_mv=f[44]×1e8、涨跌停=f[47]/f[48]）为准，两处仅互证。
 
     返回 {code: {price, prev_close, volume, amount, time, source}}；整体失败/冷却
     返回 {}，由调用方按整轮失败处理。

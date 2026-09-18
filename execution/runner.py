@@ -318,6 +318,13 @@ def _decision_from_row(row: tuple) -> dict:
                 for _flag in ("emergency_scan", "emergency_pending_skip"):
                     if c.get(_flag) is not None:
                         d[_flag] = c[_flag]
+                # C-ARC 补修1（docs/Sprint4-全库审查修复计划-2026-09-19.md 落地核验①，
+                # 即 W-A2②）：kill_liquidation 只随卖单恢复（收紧口径）——
+                # resolve_liquidations 构造的补清算单 flag 此前在 confirm 重建决策
+                # dict 时丢失，规则5 停机豁免与 T4 熔断豁免在 confirm 侧双双失效
+                # （propose 侧直接读输入 dict 不受影响）
+                if action == "sell" and c.get("kill_liquidation") is not None:
+                    d["kill_liquidation"] = c["kill_liquidation"]
                 # 审查补丁批 Fix A：skip_gate/confirmed_by 一律不从输入恢复——
                 # snapshot 存的是 LLM 原始 JSON，恢复它们等于允许决策输入自带
                 # "免闸门直写"标志（含 buy 也能直写、审计字段可伪造）。合法应急单
@@ -775,10 +782,10 @@ def propose(conn: sqlite3.Connection, decision: dict, decision_id: Optional[int]
     _assert_paper_mode()
     exec_cfg = CFG.get("execution", {})
     # C-ARC-2/T4：执行失败熔断挡板——当日 F1a∪F2 根决策数达阈值后暂停新 propose。
-    # 豁免 kill 递延补清算（强平 > 熔断，CONSTRAINTS §3.3 强序；decision 构造带
-    # kill_liquidation=True 标记，见 resolve_liquidations）。
-    if not decision.get("kill_liquidation") and \
-            exec_breaker_tripped(conn, now.strftime("%Y-%m-%d")):
+    # 豁免 kill 递延补清算（强平 > 熔断，CONSTRAINTS §3.3 强序）；补修1 收紧口径：
+    # 只认卖单（resolve_liquidations 构造恒为 sell，畸形 buy 不得借 flag 绕熔断）。
+    if not (decision.get("kill_liquidation") and decision.get("action") == "sell") \
+            and exec_breaker_tripped(conn, now.strftime("%Y-%m-%d")):
         first = _record_once_today(
             conn, "exec_circuit_breaker",
             "exec_circuit_breaker: 当日执行失败根决策数达阈值 %d，暂停新 propose"

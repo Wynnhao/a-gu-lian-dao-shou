@@ -1220,6 +1220,49 @@ def test_requeue_skips_emergency_scan_singles():
         shutil.rmtree(orders, ignore_errors=True)
 
 
+# ---------------- C-ARC 补修1（Sprint4 落地核验①/W-A2②）：补清算 flag 跨 confirm 存活 ----------------
+
+def test_confirm_liquidation_survives_stop_period_and_breaker():
+    """kill 后次日的补清算单（input_snapshot 含 kill_liquidation: true）：
+    修复前 _decision_from_row 不恢复该 flag → confirm 重建决策 dict 时丢失，
+    规则5 停机豁免失效必拒；修复后停机期 + 熔断已触发两条件下 confirm 均不被拦。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        # 条件一：停机期（kill.json 权威状态，STATE_DIR 已沙箱）
+        runner.write_kill_state(NOW10 + timedelta(hours=2), "演练停机")
+        # 条件二：熔断已触发（3 个根决策 F1a 事件，ts 与 confirm 当日口径对齐）
+        for did in (61, 62, 63):
+            _seed_f1a_event(conn, did, NOW_DATE + "T09:00:00")
+        assert runner.exec_breaker_tripped(conn, NOW_DATE) is True
+        # resolve_liquidations 同构的补清算单（昨日买入已解锁）
+        conn.execute(
+            "INSERT INTO position (code, name, shares, avail_shares, cost, updated_at)"
+            " VALUES ('000001','平安银行',100,100,12.0,?)", (YDAY + "T09:00:00",))
+        conn.commit()
+        liq = mk_decision("sell", "000001", 11.0, 100, kill_liquidation=True)
+        v = runner.propose(conn, liq, now=NOW10, orders_dir=orders)
+        assert v.approved, v.violations          # propose 侧两豁免（T4+规则5）本就活着
+        did = conn.execute("SELECT MAX(id) FROM decision").fetchone()[0]
+        snap = conn.execute("SELECT input_snapshot FROM decision WHERE id=?",
+                            (did,)).fetchone()[0]
+        assert "kill_liquidation" in snap
+        # confirm 侧：修复前 flag 丢失 → 规则5「停机期拒普通卖出」必拦
+        res = runner.confirm(conn, did, confirmed_by="测试", now=NOW10, orders_dir=orders)
+        assert res is not None and res["ok"], "补清算单在停机期+熔断下必须可 confirm 成交"
+        st = conn.execute("SELECT status FROM decision WHERE id=?", (did,)).fetchone()[0]
+        assert st == "executed" and runner.list_pending(orders) == []
+        # 修复口径：恢复只随卖单（买入重建 dict 不得带 kill_liquidation）
+        buy_d = mk_decision("buy", "600519", 1500.0, 100, kill_liquidation=True)
+        v2 = runner.propose(conn, buy_d, now=NOW10, orders_dir=orders)   # 熔断豁免只认卖单
+        assert not v2.approved and "exec breaker" in v2.warnings
+    finally:
+        if runner.KILL_STATE_FILE.exists():
+            runner.KILL_STATE_FILE.unlink()
+        shutil.rmtree(orders, ignore_errors=True)
+
+
 # ---------------- 直接运行入口 ----------------
 
 if __name__ == "__main__":

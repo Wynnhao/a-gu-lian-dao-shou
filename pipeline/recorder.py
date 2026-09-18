@@ -40,8 +40,11 @@ from data.trade_cal import is_trading_day                     # noqa: E402
 log = logging.getLogger("pipeline.recorder")
 log.setLevel(logging.INFO)
 if not log.handlers:
+    # AGSICKLE_LOG_DIR 逃生门（批次0 W0-1 同模式，Sprint4 落地核验②）：
+    # 测试/隔离环境把日志导出去，绝不写生产 logs/
+    _LOG_DIR = Path(os.environ.get("AGSICKLE_LOG_DIR") or (BASE / "logs"))
     _fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    _fh = logging.handlers.RotatingFileHandler(BASE / "logs" / "pipeline.log",
+    _fh = logging.handlers.RotatingFileHandler(_LOG_DIR / "pipeline.log",
                                                encoding="utf-8",
                                                maxBytes=5_000_000, backupCount=3)
     _fh.setFormatter(_fmt)
