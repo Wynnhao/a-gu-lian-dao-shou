@@ -40,7 +40,7 @@ from typing import Optional
 
 import pandas as pd
 
-from common.config import load  # noqa: E402
+from common.config import active_profile, load  # noqa: E402
 from data import repo  # noqa: E402
 from data.fetcher import get_conn  # noqa: E402
 from risk.blacklist import check_blacklist  # noqa: E402
@@ -442,7 +442,7 @@ def compute_all(as_of: Optional[str] = None, conn=None,
     own = conn is None
     c = conn or get_conn()
     t0 = time.time()
-    prof_name = profile or profile()
+    prof_name = profile or active_profile()
     pool = pd.read_sql("SELECT * FROM daily_bar", c)
     all_c = sorted(repo.all_codes(c))
     bl = check_blacklist(c)

@@ -202,12 +202,14 @@ def test_t_plus_1_buy_today_avail_unchanged():
     conn = fresh_conn()
     seed_market(conn)
     b = PaperBroker(EXEC_CFG)
-    b.buy(conn, "600519", "贵州茅台", 1500.0, 100)
+    # trade_date/as_of 全部显式锚定合成日：周六运行时 NEXT_DAY == 真实今天，
+    # 缺省 date.today() 会让「次日解锁」变空操作（2026-09-19 周末实测红）
+    b.buy(conn, "600519", "贵州茅台", 1500.0, 100, trade_date=NOW_DATE)
     sh, avail = conn.execute(
         "SELECT shares, avail_shares FROM position WHERE code='600519'").fetchone()
     assert (sh, avail) == (100, 0)                    # T+1：当日新买不计入 avail
-    assert b.sell(conn, "600519", "贵州茅台", 1500.0, 1) is None  # 当日不可卖
-    b.unlock_t_plus_1(conn)                           # 当日补跑盘前：当日买入不得提前解锁
+    assert b.sell(conn, "600519", "贵州茅台", 1500.0, 1, trade_date=NOW_DATE) is None  # 当日不可卖
+    b.unlock_t_plus_1(conn, as_of=NOW_DATE)           # 当日补跑盘前：当日买入不得提前解锁
     _, avail = conn.execute(
         "SELECT shares, avail_shares FROM position WHERE code='600519'").fetchone()
     assert avail == 0
@@ -246,7 +248,9 @@ def test_sell_over_avail_rejected():
     conn = fresh_conn()
     seed_market(conn)
     b = PaperBroker(EXEC_CFG)
-    b.buy(conn, "000001", "平安银行", 11.0, 100)
+    # 买入显式锚定合成日（周六运行时 NEXT_DAY==真实今天，缺省 date.today()
+    # 会让下方 as_of=NEXT_DAY 解锁变空操作，avail 恒为 0）
+    b.buy(conn, "000001", "平安银行", 11.0, 100, trade_date=NOW_DATE)
     assert b.sell(conn, "000001", "平安银行", 11.0, 1) is None        # avail=0
     b.unlock_t_plus_1(conn, as_of=NEXT_DAY)                           # 次日盘前解锁
     assert b.sell(conn, "000001", "平安银行", 11.0, 101) is None      # 超 avail
