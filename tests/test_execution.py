@@ -862,6 +862,195 @@ def test_regime_failopen_and_warn_events_propose_confirm():
         shutil.rmtree(orders, ignore_errors=True)
 
 
+# ---------------- C-ARC-1/T3：执行级有限重挂（F1a 价格漂移型） ----------------
+
+def _make_f1a(conn, orders, action="buy", code="000001", price=11.15):
+    """生产路径构造 F1a：10:00 propose（pending）→ 12:00 午休 confirm 重跑风控被拒
+    （规则4）→ status=rejected + risk_check_reconfirm + pending 已删（09-16 场景同构）。"""
+    d = mk_decision(action, code, price, 100)
+    if action == "sell":
+        conn.execute(
+            "INSERT INTO position (code, name, shares, avail_shares, cost, updated_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (code, NAMES[code], 100, 100, 12.0, YDAY + "T09:00:00"))
+        conn.commit()
+    v = runner.propose(conn, d, now=NOW10, orders_dir=orders)
+    assert v.approved, v.violations
+    lunch = datetime.combine(_BASE, time(12, 0))
+    res = runner.confirm(conn, 1, confirmed_by="试探", now=lunch, orders_dir=orders)
+    assert res is None
+    st = conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0]
+    assert st == "rejected" and st is not None
+    n = conn.execute("SELECT COUNT(*) FROM risk_event WHERE "
+                     "rule='risk_check_reconfirm' AND decision_id=1").fetchone()[0]
+    assert n >= 1
+    return d
+
+
+def _seed_retry_chain(conn, root_id, run_date, attempts):
+    """预置链上 attempt 决策行（reasons 带 exec_retry_of=<root>;attempt=<n> 标记）。"""
+    for i in range(1, attempts + 1):
+        conn.execute(
+            "INSERT INTO decision (run_date, code, action, target_weight, confidence,"
+            " reasons, risk_notes, input_snapshot, status, created_at)"
+            " VALUES (?,?,'buy',0.05,0.8,?,?,?,'rejected',?)",
+            (run_date, "000001",
+             json.dumps(["%s%d;attempt=%d" % (runner._RETRY_MARK, root_id, i)]),
+             "[]", "{}", NOW_DATE + "T13:00:00"))
+    conn.commit()
+
+
+def test_requeue_hits_price_drift_reject():
+    """命中重挂：F1a 价格漂移型拒单 → 新决策按实时价重提、完整 propose 落 pending
+    等人工 confirm（不自动成交），exec_retry 留痕。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        _make_f1a(conn, orders, price=11.15)     # 委托 11.15，实时 11.0，漂移 1.35% > 1%
+        assert len(runner.list_pending(orders)) == 0
+        n = runner.requeue_price_rejects(conn, now=NOW10, orders_dir=orders)
+        assert n == 1
+        row = conn.execute(
+            "SELECT id, status, reasons FROM decision WHERE id=2").fetchone()
+        assert row is not None and row[1] == "approved"     # 等待 confirm，非 executed
+        assert ("exec_retry_of=1;attempt=1" in row[2]), row[2]
+        pend = runner.list_pending(orders)
+        assert len(pend) == 1, "重挂单必须落 pending 人工闸门"
+        payload = json.loads(pend[0].read_text(encoding="utf-8"))
+        assert payload["decision"]["order"]["price"] == 11.0   # 按实时价重挂
+        assert len(trade_rows(conn)) == 0                       # 绝不自动成交
+        ev = conn.execute("SELECT detail, decision_id FROM risk_event WHERE"
+                          " rule='exec_retry'").fetchone()
+        assert ev and ev[1] == 2
+        info = json.loads(ev[0])
+        assert info["root"] == 1 and info["attempt"] == 1
+        assert abs(info["old_price"] - 11.15) < 1e-9 and abs(info["new_price"] - 11.0) < 1e-9
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_requeue_skips_when_manual_requeue_exists():
+    """已有人工更晚同票同向决策 → 不掺和（09-16 人工重提 #31 场景）。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        _make_f1a(conn, orders, price=11.15)
+        conn.execute(
+            "INSERT INTO decision (run_date, code, action, target_weight, confidence,"
+            " reasons, risk_notes, input_snapshot, status, created_at)"
+            " VALUES (?,?,'buy',0.05,0.8,'[]','[]','{}','approved',?)",
+            (NOW_DATE, "000001", NOW_DATE + "T13:00:00"))
+        conn.commit()
+        assert runner.requeue_price_rejects(conn, now=NOW10, orders_dir=orders) == 0
+        assert conn.execute("SELECT COUNT(*) FROM decision").fetchone()[0] == 2
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_requeue_skips_non_drift_reject():
+    """漂移不足（≤ 0.5×price_guard_pct）的非漂移型拒单不重挂。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        _make_f1a(conn, orders, price=11.05)     # 漂移 0.45% ≤ 1%
+        assert runner.requeue_price_rejects(conn, now=NOW10, orders_dir=orders) == 0
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_requeue_stops_after_attempt_exhausted():
+    """attempt 耗尽（≥ exec_retry_max=3）停止重挂；止损卖单落 stop_loss_unfilled。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        _make_f1a(conn, orders, action="sell", code="000001", price=11.15)
+        _seed_retry_chain(conn, root_id=1, run_date=NOW_DATE, attempts=3)
+        n = runner.requeue_price_rejects(conn, now=NOW10, orders_dir=orders)
+        assert n == 0
+        ev = conn.execute("SELECT detail FROM risk_event WHERE"
+                          " rule='stop_loss_unfilled'").fetchone()
+        assert ev and ev[0].startswith("stop_loss_unfilled: 000001 "), ev
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_requeue_quiet_after_1455():
+    """14:55 后不触发（给人工留 10 分钟；15:05 TTL 兜底）。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        _make_f1a(conn, orders, price=11.15)
+        late = datetime.combine(_BASE, time(14, 56))
+        assert runner.requeue_price_rejects(conn, now=late, orders_dir=orders) == 0
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_requeue_blocked_by_exec_breaker():
+    """熔断期不触发：当日已有 ≥3 个根决策的 F1a/F2 事件。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        _make_f1a(conn, orders, price=11.15)
+        # 伪造凑满阈值 3 的 F1a 事件（ts 必须用 requeue 口径的合成日 NOW_DATE；
+        # _make_f1a 经生产 confirm 产生的真实事件 ts 是真实系统日，另补一条合成日事件）。
+        # did 90/91 无 decision 行：_retry_root 回退为 id 本身，仍计为独立根。
+        for did in (1, 90, 91):
+            conn.execute(
+                "INSERT INTO risk_event (ts, rule, detail, decision_id) VALUES "
+                "(?,?,?,?)", (NOW_DATE + "T13:00:00", "risk_check_reconfirm",
+                              "演练 F1a #%d" % did, did))
+        conn.commit()
+        assert runner.exec_breaker_tripped(conn, NOW_DATE) is True
+        assert runner.requeue_price_rejects(conn, now=NOW10, orders_dir=orders) == 0
+        # 次日自动解除（ts LIKE 前缀换日即清零，无状态文件）
+        assert runner.exec_breaker_tripped(conn, "2099-01-01") is False
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_requeue_skips_non_trading_day():
+    """节假日不触发：trade_calendar 覆盖当年但当日不在其中。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        _make_f1a(conn, orders, price=11.15)
+        # 日历覆盖到当年（有行即视为"已覆盖"），但不含 _BASE → 视为假日
+        conn.execute("INSERT INTO trade_calendar VALUES (?)",
+                     ((_BASE + timedelta(days=7)).isoformat(),))
+        conn.commit()
+        assert runner.requeue_price_rejects(conn, now=NOW10, orders_dir=orders) == 0
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_requeue_cum_drift_guard_abandons_chase():
+    """追价护栏：实时价相对根决策原价累计漂移 ≥ 5% → 放弃并落 exec_retry_skip。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        _make_f1a(conn, orders, price=11.05)     # 根决策原价 11.05
+        # 盘中行情下移：11.05 → 10.45（累计漂移 5.4% ≥ 5%）
+        conn.execute("UPDATE daily_bar SET close=10.45 WHERE code='000001'"
+                     " AND trade_date=?", (NOW_DATE,))
+        conn.commit()
+        n = runner.requeue_price_rejects(conn, now=NOW10, orders_dir=orders)
+        assert n == 0
+        ev = conn.execute("SELECT detail FROM risk_event WHERE"
+                          " rule='exec_retry_skip'").fetchone()
+        assert ev and ev[0].startswith("exec_retry_skip: 000001 "), ev
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
 # ---------------- 直接运行入口 ----------------
 
 if __name__ == "__main__":

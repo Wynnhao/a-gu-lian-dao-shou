@@ -27,6 +27,7 @@
 | `kill_executed` | _do_kill 末尾汇总（卖出笔数/trade_ids/递延笔数），**不做逐笔**（trade 行天然带 decision_id+confirmed_by='kill_switch'，100% 冗余） | T2 | 不去重（每次 kill 一条） |
 | `exec_retry` | T3 每次重挂（含根 id/attempt/旧价/新价） | T3 | 不去重（每 attempt 一条） |
 | `stop_loss_unfilled` | T3 重挂链耗尽且仍为价格漂移型拒单（仅 sell） | T3 | once_today 按 code 前缀 |
+| `exec_retry_skip` | T3 累计漂移超护栏（exec_retry_drift_max）放弃追价 | T3 | once_today 按 code 前缀 |
 | `exec_circuit_breaker` | T4 熔断触发（当日首次） | T4 | once_today 同名前缀 |
 
 ## 3. 事件 detail 与去重前缀的书写约定（强制）

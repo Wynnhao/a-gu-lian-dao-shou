@@ -668,7 +668,10 @@
     "stamp_tax_rate": 0.0005,
     "slippage_bps": 10,
     "volume_participation_cap": 0.01,
-    "sim_limit_halt": true
+    "sim_limit_halt": true,
+    "exec_retry_max": 3,
+    "exec_retry_drift_max": 0.05,
+    "exec_breaker_threshold": 3
   },
   "notify": {
     "enabled": true,

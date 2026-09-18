@@ -21,12 +21,14 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import sqlite3
 from dataclasses import asdict
 from datetime import datetime, timedelta, time as dtime
 from typing import Any, Dict, List, Optional, Tuple
 
 from common.config import snapshot
+from common.market import in_trading_session
 from data import repo
 from data.fetcher import get_conn
 from risk.blacklist import check_blacklist, health_check
@@ -519,6 +521,184 @@ def resolve_liquidations(conn: sqlite3.Connection, now: Optional[datetime] = Non
         print("[liquidation] %s %s 补清算 %d 股 @%.2f" % (code, pos[0], int(pos[1]), price))
         propose(conn, decision, run_date=now.strftime("%Y-%m-%d"), now=now,
                 orders_dir=orders_dir)
+        n += 1
+    return n
+
+
+# ---------------------------------------------------------------- 执行级有限重挂（C-ARC-1/T3）与熔断判定（C-ARC-2/T4）
+#
+# taxonomy 依据 docs/ADR-0-执行失败taxonomy-F1a-F1b-F2.md：
+# - F1a（confirm 重跑风控被拒，status=rejected、pending 已删）→ 本节自动重挂对象
+# - F1b（执行价二次校验被拒，pending 保留）与 F2（broker 拒单，pending 保留）→ 不重挂
+# - 熔断输入 = F1a ∪ F2 按根决策链归并
+
+_RETRY_MARK = "exec_retry_of="   # reasons 标记：exec_retry_of=<根id>;attempt=<n>
+
+
+def _retry_root(conn: sqlite3.Connection, decision_id: int) -> int:
+    """重挂链根决策 id：本决策带 exec_retry_of 标记则归并到根，否则自身即根。"""
+    row = conn.execute("SELECT reasons FROM decision WHERE id=?", (decision_id,)).fetchone()
+    if row and row[0]:
+        m = re.search(_RETRY_MARK + r"(\d+);attempt=", str(row[0]))
+        if m:
+            return int(m.group(1))
+    return int(decision_id)
+
+
+def _retry_attempts(conn: sqlite3.Connection, root: int, run_date: str) -> int:
+    """当日链上既有重挂次数（reasons 含 exec_retry_of=<root>;attempt= 的决策数）。
+    LIKE 用 ';attempt=' 锚定，root=5 不会误配 55。"""
+    n = conn.execute(
+        "SELECT COUNT(*) FROM decision WHERE run_date=? AND reasons LIKE ?",
+        (run_date, "%" + _RETRY_MARK + "%d;attempt=%%" % root)).fetchone()[0]
+    return int(n)
+
+
+def exec_breaker_tripped(conn: sqlite3.Connection, today: Optional[str] = None,
+                         threshold: Optional[int] = None) -> bool:
+    """C-ARC-2/T4：执行失败熔断判定——当日 F1a ∪ F2 的**根决策**数 ≥ 阈值。
+
+    不加状态文件：risk_event 落库推导，DB 天然跨进程、当日自动过期、可重放。
+    根决策归并：F2 直接取 decision_id；F1a 经重挂链的按 exec_retry_of 回溯根 id。
+    """
+    today = today or datetime.now().strftime("%Y-%m-%d")
+    if threshold is None:
+        threshold = int(CFG.get("execution", {}).get("exec_breaker_threshold", 3))
+    rows = conn.execute(
+        "SELECT DISTINCT decision_id FROM risk_event WHERE rule IN "
+        "('risk_check_reconfirm','execution_failed') AND ts LIKE ? "
+        "AND decision_id IS NOT NULL", (today + "%",)).fetchall()
+    roots = {_retry_root(conn, int(did)) for (did,) in rows}
+    return len(roots) >= max(1, int(threshold))
+
+
+def _record_once_today(conn: sqlite3.Connection, rule: str, detail: str,
+                       prefix: Optional[str] = None,
+                       decision_id: Optional[int] = None) -> None:
+    """同日同前缀只落一条（照 limit_halt real_today 口径：去重窗口按真实自然日，
+    防回放注入时间击穿去重）。detail 必须以 prefix 开头（ADR-0 §3）。"""
+    prefix = prefix or detail
+    real_today = datetime.now().strftime("%Y-%m-%d")
+    n = conn.execute(
+        "SELECT COUNT(*) FROM risk_event WHERE rule=? AND ts LIKE ? AND detail LIKE ?",
+        (rule, real_today + "%", prefix + "%")).fetchone()[0]
+    if not n:
+        record_event(conn, rule, detail, decision_id)
+
+
+def requeue_price_rejects(conn: sqlite3.Connection, now: Optional[datetime] = None,
+                          orders_dir: Optional[Path] = None) -> int:
+    """C-ARC-1/T3：当日 F1a「价格漂移型」拒单 → 按实时价重插决策、走完整 propose
+    （风控 + pending），等人工 confirm。与 09-16 人工路径同构（#28 被价格保护拒
+    → 人工按实时价重提 #31）：不自动成交、不继承原单确认状态、不覆盖 F1b/F2。
+
+    判定式（施工方案 §2.T3）：rejected + risk_check_reconfirm + 无更晚同票同向决策
+    + 实时价漂移 > 0.5×price_guard_pct + attempt < exec_retry_max + 累计漂移 <
+    exec_retry_drift_max + 交易时段内且 14:55 前 + 交易日 + 熔断未触发。
+
+    返回重挂数。由 intraday_check 步骤 3.7（14:50 cron 与 catchup 30 分钟扫描）调起。
+    """
+    now = now or datetime.now()
+    exec_cfg = CFG.get("execution", {})
+    max_retry = int(exec_cfg.get("exec_retry_max", 3))
+    drift_max = float(exec_cfg.get("exec_retry_drift_max", 0.05))
+    guard_pct = float(CFG.get("risk", {}).get("price_guard_pct", 0.02))
+    today = now.strftime("%Y-%m-%d")
+
+    # 时段闸：连续竞价内 + 14:55 前（给人工留 10 分钟；15:05 TTL 兜底）
+    if not in_trading_session(now) or now.time() >= dtime(14, 55):
+        return 0
+    from data.trade_cal import is_trading_day
+    if not is_trading_day(conn, now.date()):
+        return 0
+    if exec_breaker_tripped(conn, today):   # 熔断期不重挂（C-ARC-2）
+        return 0
+
+    broker = PaperBroker()
+    rows = conn.execute(
+        "SELECT d.id FROM decision d WHERE d.run_date=? AND d.status='rejected' "
+        "AND d.action IN ('buy','sell') AND EXISTS ("
+        "  SELECT 1 FROM risk_event e WHERE e.rule='risk_check_reconfirm' "
+        "  AND e.decision_id=d.id) ORDER BY d.id", (today,)).fetchall()
+
+    n = 0
+    for (did,) in rows:
+        got = _get_decision(conn, did)
+        if not got:
+            continue
+        _row, decision = got
+        code = str(decision.get("code") or "")
+        action = str(decision.get("action") or "")
+        order = decision.get("order") or {}
+        try:
+            old_price = float(order.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not code or old_price <= 0:
+            continue
+        # 人工已重提（存在更晚的同 code+action 决策）→ 不掺和（09-16 #31 场景）
+        later = conn.execute(
+            "SELECT 1 FROM decision WHERE run_date=? AND code=? AND action=? "
+            "AND id>? LIMIT 1", (today, code, action, did)).fetchone()
+        if later:
+            continue
+        live = broker.latest_price(conn, code)
+        if not live or live <= 0:
+            continue
+        drift = abs(live - old_price) / old_price
+        if drift <= guard_pct * 0.5:
+            continue   # 非价格漂移型拒单：重提无意义（原价仍贴市价）
+        root = _retry_root(conn, did)
+        attempts = _retry_attempts(conn, root, today)
+        if attempts >= max_retry:
+            # 链耗尽：止损卖单仍未成交必须响铃（并入 stop_loss 事件流，同日同票一条）
+            if action == "sell":
+                _record_once_today(
+                    conn, "stop_loss_unfilled",
+                    "stop_loss_unfilled: %s 止损卖单重挂链耗尽（attempt=%d ≥ %d，"
+                    "根决策 #%d），仍未成交，请人工处置" % (code, attempts, max_retry, root),
+                    prefix="stop_loss_unfilled: %s " % code, decision_id=did)
+                notify("止损卖单未成交", "%s 重挂 %d 次仍未成交（根决策 #%d），请人工处置"
+                       % (code, attempts, root))
+            continue
+        # 追价护栏：新价相对根决策原价累计漂移 ≥ exec_retry_drift_max → 放弃
+        root_price = old_price
+        if root != did:
+            rg = _get_decision(conn, root)
+            if rg:
+                try:
+                    root_price = float((rg[1].get("order") or {}).get("price") or old_price)
+                except (TypeError, ValueError):
+                    root_price = old_price
+        cum = abs(live - root_price) / root_price if root_price > 0 else 0.0
+        if cum >= drift_max:
+            _record_once_today(
+                conn, "exec_retry_skip",
+                "exec_retry_skip: %s 累计漂移 %.2f%% ≥ 上限 %.0f%%（根 #%d 原 %.2f → "
+                "现 %.2f），放弃追价" % (code, cum * 100, drift_max * 100,
+                                 root, root_price, live),
+                prefix="exec_retry_skip: %s " % code, decision_id=did)
+            continue
+
+        new_decision = dict(decision)
+        new_order = dict(order)
+        new_order["price"] = float(live)
+        new_decision["order"] = new_order
+        new_decision["reasons"] = list(decision.get("reasons") or []) + [
+            "%s%d;attempt=%d（执行级重挂：原价 %.2f → 实时价 %.2f）"
+            % (_RETRY_MARK, root, attempts + 1, old_price, live)]
+        new_id = _insert_decision(conn, new_decision, today)
+        v2 = propose(conn, new_decision, decision_id=new_id, now=now,
+                     orders_dir=orders_dir)
+        record_event(conn, "exec_retry",
+                     json.dumps({"root": root, "attempt": attempts + 1,
+                                 "old_price": old_price, "new_price": float(live),
+                                 "new_decision_id": new_id,
+                                 "approved": bool(v2.approved)},
+                                ensure_ascii=False),
+                     new_id)
+        print("[requeue] decision#%d 已按实时价 %.2f 重提（根 #%d，attempt %d/%d）"
+              % (new_id, live, root, attempts + 1, max_retry))
         n += 1
     return n
 

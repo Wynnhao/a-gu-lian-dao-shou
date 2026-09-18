@@ -133,6 +133,16 @@ def main() -> int:
         except Exception as e:
             print("[sweep] 跌停应急扫描 FAIL（继续）: %r" % e)
 
+        # 3.7) C-ARC-1 执行级有限重挂：当日 F1a（confirm 重跑风控被拒）价格漂移型
+        # 拒单 → 按实时价重插决策走完整 propose，落 pending 等人工 confirm
+        #（绝不自动成交；重挂链/追价护栏/熔断闸在 runner.requeue_price_rejects 内）
+        try:
+            n_retry = runner.requeue_price_rejects(conn, now=now)
+            if n_retry:
+                print("[sweep] 执行级重挂：%d 单已重提 pending（等人工确认）" % n_retry)
+        except Exception as e:
+            print("[sweep] 执行级重挂 FAIL（继续）: %r" % e)
+
         # 4) pending 单漂移
         drifts = _pending_drift(conn, now)
 
