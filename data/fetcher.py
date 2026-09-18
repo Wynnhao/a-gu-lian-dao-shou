@@ -174,6 +174,17 @@ CREATE TABLE IF NOT EXISTS breadth_daily (
     new_high_minus_new_low INT, breadth_composite REAL,
     source TEXT
 );
+
+-- C-ARC-3b（ADR-A3 对「不引新表」的显式豁免落点，docs/架构借鉴-cloddsbot-2026-09-19.md）：
+-- 盘中 5 分钟栅格快照，供盘中时点回放/回测（尾盘决策、止损触线、limit_halt 应急的
+-- 验证基础设施）。ts 为 5 分钟栅格 ISO 串；INSERT OR REPLACE 天然幂等
+-- （launchd 合并触发/手动补跑无冲突）。录制器绝不写 daily_bar。
+CREATE TABLE IF NOT EXISTS minute_snapshot (
+    code TEXT NOT NULL, ts TEXT NOT NULL,
+    price REAL, volume REAL, amount REAL, source TEXT,
+    PRIMARY KEY (code, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_minute_snapshot_ts ON minute_snapshot(ts);
 """
 
 # 已有库的增量迁移：DDL 只对新建库生效，老库靠 ALTER 补列

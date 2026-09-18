@@ -349,6 +349,167 @@ def test_postclose_idempotent_double_run():
     # 通知已由 AGSICKLE_DISABLE_NOTIFY=1 短路：两次跑均无系统通知副作用（无法断言，语义见 docstring）
 
 
+# ----------------------- C-ARC-3b/T6：盘中分钟快照录制器 -----------------------
+
+def _patch_fetch_snapshot(snap_fn):
+    """进程内 stub 录制取数面（fetch_snapshot 不走 MOCK_QUOTES 逃生门，直 patch）。"""
+    import pipeline.recorder as rec
+    orig = rec.quotes.fetch_snapshot
+    rec.quotes.fetch_snapshot = snap_fn
+    return orig
+
+
+def _patch_recorder_conn(conn):
+    """main() 内部走 fetcher.get_conn()——patch 到调用方的 :memory: 连接，
+    绝不让测试摸到 AGSICKLE_DB/生产库（C-TEST-4）。main() 退出时会 close，
+    用 no-close 代理保护真实连接。"""
+    import pipeline.recorder as rec
+
+    class _NoCloseConn:
+        def __init__(self, c):
+            self._c = c
+
+        def close(self):
+            pass
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+    orig = rec.fetcher.get_conn
+    rec.fetcher.get_conn = lambda: _NoCloseConn(conn)
+    return orig
+
+
+def test_recorder_grid_ts():
+    """5 分钟栅格归整：向下取整到桶边界，秒/微秒清零。"""
+    import pipeline.recorder as rec
+    assert rec.grid_ts(datetime(2026, 9, 18, 12, 7, 43)) == "2026-09-18T12:05:00"
+    assert rec.grid_ts(datetime(2026, 9, 18, 9, 30, 0)) == "2026-09-18T09:30:00"
+    assert rec.grid_ts(datetime(2026, 9, 18, 15, 0, 59)) == "2026-09-18T15:00:00"
+    assert rec.grid_ts(datetime(2026, 9, 18, 10, 4, 59)) == "2026-09-18T10:00:00"
+
+
+def test_recorder_writes_idempotent_and_fetch_log_ok():
+    """入库幂等：同一 5 分钟栅格重跑行数不增（INSERT OR REPLACE）；
+    fetch_log 落 status='ok' 市场级行（code=minute_snapshot）。"""
+    import pipeline.recorder as rec
+    conn = fresh_conn()
+    seed_market(conn)
+    snap = {"600519": {"price": 1500.0, "volume": 100000.0, "amount": 1.5e9,
+                       "prev_close": 1490.0, "time": "t", "source": "tencent_snapshot"},
+            "000001": {"price": 11.0, "volume": 200000.0, "amount": 2.2e9,
+                       "prev_close": 10.9, "time": "t", "source": "tencent_snapshot"},
+            "000300": {"price": 3900.0, "volume": None, "amount": None,
+                       "prev_close": 3890.0, "time": "t", "source": "tencent_snapshot"}}
+    orig = _patch_fetch_snapshot(lambda codes, index_codes=None: dict(snap))
+    try:
+        now = datetime.combine(_BASE, time(10, 2))
+        wanted, n, miss = rec.record_once(conn, now)
+        assert (wanted, n) == (8, 3) and miss == 5      # seed 5 票 + 3 指数
+        ts = rec.grid_ts(now)
+        rows = conn.execute("SELECT code, price, source FROM minute_snapshot"
+                            " WHERE ts=?", (ts,)).fetchall()
+        assert {r[0] for r in rows} == {"600519", "000001", "000300"}
+        # 重跑同栅格：行数不增（幂等）
+        assert rec.record_once(conn, now)[1] == 3
+        assert conn.execute("SELECT COUNT(*) FROM minute_snapshot WHERE ts=?",
+                            (ts,)).fetchone()[0] == 3
+        # 不同栅格：新增行
+        rec.record_once(conn, datetime.combine(_BASE, time(10, 7)))
+        assert conn.execute("SELECT COUNT(*) FROM minute_snapshot").fetchone()[0] == 6
+        fl = conn.execute("SELECT status, rows FROM fetch_log WHERE"
+                          " code='minute_snapshot'").fetchall()
+        assert len(fl) == 3 and all(r[0] == "ok" and r[1] == 3 for r in fl), fl
+    finally:
+        rec.quotes.fetch_snapshot = orig
+        conn.close()
+
+
+def test_recorder_gates_holiday_and_lunch():
+    """双 gate：假日（日历覆盖当年但当日不在）与午休直接秒退，零写库零 fetch_log。"""
+    import pipeline.recorder as rec
+    conn = fresh_conn()
+    seed_market(conn)
+    orig_snap = _patch_fetch_snapshot(
+        lambda codes, index_codes=None: (_ for _ in ()).throw(AssertionError("不应取数")))
+    orig_gc = _patch_recorder_conn(conn)
+    try:
+        # 假日 gate：日历覆盖当年但不含 _BASE
+        conn.execute("INSERT INTO trade_calendar VALUES (?)",
+                     ((_BASE + timedelta(days=7)).isoformat(),))
+        conn.commit()
+        assert rec.main(["--now", _BASE.isoformat()]) == 0
+        # 午休 gate：清日历恢复 weekday 语义，12:00 非连续竞价
+        conn.execute("DELETE FROM trade_calendar")
+        conn.commit()
+        lunch = datetime.combine(_BASE, time(12, 0))
+        assert rec.main(["--now", lunch.isoformat()]) == 0
+        assert conn.execute("SELECT COUNT(*) FROM minute_snapshot").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM fetch_log WHERE"
+                            " code='minute_snapshot'").fetchone()[0] == 0
+    finally:
+        rec.quotes.fetch_snapshot = orig_snap
+        rec.fetcher.get_conn = orig_gc
+        conn.close()
+
+
+def test_recorder_total_failure_is_fail_loud():
+    """整轮失败 fail-loud：快照 0 行 → rc=1 + fetch_log status='fail'（缺测率验收口径）。"""
+    import pipeline.recorder as rec
+    conn = fresh_conn()
+    seed_market(conn)
+    orig_snap = _patch_fetch_snapshot(lambda codes, index_codes=None: {})
+    orig_gc = _patch_recorder_conn(conn)
+    try:
+        rc = rec.main(["--now", datetime.combine(_BASE, time(10, 2)).isoformat()])
+        assert rc == 1
+        fl = conn.execute("SELECT status, rows, detail FROM fetch_log WHERE"
+                          " code='minute_snapshot'").fetchone()
+        assert fl is not None and fl[0] == "fail" and fl[1] == 0
+        assert "miss" in fl[2]
+    finally:
+        rec.quotes.fetch_snapshot = orig_snap
+        rec.fetcher.get_conn = orig_gc
+        conn.close()
+
+
+def test_recorder_wal_concurrent_writer():
+    """并发写与 WAL 兼容：另一连接先行写入的行不被录制器覆盖/丢失（AGSICKLE_DB 文件库）。"""
+    import pipeline.recorder as rec
+    from data.fetcher import get_conn
+    d = Path(tempfile.mkdtemp(prefix="agsickle_rec_wal_"))
+    old_db = os.environ.get("AGSICKLE_DB")
+    os.environ["AGSICKLE_DB"] = str(d / "market.db")
+    try:
+        conn = get_conn()
+        seed_market(conn)
+        conn.close()
+        # 连接 A：预写一行（另一进程语义）
+        a = get_conn()
+        a.execute("INSERT OR REPLACE INTO minute_snapshot VALUES (?,?,?,?,?,?)",
+                  ("999999", "2026-09-18T10:05:00", 1.0, None, None, "other"))
+        a.commit()
+        orig = _patch_fetch_snapshot(lambda codes, index_codes=None: {
+            "600519": {"price": 1500.0, "volume": None, "amount": None,
+                       "prev_close": 1490.0, "time": "t", "source": "tencent_snapshot"}})
+        try:
+            assert rec.main(["--now", datetime.combine(_BASE, time(10, 7)).isoformat()]) == 0
+        finally:
+            rec.quotes.fetch_snapshot = orig
+        b = get_conn()
+        rows = {r[0] for r in b.execute(
+            "SELECT code FROM minute_snapshot WHERE ts LIKE '2026-09-18T10:%'")}
+        assert "999999" in rows and "600519" in rows   # 两连接的行都健在
+        b.close()
+        a.close()
+    finally:
+        if old_db is None:
+            os.environ.pop("AGSICKLE_DB", None)
+        else:
+            os.environ["AGSICKLE_DB"] = old_db
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # ----------------------- 直接运行入口 -----------------------
 
 if __name__ == "__main__":
