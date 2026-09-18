@@ -3,7 +3,7 @@
 > - **日期**：2026-09-19
 > - **来源**：飞书文档《CloddsBot 架构与交易决策机制》（v1.9.0 源码梳理），doc id `OXdldCDeBo3AaCxYvCfcD2NrnRd`
 > - **性质**：架构层借鉴的三方调研档案（对照方=现状代码证据，见 §0.2）
-> - **状态**：已审核通过（2026-09-19 对抗式审查：4 项 pass-with-fix + 1 项 pass，无红线冲突）；施工方案见 `docs/C-ARC架构加固施工方案-2026-09-19.md`（含 ADR-0 执行失败 taxonomy、ADR-A1 触发器改 F1a-only、ADR-A3 验收口径修正）
+> - **状态**：**已审核通过并施工完成（2026-09-19）**——对抗式审查 4 项 pass-with-fix + 1 项 pass；施工方案 `docs/C-ARC架构加固施工方案-2026-09-19.md`（ADR-0 taxonomy、ADR-A1 触发器 F1a-only、ADR-A3 验收口径修正均已在施工中落实）；批次 A=T1-T4、批次 B=T5-T7 当日落地，20/20 测试文件绿，CONSTRAINTS/技术方案已回填
 > - **与上轮的关系**：2026-09-17 的 `docs/策略库借鉴-cloddsbot.md` 借鉴的是**策略层**（STRATEGIES.md，9 项已拍板）；本档案借鉴的是**架构层**（五层架构/三层防线/事件总线/执行保护/录制回放），编号 `C-ARC-*` 与 `C-STR-*` 区分，无重叠
 
 ---
@@ -42,7 +42,7 @@ CloddsBot 是加密/预测市场 HFT 连续流系统（21 渠道、7 永续所�
 
 **痛点实证**：09-16 两次价格保护拒单（10:02 premarket #28 偏离 4.29%、12:17 午休 #31）均需人工「status 重置 + 按实时价重挂 + 再 confirm」，13:01 重挂 13:16 才成交。这是当前最高频的人工介入点。
 
-**方案（保守版，不碰红线）**：`execution_failed`（price_guard/涨跌停模拟拒）后，当日在剩余交易时段内自动**重挂**——按实时价生成新委托参数、完整重跑 `check()`、写回 pending 等人工 confirm。上限 3 次/决策，每次落 `risk_event(exec_retry)`。
+**方案（保守版，不碰红线；审核修正：触发对象为 F1a=confirm 重跑风控被拒，非 execution_failed——09-16 实证两笔均为 `risk_check_reconfirm`，且同 id 重挂因 input_snapshot 存旧价不可行，实现为新插 decision 走完整 propose）**：confirm 重跑风控被拒的价格漂移型拒单，当日在剩余交易时段内自动**重挂**——按实时价生成新委托参数、完整重跑 `check()`、写回 pending 等人工 confirm。上限 3 次/决策，每次落 `risk_event(exec_retry)`。
 - **明确不做激进版**（自动换价重执行）：用户 confirm 的是特定价位附近的委托，自动换价成交超出确认语义，触 L3 红线精神。
 - 与 Sprint 4「9b monitor_requeue」的关系：9b 是 `monitor` 态决策重提，C-ARC-1 是 `execution_failed` 态重挂，同机制不同状态，实现时应共用重提工具函数。
 - 工时 ~1.0d（runner.py + intraday_check 触发 + tests 3 case）。
