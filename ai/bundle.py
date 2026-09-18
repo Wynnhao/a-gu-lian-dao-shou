@@ -7,10 +7,17 @@
 - evidence_date = daily_bar 最新交易日（T-1，证据截至日），信号/数据质量按它对齐。
 
 信息密度（token 预算）：
-- 黑名单 PASS 行折叠为一行汇总；数据质量只列滞后票；
+- 黑名单 PASS 行折叠为一行汇总；数据质量只列核心池（core_codes）滞后票，
+  非 core 滞后折叠为一行计数（W-C1：universe800 停更后 730 只滞后票曾把预算吃穿）；
 - 新闻读取侧已做同事件去重与相关性排序（data.news.get_recent_news）；
-- bundle.md 超预算时逐级降级新闻正文长度（120→60→0 字）。
+- bundle.md 超预算时降级次序（W-C1）：先折叠滞后票明细（先砍墙）、再逐级降
+  新闻正文长度（120→60→0 字）。
+
+已实现盈亏口径（W-C2）：
+- realized_pnl = 移动平均成本配比（卖出按持仓移动成本结转，已平仓口径）；
+- net_cash_outlay = Σ卖出 − Σ买入（净投入现金，副口径；空仓时两者相等）。
 """
+import os
 import sys
 from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
@@ -428,14 +435,50 @@ def build_bundle(run_date: Optional[str] = None,
             bundle["portfolio_state_missing"] = f"组合状态读取失败：{type(e).__name__}: {e}"
         bundle["paper_start_cash"] = START_CASH
 
-        # ---- 已实现盈亏（trade 流水口径，含费用）----
+        # ---- 已实现盈亏（W-C2：移动平均成本配比，已平仓口径）----
+        # 此前 Σ卖出−Σ买入 会把未平仓买入全算成"已实现亏损"（P1-20：建仓后 LLM
+        # 看到接近持仓成本的假巨亏）。现按每票移动平均成本结转：卖出额 − 卖出股数×
+        # 持仓移动成本；全部平仓后与"净投入现金"口径数值一致。
         try:
+            trows = c.execute(
+                "SELECT code, side, amount, shares FROM trade WHERE status='filled' "
+                "ORDER BY trade_date, id").fetchall()
+            lots: dict = {}          # code -> [持有股数, 移动平均成本]
+            realized = 0.0
+            orphan_sells = 0
+            for code, side, amount, shares in trows:
+                shares = int(shares or 0)
+                amount = float(amount or 0.0)
+                if shares <= 0:
+                    continue
+                lot = lots.setdefault(str(code), [0, 0.0])
+                if side == "buy":
+                    total = lot[0] + shares
+                    lot[1] = (lot[1] * lot[0] + amount) / total   # amount 含费用
+                    lot[0] = total
+                else:  # sell
+                    matched = min(lot[0], shares)
+                    if lot[0] > 0:
+                        realized += amount * (matched / shares) - lot[1] * matched
+                        lot[0] -= matched
+                    if shares > matched:
+                        # 无持仓卖出（数据异常/手工单）：无成本可结转，按卖出额全额
+                        # 计入并留痕降级，不让静默数字失真
+                        orphan_sells += 1
+                        realized += amount * ((shares - matched) / shares)
+            note = "已平仓口径：卖出按持仓移动平均成本结转（含佣金印花税），未平仓不计"
+            if orphan_sells:
+                note += f"；含 {orphan_sells} 笔无持仓卖出（成本不可考，按全额计入）"
+            bundle["realized_pnl"] = _f(realized)
+            bundle["realized_pnl_note"] = note
+            # 副口径：净投入现金（Σ卖出−Σ买入），保留给账务对账
             row = c.execute(
                 "SELECT COALESCE(SUM(CASE WHEN side='sell' THEN amount ELSE 0 END),0.0), "
                 "COALESCE(SUM(CASE WHEN side='buy' THEN amount ELSE 0 END),0.0) "
                 "FROM trade WHERE status='filled'").fetchone()
-            bundle["realized_pnl"] = _f(float(row[0]) - float(row[1]))
-            bundle["realized_pnl_note"] = "卖出净入账 − 买入总支出（含佣金印花税，未平仓不计）"
+            bundle["net_cash_outlay"] = _f(float(row[0]) - float(row[1]))
+            bundle["net_cash_outlay_note"] = \
+                "净投入现金 = Σ卖出 − Σ买入（含费用；非已实现盈亏，空仓时两者一致）"
         except Exception as e:
             bundle["realized_pnl_error"] = f"已实现盈亏读取失败：{type(e).__name__}: {e}"
 
@@ -455,15 +498,52 @@ def build_bundle(run_date: Optional[str] = None,
             bundle["recent_decisions"] = []
             bundle["recent_decisions_error"] = f"决策历史读取失败：{type(e).__name__}: {e}"
 
-        # ---- 数据质量（各票最新bar日期）----
+        # ---- 数据质量（W-C1：只统计 core 池；非 core 滞后折叠为计数）----
+        # universe800 回补停更后全库 730 只"滞后票"≈1.4 万字符，把 45000 预算吃穿
+        # 导致新闻正文连续三天被降级清零（P1-19），且滞后告警常态化淹没真异常。
         try:
-            dq = dict(sorted(repo.latest_dates_by_code(c).items()))
-            bundle["data_quality"] = dq
-            if not dq:
+            dq_all = repo.latest_dates_by_code(c)
+            core = set(core_codes())
+            dq_core = {code: d for code, d in dq_all.items() if code in core}
+            bundle["data_quality"] = dict(sorted(dq_core.items()))
+            bundle["data_quality_noncore_total"] = len(dq_all) - len(dq_core)
+            bundle["data_quality_noncore_lag"] = sum(
+                1 for code, d in dq_all.items()
+                if code not in core and d != bundle["evidence_date"])
+            if not dq_all:
                 bundle["data_quality_missing"] = "daily_bar 为空（行情拉取全失败或尚未初始化）"
         except Exception as e:
             bundle["data_quality"] = {}
             bundle["data_quality_missing"] = f"行情质量读取失败：{type(e).__name__}: {e}"
+
+        # ---- 当前可行动空间（W-C3：按 regime/拥挤/黑名单把硬边界显式算给 LLM）----
+        # 红线被误读为交易禁令（P1-26）的解法之一：边界数字化，红线语义另行澄清。
+        try:
+            rg_cap = (bundle.get("regime") or {}).get("cap")
+            total_cap = float(rg_cap) if rg_cap is not None else MAX_TOTAL_WEIGHT
+            crowded = bool((bundle.get("factor_crowding") or {}).get("crowded"))
+            single_cap = min(MAX_SINGLE_WEIGHT, 0.05) if crowded else MAX_SINGLE_WEIGHT
+            core_set = set(core_codes())
+            blocked_core = sorted(
+                code for code, v in (bundle.get("blacklist") or {}).items()
+                if not v.get("ok") and code in core_set)
+            invested = sum(
+                p["weight"] for p in (bundle.get("positions") or [])
+                if p.get("weight") is not None)
+            bundle["actionable_space"] = {
+                "total_weight_cap": _f(total_cap),
+                "total_cap_source": ("regime 动态闸" if rg_cap is not None
+                                     else "静态 max_total_weight"),
+                "current_invested_weight": _f(invested),
+                "remaining_buy_budget": _f(max(0.0, total_cap - invested)),
+                "single_weight_cap": _f(single_cap),
+                "crowding_capped_to_5pct": crowded,
+                "blacklist_blocked_core": blocked_core,
+                "note": ("仓位比例以最新 portfolio_state.total 为分母（盯市可能滞后）；"
+                         "本节是风控硬边界，与红线评估信号（降置信，非禁令）互不替代"),
+            }
+        except Exception as e:
+            bundle["actionable_space"] = {"error": f"{type(e).__name__}: {e}"}
         return bundle
     finally:
         if own:
@@ -493,7 +573,16 @@ _OUTPUT_RULES = """## 决策输出要求（prompt_version={pv}）
    buy 单 confidence 必须 ≥ 0.7（否则改 hold/watch），且 target_weight ≤ 5%（即使人工填更高，
    风控规则 20 也会自动压回 5%）。
 9. **业绩预告事件（Sprint 2 任务 2）**：当 bundle.earnings_events_latest[code].net ≤ -2 时，
-   该票禁止 buy（即使其他信号看好）。"""
+   该票禁止 buy（即使其他信号看好）。
+10. **回测 MDD 红线的语义（重要，勿误读）**：红线触发（profile_verdict.red_line_triggered
+   或 verdict=hold）只是**评估信号，不是交易禁令**——含义是：对新开仓**降低置信度、
+   要求更强证据、只做小仓位试探**（仍在总仓位上限、单票上限、拥挤熔断 5% 之内）；
+   有充分证据时按正常流程输出 buy/sell，**不得因红线无条件空仓或拒绝一切新开仓**。
+   "当前可行动空间"一节给出了当前实际允许的最大单票权重与总仓位上限。
+11. **红线数据缺失**：bundle 无 profile_verdict、或其中无回测 B/C（MDD）数字时，
+   按"无红线信息"处理，并在 risk_notes 中注明"红线数据缺失"；**严禁臆造任何
+   回测/MDD 数字**；引用红线数字必须同时带其数据版本（backtest 元数据），
+   版本未知时须注明"数据版本未知"。"""
 
 
 def _md_table(headers: list, rows: list) -> str:
@@ -504,10 +593,13 @@ def _md_table(headers: list, rows: list) -> str:
     return "\n".join(lines)
 
 
-def bundle_to_markdown(bundle: dict, news_content_len: int = 120) -> str:
+def bundle_to_markdown(bundle: dict, news_content_len: int = 120,
+                       lag_detail: bool = True) -> str:
     """把 bundle dict 渲染为人话版 markdown（末尾附决策输出要求固定文案）。
 
-    news_content_len 供 token 预算降级用（write_bundle 超预算时逐级缩短）。
+    news_content_len 供 token 预算降级用（write_bundle 超预算时逐级缩短）；
+    lag_detail=False 时数据质量节折叠为一行计数（W-C1 降级次序：先砍滞后票墙，
+    再砍新闻正文）。
     """
     run_date = bundle.get("run_date", "")
     ev = bundle.get("evidence_date", run_date)
@@ -543,7 +635,8 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120) -> str:
         lines.append("（无黑名单数据）")
     lines.append("")
 
-    # profile_verdict（v1.4：B+C 投票 + MDD 红线）
+    # profile_verdict（v1.4：B+C 投票 + MDD 红线；W-C3：红线=评估信号非禁令，
+    # 引用红线数字必须带数据版本，缺失时按"无红线信息"处理、不得臆造）
     v = bundle.get("profile_verdict_latest")
     if v:
         lines.append("## Score Profile Verdict（v1.4）")
@@ -551,19 +644,30 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120) -> str:
         lines.append(f"- profile: **{v.get('profile')}**（备选: {v.get('other_profile')}）")
         lines.append(f"- verdict: **{v.get('verdict')}** → suggest: `{v.get('suggest_profile')}`")
         if v.get("red_line_triggered"):
-            lines.append(f"- ⚠️ **MDD 红线触发**（阈值 {v['thresholds']['mdd_red_line']:.0%}，"
-                         f"current={v['C']['current']:.2%}）→ 无条件 hold")
+            th = (v.get("thresholds") or {}).get("mdd_red_line")
+            th_s = "n/a" if th is None else f"{th:.0%}"
+            c_cur = (v.get("C") or {}).get("current")
+            c_cur_s = "n/a" if c_cur is None else f"{c_cur:.2%}"
+            bt_ver = v.get("backtest_generated_at") or v.get("data_version")
+            ver_s = bt_ver if bt_ver else "数据版本未知（verdict 未携带 backtest 元数据）"
+            lines.append(f"- ⚠️ **MDD 红线触发**（阈值 {th_s}，current={c_cur_s}，"
+                         f"数据版本：{ver_s}）→ **评估信号**：新开仓降置信 + 需更强证据 + "
+                         f"仅小仓位试探（总仓位/单票/拥挤上限内）；**不是交易禁令**，"
+                         f"不得据此无条件空仓")
         votes = v.get("votes") or {}
         lines.append(f"- 投票: B_switch={votes.get('b_switch')}, "
                      f"C_switch={votes.get('c_switch')}, "
                      f"{votes.get('votes_switch')}/{votes.get('votes_total')}")
         B, C = v.get("B") or {}, v.get("C") or {}
-        if B.get("current") is not None:
-            lines.append(f"- B (年化超额 vs HS300): cur={B['current']:.2%}, "
-                         f"alt={B['alt']:.2%}, gap={B['gap']:+.2%}")
-        if C.get("current") is not None:
-            lines.append(f"- C (MDD): cur={C['current']:.2%}, "
-                         f"alt={C['alt']:.2%}, gap={C['gap']:+.2%}")
+        if B.get("current") is not None or B.get("alt") is not None:
+            lines.append(f"- B (年化超额 vs HS300): cur={_pct(B.get('current'))}, "
+                         f"alt={_pct(B.get('alt'))}, gap={_pct(B.get('gap'))}")
+        if C.get("current") is not None or C.get("alt") is not None:
+            lines.append(f"- C (MDD): cur={_pct(C.get('current'))}, "
+                         f"alt={_pct(C.get('alt'))}, gap={_pct(C.get('gap'))}")
+        if v.get("backtest_missing"):
+            lines.append(f"- ⚠️ **红线数据缺失**：{v['backtest_missing']} → "
+                         f"按\"无红线信息\"处理并在 risk_notes 注明，不得臆造回测数字")
         abstains = v.get("abstains") or []
         if abstains:
             lines.append(f"- 弃权维度: {', '.join(abstains)}（{v.get('abstain_reason', '')}）")
@@ -573,6 +677,9 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120) -> str:
         lines.append(f"## Score Profile Verdict（v1.4）")
         lines.append("")
         lines.append(f"- ⚠️ {bundle['profile_verdict_missing']}")
+        lines.append("- **红线数据缺失**：按\"无红线信息\"处理并在 risk_notes 注明"
+                     "\"红线数据缺失\"；不得臆造任何回测/MDD 数字；有充分证据仍可"
+                     "按正常流程输出决策（红线缺失≠禁仓）。")
         lines.append("")
 
     # factor_crowding（任务 5：规则 20）
@@ -778,6 +885,28 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120) -> str:
                 lines.append(f"- 波动率目标计算失败：{v['error']}")
     lines.append("")
 
+    # 当前可行动空间（W-C3：把硬边界显式算给 LLM，防红线被误读为全面禁仓）
+    act = bundle.get("actionable_space")
+    if act:
+        lines += ["## 当前可行动空间（硬边界）", ""]
+        if act.get("error"):
+            lines.append(f"- 计算失败：{act['error']}")
+        else:
+            lines.append(f"- 总仓位上限：{act['total_weight_cap']:.0%}"
+                         f"（{act['total_cap_source']}）；卖出不受限")
+            inv = act.get("current_invested_weight")
+            inv_s = "n/a" if inv is None else f"{inv:.1%}"
+            rem = act.get("remaining_buy_budget")
+            rem_s = "n/a" if rem is None else f"{rem:.1%}"
+            lines.append(f"- 当前总仓位（盯市口径）：{inv_s}；剩余可买入预算：{rem_s}")
+            lines.append(f"- 单票权重上限：{act['single_weight_cap']:.0%}"
+                         + ("（拥挤熔断生效，压至 5%）" if act.get("crowding_capped_to_5pct") else ""))
+            bl_blocked = act.get("blacklist_blocked_core") or []
+            lines.append("- 核心池内黑名单禁交易：%s"
+                         % (("、".join(bl_blocked) if bl_blocked else "无")))
+            lines.append(f"- 口径：{act.get('note', '')}")
+        lines.append("")
+
     # 动态池
     dp = bundle.get("dynamic_pools") or {}
     lines += ["## 异动池 / 热门池（评估参考）", ""]
@@ -827,8 +956,11 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120) -> str:
     else:
         lines.append("- 当前无持仓")
     if bundle.get("realized_pnl") is not None:
-        lines.append(f"- 累计已实现盈亏：{_money(bundle.get('realized_pnl'))}"
+        lines.append(f"- 累计已实现盈亏（已平仓口径）：{_money(bundle.get('realized_pnl'))}"
                      f"（{bundle.get('realized_pnl_note', '')}）")
+    if bundle.get("net_cash_outlay") is not None:
+        lines.append(f"- 净投入现金（副口径）：{_money(bundle.get('net_cash_outlay'))}"
+                     f"（{bundle.get('net_cash_outlay_note', '')}）")
     st = bundle.get("portfolio_state")
     if st:
         lines.append(
@@ -856,16 +988,26 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120) -> str:
         lines.append("- （decision 表为空，暂无历史决策）")
     lines.append("")
 
-    # 数据质量（只列滞后票——此前 30 行逐票列相同日期全是噪音）
+    # 数据质量（W-C1：只列核心池滞后票；非 core 折叠计数；预算降级时整体折叠）
     lines += [f"## 数据质量（证据日 {ev}）", ""]
-    dq = bundle.get("data_quality") or {}
+    dq = bundle.get("data_quality")
     if dq:
         lag = {c: d for c, d in sorted(dq.items()) if d != ev}
-        if lag:
-            lines.append(f"- 滞后票 {len(lag)} 只：" +
-                         "、".join(f"{c}({d})" for c, d in lag.items()))
+        if lag_detail:
+            if lag:
+                lines.append(f"- 核心池滞后票 {len(lag)} 只：" +
+                             "、".join(f"{c}({d})" for c, d in lag.items()))
+            else:
+                lines.append(f"- 核心池 {len(dq)} 只票行情已更新至 {ev}")
         else:
-            lines.append(f"- 全部 {len(dq)} 只票行情已更新至 {ev}")
+            lines.append(f"- （预算降级）核心池 {len(dq)} 只中滞后 {len(lag)} 只"
+                         "（明细折叠，见 bundle.json）")
+        noncore_lag = bundle.get("data_quality_noncore_lag") or 0
+        if noncore_lag:
+            noncore_total = bundle.get("data_quality_noncore_total")
+            total_s = f"/{noncore_total} 只" if noncore_total else ""
+            lines.append(f"- 另有 {noncore_lag} 只非核心票滞后{total_s}"
+                         "（不计入决策包，仅计数）")
     else:
         lines.append(f"- 数据缺失：{bundle.get('data_quality_missing', '无数据')}")
     lines.append("")
@@ -885,27 +1027,52 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120) -> str:
 
 # ---------------------------------------------------------------- 落盘与 CLI
 
+BUNDLE_STAMP_KEEP = 10         # bundle.HHMM.md 带时间戳副本保留份数（防审计链无限增长）
+
+
+def _session_root() -> Path:
+    """session 产物根目录；AGSICKLE_SESSION_DIR 调用时读（测试隔离，与 midday 同模式）。"""
+    return Path(os.environ.get("AGSICKLE_SESSION_DIR")
+                or str(BASE / "logs" / "session"))
+
+
 def write_bundle(run_date: Optional[str] = None,
                  conn: Optional[sqlite3.Connection] = None) -> Tuple[Path, Path]:
     """落盘 logs/session/<run_date>/bundle.json 与 bundle.md，返回 (json_path, md_path)。
 
-    token 预算：md 超 MD_BUDGET 时逐级降级新闻正文长度（120→60→0 字）。
+    token 预算降级次序（W-C1）：超预算先折叠滞后票明细（先砍墙），仍超再逐级
+    降新闻正文（120→60→0 字）——此前 730 只滞后票墙直接把正文吃穿清零。
+    版本化（W-C8）：bundle.md 之外另写 bundle.HHMM.md 带时间戳副本（防傍晚整套
+    重跑覆盖早晨证据，保留最近 BUNDLE_STAMP_KEEP 份）。
     """
     b = build_bundle(run_date, conn=conn)
-    target = BASE / "logs" / "session" / str(b["run_date"])
+    target = _session_root() / str(b["run_date"])
     target.mkdir(parents=True, exist_ok=True)
     md = bundle_to_markdown(b)
     if len(md) > MD_BUDGET:
-        md = bundle_to_markdown(b, news_content_len=60)
-        log.info("bundle.md 超预算（%d 字符），新闻正文降级至 60 字", len(md))
+        md = bundle_to_markdown(b, lag_detail=False)
+        log.info("bundle.md 超预算（%d 字符），先砍滞后票墙（明细折叠为计数）", len(md))
     if len(md) > MD_BUDGET:
-        md = bundle_to_markdown(b, news_content_len=0)
+        md = bundle_to_markdown(b, lag_detail=False, news_content_len=60)
+        log.info("bundle.md 仍超预算（%d 字符），新闻正文降级至 60 字", len(md))
+    if len(md) > MD_BUDGET:
+        md = bundle_to_markdown(b, lag_detail=False, news_content_len=0)
         log.info("bundle.md 仍超预算（%d 字符），新闻正文置空", len(md))
     json_path = target / "bundle.json"
     md_path = target / "bundle.md"
     json_path.write_text(json.dumps(b, ensure_ascii=False, indent=2), encoding="utf-8")
     md_path.write_text(md, encoding="utf-8")
-    log.info("bundle 已落盘 run_date=%s -> %s", b["run_date"], json_path)
+    # W-C8：带时间戳副本（同分钟重跑覆盖同名副本，接受）+ 保留最近 N 份
+    stamp_path = target / ("bundle.%s.md" % datetime.now().strftime("%H%M"))
+    stamp_path.write_text(md, encoding="utf-8")
+    stamped = sorted(target.glob("bundle.????.md"))
+    for old in stamped[:-BUNDLE_STAMP_KEEP]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    log.info("bundle 已落盘 run_date=%s -> %s（时间戳副本 %s）",
+             b["run_date"], json_path, stamp_path.name)
     return json_path, md_path
 
 

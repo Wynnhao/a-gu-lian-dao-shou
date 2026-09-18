@@ -208,27 +208,56 @@ def weekly_report(end_date: Optional[str] = None,
                 body_perf += f"\n- 期末回撤：{_fmt_pct(ks_row[0])}；kill_switch：{ks_row[1]}"
 
         # ---- 基准（沪深300）----
+        # W-C5（P1-28）：基准端取数后校验"基准日期 == 组合端对应日期"——此前
+        # on-or-before 静默回退（组合端 09-18、基准端 09-17）→ 跨日相减的假超额。
+        # 两端任一错配：显式标注"基准窗口止于 YYYY-MM-DD（数据滞后 N 日）"，
+        # 超额收益标 n/a，归因同样拒绝错日相减。
         body_bench = ""
         bench_ret: Optional[float] = None
+        bench_mismatch_days: Optional[int] = None
         if base_row is not None and rows:
+            port_end_date = rows[-1][0]      # 组合端期末（盯市实际日期，可能早于 end_date）
+            port_base_date = base_row[0]     # 组合端基准日
             i_cur = _index_close_on_or_before(conn, end_d.isoformat())
-            i_prev = _index_close_on_or_before(conn, base_row[0])
+            i_prev = _index_close_on_or_before(conn, port_base_date)
             if i_cur is None or i_prev is None or i_prev[1] <= 0:
                 body_bench = "基准数据缺失（index_daily 无 '000300' 覆盖窗口两端）"
             else:
-                bench_ret = i_cur[1] / i_prev[1] - 1.0
-                body_bench = (
-                    f"- 沪深300：{i_prev[1]:.2f}（{i_prev[0]}）→ {i_cur[1]:.2f}（{i_cur[0]}），周收益 {_fmt_pct(bench_ret)}\n"
-                    f"- 超额收益（组合-基准）：**{_fmt_pct(None if week_ret is None else week_ret - bench_ret)}**\n"
-                    f"- 基准数据来源：{bench_info.get('source')}"
-                )
+                cur_aligned = i_cur[0] == port_end_date
+                prev_aligned = i_prev[0] == port_base_date
+                lines_b = [f"- 沪深300：{i_prev[1]:.2f}（{i_prev[0]}）→ "
+                           f"{i_cur[1]:.2f}（{i_cur[0]}）"]
+                if cur_aligned and prev_aligned:
+                    bench_ret = i_cur[1] / i_prev[1] - 1.0
+                    lines_b.append(f"- 基准周收益：{_fmt_pct(bench_ret)}")
+                    lines_b.append(f"- 超额收益（组合-基准）："
+                                   f"**{_fmt_pct(None if week_ret is None else week_ret - bench_ret)}**")
+                else:
+                    bench_mismatch_days = max(
+                        0, (_to_date(port_end_date) - _to_date(i_cur[0])).days)
+                    lag_line = (f"- ⚠️ 基准窗口止于 {i_cur[0]}（数据滞后 "
+                                f"{bench_mismatch_days} 日；组合端期末 {port_end_date}）")
+                    if not prev_aligned:
+                        lag_line += (f"；基准期初端止于 {i_prev[0]}"
+                                     f"（组合端基准日 {port_base_date}）")
+                    lag_line += "——跨日相减已禁止"
+                    lines_b.append(lag_line)
+                    lines_b.append("- 超额收益：n/a（基准窗口与组合窗口两端日期不一致）")
+                    notes.append("基准窗口错配：基准止于 %s、组合端期末 %s，"
+                                 "超额/归因已标 n/a" % (i_cur[0], port_end_date))
+                lines_b.append(f"- 基准数据来源：{bench_info.get('source')}")
+                body_bench = "\n".join(lines_b)
 
         # ---- 简单归因 ----
         body_attr = ""
         if base_row is None or not rows:
             body_attr = "暂无数据（缺组合期初/期末状态，无法归因）"
         elif bench_ret is None:
-            body_attr = "基准数据缺失，无法计算相对归因"
+            if bench_mismatch_days is not None:
+                body_attr = ("基准窗口错配（滞后 %d 日），错日相减已禁止，相对归因 n/a"
+                             % bench_mismatch_days)
+            else:
+                body_attr = "基准数据缺失，无法计算相对归因"
         else:
             base_date, total_base = base_row
             if total_base is None or total_base <= 0:
@@ -330,29 +359,74 @@ def weekly_report(end_date: Optional[str] = None,
 def _sec_decision_quality(conn: sqlite3.Connection, start: str, end: str) -> str:
     """决策→结果闭环质量统计（此前周报归因完全不覆盖 AI 决策质量）。
 
-    - 方向命中率（backfill_decision_outcomes 回填的 direction_hit）；
-    - 置信度校准：高置信组 vs 低置信组命中率对比；
-    - 风控拒绝次数（risk_event）；
-    - 信号有效性（review/signal_eval.evaluate，样本不足自动标注）。
+    W-C4（P1-27）分组口径：
+    - 已执行 buy/sell（executed/executed_unverified）：方向命中率与置信度校准；
+    - 未执行 buy/sell（proposed/approved/expired/report_only/cancelled 等）：
+      事后方向单独统计，不与已执行混算；
+    - watch/hold：无方向分（direction_hit 恒 NULL），只看 t1_ret 事后分布；
+    - 被风控 rejected 的决策**不计入任何胜率分母**（混淆"信号事后方向"与
+      "执行决策质量"），单独计数展示。
+    另含风控拦截次数（risk_event）与信号有效性（review/signal_eval.evaluate）。
     """
     lines: List[str] = []
+    EXECUTED = ("executed", "executed_unverified")
+
+    # 已执行 buy/sell：胜率 + 置信度校准（唯一计入胜率分母的组）
     row = conn.execute(
         "SELECT COUNT(*), SUM(direction_hit=1), AVG(confidence), "
         "SUM(confidence>=0.7 AND direction_hit=1), SUM(confidence>=0.7 AND "
         "direction_hit IS NOT NULL) FROM decision "
-        "WHERE trade_date BETWEEN ? AND ? AND direction_hit IS NOT NULL",
-        (start, end)).fetchone()
+        "WHERE trade_date BETWEEN ? AND ? AND action IN ('buy','sell') "
+        "AND status IN (%s) AND direction_hit IS NOT NULL"
+        % ",".join("?" * len(EXECUTED)),
+        (start, end, *EXECUTED)).fetchone()
     n, hits, avg_conf, hi_hits, hi_n = row
     if not n:
-        lines.append("- 本周无已回填方向的 buy/sell 决策（尚未产生成交或结果未到回填窗口）")
+        lines.append("- 已执行 buy/sell：本周无已回填方向的决策"
+                     "（尚未产生成交或结果未到回填窗口）")
     else:
         hits = int(hits or 0)
-        lines.append(f"- 方向命中：{hits}/{n}（胜率 {hits / n:.0%}）"
+        lines.append(f"- 已执行 buy/sell 方向命中：{hits}/{n}（胜率 {hits / n:.0%}）"
                      f"｜平均置信度 {'n/a' if avg_conf is None else '%.2f' % float(avg_conf)}")
         if hi_n:
-            lines.append(f"- 置信度校准：conf≥0.7 组命中 {int(hi_hits or 0)}/{int(hi_n)}"
+            lines.append(f"- 置信度校准（已执行组）：conf≥0.7 命中 {int(hi_hits or 0)}/{int(hi_n)}"
                          f"（{int(hi_hits or 0) / int(hi_n):.0%}）——若长期不高于低置信组，"
                          f"说明自报置信度缺乏区分度，应收紧置信度门槛")
+
+    # 未执行 buy/sell（不含 rejected）：单独分组，不算进执行胜率
+    row2 = conn.execute(
+        "SELECT COUNT(*), SUM(direction_hit=1) FROM decision "
+        "WHERE trade_date BETWEEN ? AND ? AND action IN ('buy','sell') "
+        "AND (status IS NULL OR status NOT IN (%s,'rejected')) "
+        "AND direction_hit IS NOT NULL"
+        % ",".join("?" * len(EXECUTED)),
+        (start, end, *EXECUTED)).fetchone()
+    n2, hits2 = row2
+    if n2:
+        lines.append(f"- 未执行 buy/sell（proposed/approved/expired 等，事后方向参考）："
+                     f"{int(hits2 or 0)}/{int(n2)}（{int(hits2 or 0) / int(n2):.0%}）"
+                     "——未经执行确认，不并入上方执行胜率")
+
+    # watch/hold：事后方向参考（t1_ret 必填、direction_hit 恒 NULL）
+    row3 = conn.execute(
+        "SELECT COUNT(*), AVG(t1_ret), SUM(t1_ret>0) FROM decision "
+        "WHERE trade_date BETWEEN ? AND ? AND action IN ('watch','hold') "
+        "AND t1_ret IS NOT NULL", (start, end)).fetchone()
+    n3, avg_ret3, pos3 = row3
+    if n3:
+        pos3 = int(pos3 or 0)
+        lines.append(f"- watch/hold（未交易，事后方向参考）：{int(n3)} 条，"
+                     f"平均次日收益 {'n/a' if avg_ret3 is None else '%+.2f%%' % (avg_ret3 * 100)}"
+                     f"，上涨占比 {pos3 / n3:.0%}")
+
+    # rejected：不计入胜率分母，单独计数（W-C4）
+    rej_dec = conn.execute(
+        "SELECT COUNT(*) FROM decision WHERE trade_date BETWEEN ? AND ? "
+        "AND status='rejected'", (start, end)).fetchone()[0]
+    if rej_dec:
+        lines.append(f"- 风控拒绝决策 {int(rej_dec)} 条（**不进胜率分母**——"
+                     "被拒信号的方向运气与执行质量分开统计）")
+
     rej = conn.execute(
         "SELECT COUNT(*) FROM risk_event WHERE rule IN ('risk_check','risk_check_reconfirm') "
         "AND substr(ts,1,10) BETWEEN ? AND ?", (start, end)).fetchone()[0]

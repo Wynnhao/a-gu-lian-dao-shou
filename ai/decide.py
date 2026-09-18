@@ -309,11 +309,14 @@ def save_decisions(conn: sqlite3.Connection, decisions, input_snapshot: str,
 
 
 def load_and_save(json_path, run_date: Optional[str] = None,
-                  model: str = "") -> List[int]:
+                  model: str = "", result: Optional[dict] = None) -> List[int]:
     """CLI 主流程：读决策 JSON 文件（支持单对象或数组）-> validate -> save -> 打印结果。
 
     run_date 默认**今天**（预期执行日，与日报"决策回顾"对齐；此前取 daily_bar
     最新交易日导致盘前决策 run_date=T-1、日报按 T 查询永远查空）。
+    result（可选 out 参数）：写入 {"legal_empty": bool}——LLM 输出 `[]` 且校验零失败
+    属"当日合法空决策"（W-C6/P1-23），调用方（main）据此 exit 0，避免自动化把
+    合法空决策误判为"决策缺失需补跑"。
     """
     p = Path(json_path)
     try:
@@ -328,6 +331,15 @@ def load_and_save(json_path, run_date: Optional[str] = None,
     if not isinstance(data, list):
         log.error("决策文件顶层须为 JSON 对象或数组，实际: %s", type(data).__name__)
         print("[decide] 决策文件格式非法，放弃当日决策（详见 logs/ai.log）")
+        return []
+
+    # W-C6（P1-23）：合法空决策——`[]` 无条目即校验零失败，属正常"今日不交易"
+    # 语义（fail-safe 与显式不交易要区分开），提前返回且不碰数据库。
+    if data == []:
+        if result is not None:
+            result["legal_empty"] = True
+        print("[decide] 当日合法空决策（LLM 输出 []，无交易意图，正常语义）"
+              "run_date=%s" % (run_date or date.today().isoformat()))
         return []
 
     conn = get_conn()
@@ -421,7 +433,10 @@ def main(argv=None) -> int:
         return 0
     if not args.file:
         ap.error("需要 --file decision.json（或使用 --template 查看合法示例）")
-    ids = load_and_save(args.file, args.run_date, model=args.model)
+    result: dict = {}
+    ids = load_and_save(args.file, args.run_date, model=args.model, result=result)
+    if not ids and result.get("legal_empty"):
+        return 0  # W-C6：合法空决策不是失败
     return 0 if ids else 1
 
 

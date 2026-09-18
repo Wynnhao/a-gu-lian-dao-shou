@@ -279,17 +279,19 @@ def backfill_decision_outcomes(conn: sqlite3.Connection,
                                as_of: Optional[str] = None) -> int:
     """回填 decision.t1_ret / direction_hit（决策→结果闭环，此前完全缺失）。
 
-    对 trade_date < as_of 且 t1_ret 为空的 buy/sell 决策：
+    对 trade_date < as_of 且 t1_ret 为空的决策（W-C4：buy/sell/watch/hold 全覆盖，
+    此前只回填 buy/sell → watch/hold 提出即沉没，占决策 67%）：
     - t1_ret = 决策交易日后首个有行情日的 close 相对决策日最新收盘的涨跌
-      （用 close_qfq 优先，除权不误判方向）；
-    - direction_hit：buy 且 t1_ret>0 → 1；sell 且 t1_ret<0 → 1；否则 0。
+      （用 close_qfq 优先，除权不误判方向）；全部动作必填；
+    - direction_hit 仅对 buy/sell 打分（buy 且 t1_ret>0 → 1；sell 且 t1_ret<0 → 1；
+      否则 0）；watch/hold 无执行方向语义，保持 NULL 不打分。
     返回回填条数。盘后流水线每个交易日调用一次。
     """
     as_of = as_of or latest_trade_date(conn)
     rows = conn.execute(
         "SELECT id, trade_date, code, action FROM decision "
-        "WHERE trade_date IS NOT NULL AND trade_date < ? AND t1_ret IS NULL "
-        "AND action IN ('buy','sell')", (as_of,)).fetchall()
+        "WHERE trade_date IS NOT NULL AND trade_date < ? AND t1_ret IS NULL",
+        (as_of,)).fetchall()
     filled = 0
     for did, tdate, code, action in rows:
         base = conn.execute(
@@ -303,7 +305,11 @@ def backfill_decision_outcomes(conn: sqlite3.Connection,
         if not base or not nxt or not base[1] or not nxt[1]:
             continue  # 行情未齐，下个交易日再试
         ret = float(nxt[1]) / float(base[1]) - 1.0
-        hit = 1 if ((action == "buy" and ret > 0) or (action == "sell" and ret < 0)) else 0
+        if action in ("buy", "sell"):
+            hit = 1 if ((action == "buy" and ret > 0)
+                        or (action == "sell" and ret < 0)) else 0
+        else:
+            hit = None  # watch/hold 不打方向分（W-C4）
         conn.execute("UPDATE decision SET t1_ret=?, direction_hit=? WHERE id=?",
                      (round(ret, 6), hit, did))
         filled += 1
@@ -493,20 +499,15 @@ def generate_daily_report(trade_date: Optional[str] = None,
         target_dir = Path(out_dir) if out_dir is not None else Path(
             os.environ.get("AGSICKLE_REPORTS_DIR") or (BASE / "logs" / "reports"))
         target_dir.mkdir(parents=True, exist_ok=True)
-        # P0 修复：trade_date 早于今日时绝不覆写昨日日报，写 PENDING 兜底；
-        # postclose 已做此校验，这里是兜底保护（其它入口如 catchup 调到这里）。
-        today_iso = date.today().isoformat()
-        if trade_date < today_iso:
-            pending_path = target_dir / f"PENDING-{today_iso}.md"
-            pending_path.write_text(
-                "# 待清算日报 %s\n\n"
-                "> generate_daily_report 检测到 trade_date=%s < today=%s\n\n"
-                "- 为避免覆写历史日报，已改写本兜底文件。\n"
-                "- 跑 `python -m pipeline.catchup --date %s` 补数据后再重跑 postclose。\n"
-                % (today_iso, trade_date, today_iso, today_iso),
-                encoding="utf-8")
-            return pending_path
         path = target_dir / f"{trade_date}.md"
+        # W-C7（P1-21）：防覆写守卫改为"目标报告文件已存在才拒写"。此前对
+        # trade_date<today 一律改写 PENDING 并 return——catchup 步骤1 补跑历史日报
+        # 永远写不出 td.md 且不报错（守卫 09-16 加入，晚于补跑功能）。
+        # 现语义：历史日产物已在 → 拒写保护审计链（返回既有路径）；
+        # 历史日产物缺失 → 正常落盘（补跑场景）；当日 → 允许覆盖重写（幂等双跑）。
+        today_iso = date.today().isoformat()
+        if trade_date < today_iso and path.exists():
+            return path
         path.write_text("\n".join(lines), encoding="utf-8")
         return path
     finally:

@@ -167,6 +167,15 @@ def catch_up(now: Optional[datetime] = None) -> int:
                 if w.weekday() == 4 and not (REPORTS_DIR / (
                         "%d-W%02d.md" % (w.isocalendar()[0], w.isocalendar()[1]))).is_file():
                     weekly.weekly_report(td)
+                # W-C7（P1-21）：补跑产物校验——此前防覆写守卫把历史日报拦成
+                # PENDING 且不报错，"补跑成功"是假的。现在盯市行与 td.md 缺一
+                # 即计入 failures，不再静默。
+                if not repo.has_state(conn, td):
+                    failures += 1
+                    _say("  ↳ 补跑 %s 后盯市行缺失（portfolio_state 无该日）" % td)
+                elif not report.is_file():
+                    failures += 1
+                    _say("  ↳ 补跑 %s 后日报产物缺失（%s.md 未落盘）" % (td, td))
             except Exception as e:  # noqa: BLE001
                 failures += 1
                 _say("  ↳ 补跑 %s 失败: %r" % (td, e))
@@ -186,18 +195,26 @@ def catch_up(now: Optional[datetime] = None) -> int:
 
         # ---- 2) 盘中兜底（仅交易日盘中窗口）----
         if in_trading_window and latest_td:
-            # 2a) 盘前 bundle 过期 或 信号未对齐最新交易日 → 重跑盘前流水线
-            # （此前只看 bundle.md mtime：信号步骤失败但 bundle 已写出时，
-            #  signals_missing 会原样喂给 LLM 一整天）
+            # 2a) 盘前 bundle 缺失 → 重跑盘前流水线；信号未对齐仅 11:00 前才重跑
+            #（W-C8 / P1-22：此前对齐检查在傍晚也成立——15:43 整套重跑 premarket
+            #  覆盖早晨 bundle，事后复盘读到的是与决策时不同的证据。11:00 后
+            #  bundle 已在即不再动它，信号对齐交给盘后流程）
             bundle = SESSION_DIR / latest_td / "bundle.md"
             sig_latest = conn.execute("SELECT MAX(as_of) FROM signal").fetchone()[0]
-            need_premarket = (not _file_fresh_today(bundle)) or (sig_latest != latest_td)
+            bundle_missing = not _file_fresh_today(bundle)
+            sig_misaligned = sig_latest != latest_td
+            before_1100 = (now.hour, now.minute) < (11, 0)
+            need_premarket = bundle_missing or (sig_misaligned and before_1100)
             if need_premarket:
-                why = "当日盘前流程缺失" if not _file_fresh_today(bundle) \
-                    else "信号未对齐最新交易日（signal as_of=%s ≠ %s）" % (sig_latest, latest_td)
+                why = "当日盘前流程缺失" if bundle_missing \
+                    else "信号未对齐最新交易日（signal as_of=%s ≠ %s，11:00 前允许重跑）" \
+                    % (sig_latest, latest_td)
                 _say("步骤2a %s，补跑（LLM 决策需会话补做）" % why)
                 if not _run_script("pipeline/premarket.py", timeout=900):
                     failures += 1
+            elif sig_misaligned:
+                _say("步骤2a 跳过：信号未对齐（as_of=%s ≠ %s）但已过 11:00 且当日 "
+                     "bundle 在——不覆盖早晨证据（W-C8）" % (sig_latest, latest_td))
             # 2b) 午间包缺失（11:00 后）→ 补午评准备
             midday_bundle = SESSION_DIR / latest_td / "midday_bundle.md"
             if now.hour >= 11 and not _file_fresh_today(midday_bundle):
