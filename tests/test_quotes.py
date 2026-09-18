@@ -234,6 +234,148 @@ def test_audit_snapshot_writes_jsonl():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------- C-ARC-3a/T5：录制专用 fetch_snapshot ----------------
+
+def _snapshot_payload() -> str:
+    """混编报文：茅台（sh600519）+ 上证指数（sh000001，显式表命中）+ 停牌票。"""
+    return "\n".join([
+        _tencent_payload("sh", "贵州茅台", "600519", "1275.16", "1285.13"),
+        'v_sh000001="%s";' % "~".join([
+            "100", "上证指数", "000001", "3123.11", "3105.55", "3108.00",
+            "256000", "3100.00", "0", "0", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "", "", "", "20260919103000",
+            "", "", "3150.00", "3100.00", "", "", "", "31234.5"]),
+        'v_sz000001="%s";' % "~".join(
+            ["51", "平安银行", "000001", "0.00", "11.85", "11.80"] + [""] * 42),
+    ])
+
+
+@test
+def test_fetch_snapshot_index_symbol_mapping():
+    """指数走显式符号表：000001 必须拼成 sh000001（上证指数），
+    绝不许经 _exchange_prefix 变成 sz000001（平安银行）。"""
+    seen = {"url": ""}
+
+    class FakeResp:
+        text = _snapshot_payload()
+        encoding = ""
+
+    def fake_get(url, timeout=None, headers=None):
+        seen["url"] = url
+        return FakeResp()
+
+    orig = quotes.requests.get
+    quotes.requests.get = fake_get
+    try:
+        out = quotes.fetch_snapshot(["600519"], index_codes=["000001", "000300"])
+    finally:
+        quotes.requests.get = orig
+    assert "sh600519" in seen["url"] and "sh000001" in seen["url"], seen["url"]
+    assert "sz000001" not in seen["url"], "000001 被误拼成深市前缀！"
+    assert "sh000300" in seen["url"]
+    assert set(out) == {"600519", "000001"}, out.keys()
+    assert out["000001"]["price"] == 3123.11          # 上证指数的价，非平安银行
+    assert out["000001"]["source"] == "tencent_snapshot"
+
+
+@test
+def test_fetch_snapshot_volume_amount_units():
+    """量纲：f[6] 手→股 ×100；f[37] 万元→元 ×10000（与 spot_tx 兜底口径一致）。"""
+    class FakeResp:
+        text = _snapshot_payload()
+        encoding = ""
+
+    orig = quotes.requests.get
+    quotes.requests.get = lambda url, timeout=None, headers=None: FakeResp()
+    try:
+        out = quotes.fetch_snapshot(["600519"], index_codes=["000001"])
+    finally:
+        quotes.requests.get = orig
+    q = out["600519"]
+    # _tencent_payload 未填 f[6]/f[37]（空串）→ None，不抛异常
+    assert q["volume"] is None and q["amount"] is None
+    # 显式构造带量额的指数行：256000 手 → 25,600,000 股；31234.5 万 → 3.12345 亿元
+    assert out["000001"]["volume"] == 256000 * 100.0
+    assert out["000001"]["amount"] == 31234.5 * 10000.0
+
+
+@test
+def test_fetch_snapshot_skips_suspended():
+    """停牌过滤：f[3]<=0 的行不进结果（照 _fetch_tencent 口径）。"""
+    class FakeResp:
+        text = _snapshot_payload()   # sz000001 price=0.00（停牌）
+        encoding = ""
+
+    orig = quotes.requests.get
+    quotes.requests.get = lambda url, timeout=None, headers=None: FakeResp()
+    try:
+        out = quotes.fetch_snapshot(["600519", "000001"])
+    finally:
+        quotes.requests.get = orig
+    assert "000001" not in out and "600519" in out
+
+
+@test
+def test_fetch_snapshot_sends_user_agent():
+    """请求必须带 UA（免费源对无 UA 请求更易封禁，照 fetcher Session 教训）。"""
+    captured = {}
+
+    class FakeResp:
+        text = _snapshot_payload()
+        encoding = ""
+
+    def fake_get(url, timeout=None, headers=None):
+        captured["headers"] = headers
+        return FakeResp()
+
+    orig = quotes.requests.get
+    quotes.requests.get = fake_get
+    try:
+        quotes.fetch_snapshot(["600519"])
+    finally:
+        quotes.requests.get = orig
+    assert captured["headers"] and "User-Agent" in captured["headers"]
+    assert "Mozilla" in captured["headers"]["User-Agent"]
+
+
+@test
+def test_fetch_snapshot_cooldown_persisted():
+    """独立冷却：连续失败 ≥5 次（跨进程累计，count 落盘）→ 冷却期直接返回 {}；
+    健康文件原子落盘到 AGSICKLE_STATE_DIR（与 fetcher akshare 熔断器互不影响）。"""
+    import time as _t
+    state = tempfile.mkdtemp(prefix="quotes_cooldown_")
+    old_state = os.environ.get("AGSICKLE_STATE_DIR")
+    os.environ["AGSICKLE_STATE_DIR"] = state
+
+    def boom(url, timeout=None, headers=None):
+        raise ConnectionError("down")
+
+    orig = quotes.requests.get
+    quotes.requests.get = boom
+    try:
+        for i in range(5):
+            out = quotes.fetch_snapshot(["600519"])
+            assert out == {}
+            if i < 4:
+                assert not quotes.recorder_blocked()   # 未达阈值不冷却
+        assert quotes.recorder_blocked()               # 第 5 次失败触发冷却
+        hf = Path(state) / "recorder_health.json"
+        assert hf.is_file()
+        blob = json.loads(hf.read_text(encoding="utf-8"))
+        assert blob["blocked_until"] > _t.time()
+        assert blob["fail_count"] == 0                 # 进入冷却后计数清零
+        quotes.requests.get = orig
+        assert quotes.fetch_snapshot(["600519"]) == {}  # 冷却期不发起网络请求
+    finally:
+        quotes.requests.get = orig
+        if old_state is None:
+            os.environ.pop("AGSICKLE_STATE_DIR", None)
+        else:
+            os.environ["AGSICKLE_STATE_DIR"] = old_state
+        import shutil
+        shutil.rmtree(state, ignore_errors=True)
+
+
 def main() -> int:
     failed = 0
     for fn in _TESTS:

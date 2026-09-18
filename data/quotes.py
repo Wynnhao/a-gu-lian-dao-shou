@@ -196,6 +196,146 @@ def get_live_price(codes: List[str], code: str) -> Optional[float]:
     return get_live_prices(codes).get(str(code), {}).get("price")
 
 
+# ---------------------------------------------------------------- 录制专用快照（C-ARC-3a/T5）
+
+# 显式指数符号表（与 fetcher.INDEX_TX_SYMBOL 对齐）。绝不经 _exchange_prefix 拼
+# 指数符号——000001 会被拼成 sz000001=平安银行（审核抓出的三个硬伤之一）。
+INDEX_SYMBOLS = {
+    "000001": "sh000001",   # 上证指数
+    "000300": "sh000300",   # 沪深300
+    "000905": "sh000905",   # 中证500
+    "399001": "sz399001",   # 深证成指
+    "399006": "sz399006",   # 创业板指
+}
+
+# 免费源对无 UA 请求更易封禁（照 fetcher._session 的教训）
+_UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
+}
+
+_RECORDER_MAX_FAIL = 5
+_RECORDER_COOLDOWN_MIN = 30
+
+
+def _recorder_breaker_file() -> Path:
+    """录制器独立熔断状态文件；AGSICKLE_STATE_DIR 调用时读（测试隔离，C-ENG-6 语义）。"""
+    state = Path(os.environ.get("AGSICKLE_STATE_DIR") or (BASE / "logs" / "state"))
+    return state / "recorder_health.json"
+
+
+def _recorder_health() -> dict:
+    """{"fail_count": int, "blocked_until": epoch 秒}；文件缺失/损坏视为全新状态。"""
+    try:
+        raw = json.loads(_recorder_breaker_file().read_text(encoding="utf-8"))
+        return {"fail_count": int(raw.get("fail_count") or 0),
+                "blocked_until": float(raw.get("blocked_until") or 0.0)}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {"fail_count": 0, "blocked_until": 0.0}
+
+
+def _save_recorder_health(count: int, blocked_until: float) -> None:
+    """原子落盘（tmp+replace，照 fetcher.source_health.json 模式）；失败仅告警。
+    录制器是 5 分钟短命进程：fail_count 必须随文件持久化，连续失败才能跨进程累计。"""
+    try:
+        p = _recorder_breaker_file()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"fail_count": count, "blocked_until": blocked_until}),
+                       encoding="utf-8")
+        tmp.replace(p)
+    except OSError as e:
+        log.warning("录制器熔断状态落盘失败: %s", e)
+
+
+def recorder_blocked() -> bool:
+    """冷却中：连续失败 ≥ _RECORDER_MAX_FAIL 后冷却 _RECORDER_COOLDOWN_MIN 分钟。"""
+    return time.time() < _recorder_health()["blocked_until"]
+
+
+def _mark_recorder(ok: bool) -> None:
+    h = _recorder_health()
+    if ok:
+        if h["fail_count"] or h["blocked_until"]:
+            _save_recorder_health(0, 0.0)
+        return
+    n = h["fail_count"] + 1
+    if n >= _RECORDER_MAX_FAIL:
+        _save_recorder_health(0, time.time() + _RECORDER_COOLDOWN_MIN * 60)
+        log.warning("录制快照源连续失败 %d 次，冷却 %d 分钟（已落盘，跨进程生效）",
+                    n, _RECORDER_COOLDOWN_MIN)
+    else:
+        _save_recorder_health(n, h["blocked_until"])
+
+
+def fetch_snapshot(codes: List[str], index_codes: Optional[List[str]] = None
+                   ) -> Dict[str, dict]:
+    """录制专用批量快照（腾讯一次请求，个股+指数混编）。与 get_live_prices 的差异：
+
+    - 指数走 INDEX_SYMBOLS 显式符号表（_exchange_prefix 会把 000001 拼成 sz000001）；
+    - 解析 volume（f[6]，手→股 ×100）与 amount（f[37]，万元→元 ×10000），
+      量纲口径与 movers 的 spot_tx 兜底换算一致；
+    - 请求带 UA；
+    - **绝不写 _audit_snapshot jsonl**（录制数据落点是 minute_snapshot 表，防双写）；
+    - 独立冷却（recorder_health.json），不动 fetcher 的 akshare 熔断器；
+    - 同样绝不写 daily_bar（本模块红线不变）。
+
+    返回 {code: {price, prev_close, volume, amount, time, source}}；整体失败/冷却
+    返回 {}，由调用方按整轮失败处理。
+    """
+    if recorder_blocked():
+        log.warning("录制快照源冷却中（recorder_health.json），本轮跳过")
+        return {}
+    symbols: Dict[str, str] = {}   # 腾讯 symbol -> 6 位码
+    for c in codes:
+        pfx = _exchange_prefix(str(c))
+        if pfx:
+            symbols[pfx + str(c)] = str(c)
+    for c in (index_codes or []):
+        sym = INDEX_SYMBOLS.get(str(c))
+        if sym:
+            symbols[sym] = str(c)
+    if not symbols:
+        return {}
+    url = "https://qt.gtimg.cn/q=" + ",".join(symbols)
+    try:
+        resp = requests.get(url, timeout=_TIMEOUT, headers=_UA_HEADERS)
+        resp.encoding = "gbk"
+    except Exception as e:  # noqa: BLE001
+        _mark_recorder(False)
+        log.warning("录制快照请求失败: %s", repr(e)[:120])
+        return {}
+    out: Dict[str, dict] = {}
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    for m in re.finditer(r'v_(sh|sz)(\d{6})="([^"]*)"', resp.text):
+        code = symbols.get(m.group(1) + m.group(2))
+        if not code:
+            continue
+        f = m.group(3).split("~")
+        if len(f) < 6:
+            continue
+        try:
+            if float(f[3]) <= 0:  # 停牌"0.00"不得作为有效价（照 _fetch_tencent 口径）
+                continue
+        except ValueError:
+            continue
+        try:
+            out[code] = {
+                "price": float(f[3]),
+                "prev_close": float(f[4]) if f[4] else None,
+                "volume": float(f[6]) * 100.0 if f[6] else None,   # 手 → 股
+                "amount": (float(f[37]) * 10000.0)
+                          if len(f) > 37 and f[37] else None,      # 万元 → 元
+                "time": f[30] if len(f) > 30 and f[30] else now_iso,
+                "source": "tencent_snapshot",
+            }
+        except (ValueError, IndexError):
+            continue
+    _mark_recorder(bool(out))
+    log.info("录制快照 %d/%d 票（含指数）", len(out), len(symbols))
+    return out
+
+
 def freshness_note(q: Optional[dict]) -> str:
     """给调用方生成口径注：该报价的时间与来源。"""
     if not q:
