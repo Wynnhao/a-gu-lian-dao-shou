@@ -204,13 +204,15 @@ def test_postclose_scan_proposes_and_dedupes(monkeypatch=None):
     orig_orders_dir = _runner.ORDERS_DIR
     _runner.ORDERS_DIR = orders_dir
     try:
-        now = datetime(2026, 9, 17, 15, 30, 0)  # 盘后（规则4 豁免）
+        # 盘后扫描时刻=真实今天 15:30（完工审查执行日语义：prev_close 的
+        # before=执行日，必须与 _seed_hit 的 bar 日期（真实今天/昨天）同一基准）
+        now = datetime.combine(date.today(), datetime.min.time()).replace(hour=15, minute=30)
         r1 = limit_halt.run_postclose_scan(conn, now=now)
         assert r1["proposed"] == ["600519"], r1
         row = conn.execute(
             "SELECT run_date, code, action, status, emergency_scan FROM decision"
             " WHERE emergency_scan=1").fetchone()
-        assert row[0] == "2026-09-18"          # run_date=预期执行日（次日）
+        assert row[0] == (date.today() + timedelta(days=1)).isoformat()  # run_date=预期执行日（次日）
         assert row[1] == "600519" and row[2] == "sell"
         assert row[3] == "approved"            # pending 等人工 confirm
         assert row[4] == 1
@@ -451,7 +453,8 @@ def test_postclose_scan_wires_live_quotes_seal():
         orig_orders_dir = _runner.ORDERS_DIR
         _runner.ORDERS_DIR = orders_dir
         try:
-            return limit_halt.run_postclose_scan(conn, now=datetime(2026, 9, 17, 15, 30))
+            return limit_halt.run_postclose_scan(conn, now=datetime.combine(
+            date.today(), datetime.min.time()).replace(hour=15, minute=30))
         finally:
             if old_mock is None:
                 os.environ.pop("AGSICKLE_MOCK_QUOTES", None)

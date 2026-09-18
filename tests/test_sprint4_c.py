@@ -717,6 +717,45 @@ def test_wc8_premarket_gate_before_and_after_1100():
 
 
 @test
+@test
+def test_wc8_intraday_latest_td_is_yesterday_bundle_in_today_dir():
+    """完工审查 P1-1 回归：盘中 daily_bar 最新=上一交易日（latest_td=昨天），
+    而 bundle 落盘在**当日**会话目录——旧实现检查 latest_td 目录恒判"缺失"，
+    叠加 */30 catchup 后每个 tick 整套重跑 premarket。修正后查 today 目录，
+    bundle 在（fresh）→ 任何时刻都不重跑。"""
+    d = Path(tempfile.mkdtemp(prefix="agsickle_c_wc8c_"))
+    db_path = str(d / "market.db")
+    reports, session, state = d / "reports", d / "session", d / "state"
+    for pth in (reports, session, state):
+        pth.mkdir(parents=True, exist_ok=True)
+    yday = (date.today() - timedelta(days=1)).isoformat()
+    today_str = _seed_catchup_db(db_path, [yday])  # 盘中态：bar 只到昨天
+    conn = sqlite3.connect(db_path)
+    conn.execute("INSERT INTO signal (code, as_of, signals, score, profile) VALUES"
+                 " ('600519', ?, '{}', 0.5, 'reversal_lowvol')", (yday,))
+    # 昨日盯市/日报已齐（避免步骤1 补跑昨日的 failures 干扰本用例焦点）
+    conn.execute("INSERT OR REPLACE INTO portfolio_state VALUES"
+                 " (?, 0, 0, 100.0, 0, 0, ?)", (yday, "价格日期=%s" % yday))
+    conn.commit()
+    conn.close()
+    (reports / (yday + ".md")).write_text("# daily", encoding="utf-8")
+    old_db = os.environ.get("AGSICKLE_DB")
+    os.environ["AGSICKLE_DB"] = db_path
+    try:
+        (session / today_str).mkdir(parents=True, exist_ok=True)
+        (session / today_str / "bundle.md").write_text("# morning", encoding="utf-8")
+        with _CatchupSandbox(db_path, reports, session, state) as sb:
+            rc = catchup.catch_up(now=datetime.combine(date.today(), time(14, 0)))
+        assert rc == 0
+        assert "pipeline/premarket.py" not in sb.calls, \
+            "盘中 latest_td=昨天时不得误判 bundle 缺失: %s" % sb.calls
+    finally:
+        if old_db is None:
+            os.environ.pop("AGSICKLE_DB", None)
+        else:
+            os.environ["AGSICKLE_DB"] = old_db
+
+
 def test_wc8_bundle_stamp_versions_retention():
     """W-C8：write_bundle 同时落 bundle.HHMM.md 带时间戳副本；目录只保留最近
     10 份（防审计链无限增长）。时间冻结到 12:00 保证与历史副本的排序确定。"""

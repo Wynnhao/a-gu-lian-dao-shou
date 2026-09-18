@@ -220,8 +220,13 @@ def catch_up(now: Optional[datetime] = None) -> int:
             # 2a) 盘前 bundle 缺失 → 重跑盘前流水线；信号未对齐仅 11:00 前才重跑
             #（W-C8 / P1-22：此前对齐检查在傍晚也成立——15:43 整套重跑 premarket
             #  覆盖早晨 bundle，事后复盘读到的是与决策时不同的证据。11:00 后
-            #  bundle 已在即不再动它，信号对齐交给盘后流程）
-            bundle = SESSION_DIR / latest_td / "bundle.md"
+            #  bundle 已在即不再动它，信号对齐交给盘后流程）。
+            #（完工审查修正：bundle/midday 落盘在**当日**会话目录 SESSION_DIR/<today>/
+            #  ——premarket/midday 的 run_date=今天；原检查指向 latest_td（盘中
+            #  daily_bar 最新=上一交易日）恒判"缺失"，叠加 */30 catchup 后每个
+            #  tick 都整套重跑 premarket。目录修正后 bundle_missing 腿天然幂等
+            #  （早晨生成过→mtime=今天→不再补），保持"任何时候补"语义不变。）
+            bundle = SESSION_DIR / today_str / "bundle.md"
             sig_latest = conn.execute("SELECT MAX(as_of) FROM signal").fetchone()[0]
             bundle_missing = not _file_fresh_today(bundle)
             sig_misaligned = sig_latest != latest_td
@@ -235,10 +240,9 @@ def catch_up(now: Optional[datetime] = None) -> int:
                 if not _run_script("pipeline/premarket.py", timeout=900):
                     failures += 1
             elif sig_misaligned:
-                _say("步骤2a 跳过：信号未对齐（as_of=%s ≠ %s）但已过 11:00 且当日 "
-                     "bundle 在——不覆盖早晨证据（W-C8）" % (sig_latest, latest_td))
-            # 2b) 午间包缺失（11:00 后）→ 补午评准备
-            midday_bundle = SESSION_DIR / latest_td / "midday_bundle.md"
+                pass  # 11:00 后信号未对齐属盘后常态（当日 bar 15:30 后才入库），静默跳过
+            # 2b) 午间包缺失（11:00 后）→ 补午评准备（midday 落盘同在当日会话目录）
+            midday_bundle = SESSION_DIR / today_str / "midday_bundle.md"
             if now.hour >= 11 and not _file_fresh_today(midday_bundle):
                 _say("步骤2b 当日午间包缺失，补跑午评准备")
                 if not _run_script("pipeline/midday.py", timeout=600):

@@ -109,7 +109,8 @@ class PaperBroker:
 
     def _pre_trade_guards(self, conn: sqlite3.Connection, code: str, side: str,
                           price: float, shares: int,
-                          decision_id: Optional[int]) -> None:
+                          decision_id: Optional[int],
+                          trade_date: Optional[str] = None) -> None:
         """成交前置防线（任一触发直接拒绝成交，返回 None 由调用方处理）：
 
         1. 幂等：同 decision_id 已有有效成交 → 拒绝（readback 失败后重跑 confirm
@@ -127,7 +128,7 @@ class PaperBroker:
                              % (decision_id, side, code, shares), decision_id)
                 raise _Reject("decision#%s 已有成交（幂等拒绝）" % decision_id)
         if self.cfg.get("sim_limit_halt", True) and price > 0:
-            pc = self.prev_close(conn, code)
+            pc = self.prev_close(conn, code, on_date=trade_date)
             if pc:
                 pct = limit_pct(code)  # 停板幅度统一走风控引擎口径（含北交所30%）
                 if side == "buy" and price > limit_price(pc, pct, True) + 1e-9:
@@ -234,9 +235,19 @@ class PaperBroker:
             log.warning("实时价获取失败（回退日线收盘）: %s", repr(e)[:120])
             return None
 
-    def prev_close(self, conn: sqlite3.Connection, code: str) -> Optional[float]:
-        """前一交易日收盘（涨跌停基准用）。"""
-        return repo.latest_close(conn, code, offset=1)
+    def prev_close(self, conn: sqlite3.Connection, code: str,
+                   on_date: Optional[str] = None) -> Optional[float]:
+        """涨跌停基准价 = 严格早于执行日的最新收盘。
+
+        完工审查修正（原 offset=1 在盘中取到 T-2，基准错位一天——连续下跌时
+        [真跌停, 旧跌停] 区间的合法止损卖单被规则14/paper 双双误拒）：
+        - 盘中 T（daily_bar 最新=T-1）→ 取 T-1 ✓
+        - 盘后 T（当日 bar 已入库）→ 仍取 T-1（当日订单基准不变）✓
+        - 次日 T+1 → 取 T 收盘（T+1 涨跌停基准）✓
+        on_date=执行日（缺省墙钟今天）；回放/测试场景由调用方显式传。
+        """
+        return repo.latest_close(conn, code,
+                                 before=on_date or date.today().isoformat())
 
     # ------------------------------------------------------------ 买卖
 
@@ -253,7 +264,8 @@ class PaperBroker:
             log.warning("buy 拒绝：非法参数 code=%s price=%s shares=%s", code, price, shares)
             return None
         try:
-            self._pre_trade_guards(conn, code, "buy", price, shares, decision_id)
+            self._pre_trade_guards(conn, code, "buy", price, shares, decision_id,
+                                  trade_date=trade_date)
         except _Reject as e:
             log.warning("buy 拒绝：%s code=%s", e, code)
             return None
@@ -316,7 +328,8 @@ class PaperBroker:
             log.warning("sell 拒绝：非法参数 code=%s price=%s shares=%s", code, price, shares)
             return None
         try:
-            self._pre_trade_guards(conn, code, "sell", price, shares, decision_id)
+            self._pre_trade_guards(conn, code, "sell", price, shares, decision_id,
+                                  trade_date=trade_date)
         except _Reject as e:
             log.warning("sell 拒绝：%s code=%s", e, code)
             return None
@@ -482,7 +495,8 @@ class PaperBroker:
 
     # ------------------------------------------------------------ 组合快照
 
-    def portfolio(self, conn: sqlite3.Connection
+    def portfolio(self, conn: sqlite3.Connection,
+                  today: Optional[str] = None
                   ) -> Tuple[float, Dict[str, dict], float, Dict[str, float]]:
         """返回 (现金, 持仓dict, 总权益, 昨收盘dict)，供风控上下文组装。
 
@@ -502,7 +516,7 @@ class PaperBroker:
         prev_closes: Dict[str, float] = {}
         total_equity = cash
         for code in sorted(codes):
-            pc = self.prev_close(conn, code)
+            pc = self.prev_close(conn, code, on_date=today)
             if pc is not None:
                 prev_closes[code] = pc
             if code in positions:

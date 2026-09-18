@@ -146,11 +146,21 @@ def latest_bar_date(conn: sqlite3.Connection, code: str,
 
 
 def latest_close(conn: sqlite3.Connection, code: str,
-                 offset: int = 0) -> Optional[float]:
-    """单票最新收盘（offset=1 为次新 bar——paper.prev_close 的取法）。"""
-    row = conn.execute(
-        "SELECT close FROM daily_bar WHERE code=? ORDER BY trade_date DESC LIMIT 1 OFFSET ?",
-        (code, int(offset))).fetchone()
+                 offset: int = 0, before: Optional[str] = None) -> Optional[float]:
+    """单票最新收盘。
+
+    - offset=1：次新 bar（旧口径，涨跌停基准已弃用——盘中会取到 T-2）；
+    - before=YYYY-MM-DD：严格早于该日的最新收盘——涨跌停基准唯一正确口径
+      （盘中取 T-1、盘后仍 T-1、次日自动滚动到 T 收盘，完工审查 P1 修正）。
+    """
+    if before:
+        row = conn.execute(
+            "SELECT close FROM daily_bar WHERE code=? AND trade_date<? "
+            "ORDER BY trade_date DESC LIMIT 1", (code, str(before))).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT close FROM daily_bar WHERE code=? ORDER BY trade_date DESC "
+            "LIMIT 1 OFFSET ?", (code, int(offset))).fetchone()
     return float(row[0]) if row and row[0] is not None else None
 
 

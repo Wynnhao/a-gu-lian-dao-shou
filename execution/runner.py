@@ -233,7 +233,8 @@ def build_context(conn: sqlite3.Connection, now: datetime,
       confirm 定价据此识别"昨收冒充实价"。
     """
     broker = PaperBroker()
-    cash, positions, total_equity, prev_closes = broker.portfolio(conn)
+    cash, positions, total_equity, prev_closes = broker.portfolio(
+        conn, today=now.strftime("%Y-%m-%d"))
 
     codes = set(positions)
     for c in repo.all_codes(conn):
@@ -266,8 +267,9 @@ def build_context(conn: sqlite3.Connection, now: datetime,
             if lp is not None:
                 latest_prices[code] = lp
                 price_source[code] = "stale_close"
-    for code, q in live_quotes.items():  # 实时昨收补齐（新股仅1根bar时日线推不出）
-        if code not in prev_closes and q.get("prev_close") is not None:
+    for code, q in live_quotes.items():  # 实时昨收覆盖（完工审查：live 口径权威，
+        # DB bar 可能滞后/缺失；原"只补缺"会在 DB 有更旧 bar 时保留错位基准）
+        if q.get("prev_close") is not None:
             prev_closes[code] = float(q["prev_close"])
     if live_quotes_override is not None:
         # W-A7：override 连带重算 total_equity——持仓价以 override 为权威，
@@ -1423,6 +1425,13 @@ def load_decision_file(path: str) -> List[dict]:
         for _k in ("skip_gate", "confirmed_by"):
             if d.pop(_k, None) is not None:
                 log.warning("决策文件 %s 携带 %s，已剥离（仅规则21 可设置）", path, _k)
+        # Sprint4 完工审查 P1：kill_liquidation/emergency_scan 已获服务端特权
+        # （豁免规则3/4/18、跨日/TTL 闸、stale 设计价执行），与 skip_gate 同类
+        # 提权面——文件输入一律剥离；合法注入点仅在服务端
+        # （signals.limit_halt 扫描器 / runner.resolve_liquidations）。
+        for _k in ("kill_liquidation", "emergency_scan"):
+            if d.pop(_k, None):
+                log.warning("决策文件 %s 携带 %s，已剥离（仅服务端链路可设置）", path, _k)
     return out
 
 

@@ -306,7 +306,7 @@ def test_portfolio_snapshot():
     b = PaperBroker(EXEC_CFG)
     b.buy(conn, "000001", "平安银行", 11.0, 100)
     b.buy(conn, "600519", "贵州茅台", 1500.0, 100)
-    cash, positions, total, prev = b.portfolio(conn)
+    cash, positions, total, prev = b.portfolio(conn, today=NOW_DATE)
     assert cash == 1000000.0 - 1105.0 - 150037.5
     assert set(positions) == {"000001", "600519"}
     assert positions["600519"]["shares"] == 100 and positions["600519"]["cost"] == 1500.0
@@ -800,6 +800,38 @@ def test_duplicate_decision_id_trade_rejected():
     assert n == 1
 
 
+def test_load_decision_file_strips_privilege_flags():
+    """完工审查 P1：load_decision_file（外部文件输入）须剥离 kill_liquidation/
+    emergency_scan 提权键（豁免规则3/4/18、跨日/TTL 闸、设计价执行）——合法
+    注入点仅在服务端 limit_halt/resolve_liquidations。"""
+    d = Path(tempfile.mkdtemp(prefix="agsickle_exec_priv_"))
+    f = d / "decision.json"
+    f.write_text(json.dumps([{"action": "sell", "code": "600519",
+                              "target_weight": 0.0, "confidence": 0.9,
+                              "reasons": ["r1"], "risk_notes": [],
+                              "kill_liquidation": True, "emergency_scan": True}]),
+                 encoding="utf-8")
+    out = runner.load_decision_file(str(f))
+    assert out and "kill_liquidation" not in out[0] and "emergency_scan" not in out[0]
+
+
+def test_prev_close_uses_last_bar_before_today_intraday():
+    """完工审查 P1：盘中（daily_bar 最新=昨日）涨跌停基准应取昨日收盘；
+    旧 offset=1 会取到前日（基准错位一天，合法止损卖单被误拒）。"""
+    conn = fresh_conn()
+    conn.execute("INSERT INTO stock_info VALUES ('000001','平安银行','2024-01-02','x')")
+    d3 = (date.today() - timedelta(days=2)).isoformat()
+    d2 = (date.today() - timedelta(days=1)).isoformat()
+    for td, cl in ((d3, 10.0), (d2, 10.9)):   # 盘中：无今日 bar
+        conn.execute("INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
+                     " volume, amount, pct_chg, turnover) VALUES"
+                     " ('000001',?,?,?,?,?,1000,1e7,0.0,1.0)", (td, cl, cl, cl, cl))
+    conn.commit()
+    b = PaperBroker(EXEC_CFG)
+    assert b.prev_close(conn, "000001",
+                        on_date=date.today().isoformat()) == 10.9
+
+
 def test_slippage_and_limit_halt_sim():
     """滑点模型 + 停板模拟：enabled 时买入按上滑价成交、超涨停价拒单。"""
     old = os.environ.pop("AGSICKLE_DISABLE_SLIPPAGE", None)
@@ -808,13 +840,13 @@ def test_slippage_and_limit_halt_sim():
         seed_market(conn)
         cfg = dict(EXEC_CFG, slippage_bps=100)             # 100bps = 1%
         b = PaperBroker(cfg)
-        res = b.buy(conn, "000001", "平安银行", 11.0, 100)
+        res = b.buy(conn, "000001", "平安银行", 11.0, 100, trade_date=NOW_DATE)
         assert res["price"] == 11.11 and res["requested_price"] == 11.0
         assert res["amount"] == 1116.0                     # gross 1111 + 最低佣金 5
         # 委托价超涨停（10.9×1.1=11.99）→ 停板模拟拒绝
-        res2 = b.buy(conn, "600519", "贵州茅台", 1500.0, 100)  # 1500 < 1639 正常
+        res2 = b.buy(conn, "600519", "贵州茅台", 1500.0, 100, trade_date=NOW_DATE)  # 1500 < 1639 正常
         assert res2 and res2["ok"]
-        up_reject = b.buy(conn, "000001", "平安银行", 12.0, 100)
+        up_reject = b.buy(conn, "000001", "平安银行", 12.0, 100, trade_date=NOW_DATE)
         assert up_reject is None                           # 12.0 > 涨停 11.99
     finally:
         if old is not None:

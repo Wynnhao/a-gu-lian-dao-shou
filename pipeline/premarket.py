@@ -84,6 +84,23 @@ def main(argv=None) -> int:
     ap.add_argument("--date", default=None, dest="run_date",
                     help="运行日期 YYYY-MM-DD（默认今天=预期执行日；证据自动取最新交易日）")
     args = ap.parse_args(argv)
+
+    # 单实例锁（完工审查修正）：crontab */30 tick 与 09:00 调度节点可能并发整套
+    # 重跑 premarket（重拉新闻/行情+重写 bundle）。进程死亡内核即释放锁。
+    import fcntl
+    _lock_file = BASE / "logs" / ".premarket.lock"
+    try:
+        _lock_file.parent.mkdir(parents=True, exist_ok=True)
+        _lock_fh = open(_lock_file, "w")
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.warning("已有 premarket 实例在跑（锁 %s 被占），本次退出", _lock_file)
+        print("[premarket] 已有实例在跑（锁 %s 被占），本次退出" % _lock_file)
+        return 0
+    except OSError as e:
+        log.error("premarket 锁文件初始化失败：%s", e)
+        return 1
+
     log.info("==== premarket start ====")
 
     # 0.5 跌停应急单超时兜底（Fix-4 / D1：昨日未 confirm 的 emergency_scan 单，

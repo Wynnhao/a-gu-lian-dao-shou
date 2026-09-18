@@ -90,7 +90,8 @@ def scan_positions(conn: sqlite3.Connection, ctx_inputs: Optional[dict] = None,
         latest_prices = dict(latest_prices or {})
         for code in codes:
             if code not in prev_close:
-                pc = broker.prev_close(conn, code)
+                pc = broker.prev_close(conn, code,
+                                       on_date=(now or datetime.now()).strftime("%Y-%m-%d"))
                 if pc is not None:
                     prev_close[code] = float(pc)
             if not lp_from_input and code not in latest_prices:
