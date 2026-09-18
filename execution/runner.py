@@ -574,9 +574,10 @@ def exec_breaker_tripped(conn: sqlite3.Connection, today: Optional[str] = None,
 
 def _record_once_today(conn: sqlite3.Connection, rule: str, detail: str,
                        prefix: Optional[str] = None,
-                       decision_id: Optional[int] = None) -> None:
+                       decision_id: Optional[int] = None) -> bool:
     """同日同前缀只落一条（照 limit_halt real_today 口径：去重窗口按真实自然日，
-    防回放注入时间击穿去重）。detail 必须以 prefix 开头（ADR-0 §3）。"""
+    防回放注入时间击穿去重）。detail 必须以 prefix 开头（ADR-0 §3）。
+    返回是否本次真正落库（调用方据此决定是否 notify，避免重复打扰）。"""
     prefix = prefix or detail
     real_today = datetime.now().strftime("%Y-%m-%d")
     n = conn.execute(
@@ -584,6 +585,8 @@ def _record_once_today(conn: sqlite3.Connection, rule: str, detail: str,
         (rule, real_today + "%", prefix + "%")).fetchone()[0]
     if not n:
         record_event(conn, rule, detail, decision_id)
+        return True
+    return False
 
 
 def requeue_price_rejects(conn: sqlite3.Connection, now: Optional[datetime] = None,
@@ -766,6 +769,22 @@ def propose(conn: sqlite3.Connection, decision: dict, decision_id: Optional[int]
     now = now or datetime.now()
     _assert_paper_mode()
     exec_cfg = CFG.get("execution", {})
+    # C-ARC-2/T4：执行失败熔断挡板——当日 F1a∪F2 根决策数达阈值后暂停新 propose。
+    # 豁免 kill 递延补清算（强平 > 熔断，CONSTRAINTS §3.3 强序；decision 构造带
+    # kill_liquidation=True 标记，见 resolve_liquidations）。
+    if not decision.get("kill_liquidation") and \
+            exec_breaker_tripped(conn, now.strftime("%Y-%m-%d")):
+        first = _record_once_today(
+            conn, "exec_circuit_breaker",
+            "exec_circuit_breaker: 当日执行失败根决策数达阈值 %d，暂停新 propose"
+            "（kill 补清算豁免）" % int(exec_cfg.get("exec_breaker_threshold", 3)),
+            prefix="exec_circuit_breaker")
+        if first:
+            notify("执行失败熔断生效",
+                   "当日执行失败（拒单/成交失败）根决策数达阈值，已暂停新 propose；"
+                   "请人工检查行情与数据后处理积压单")
+        print("[propose] 执行失败熔断生效：暂停新 propose（risk_event 已留痕）")
+        return Verdict(approved=False, warnings=["exec breaker"])
     # 审查补丁批 Fix A：skip_gate/confirmed_by 只能由规则 21 在下方 check() 内设置；
     # 任何调用方传入的这两个键一律剥离（防决策输入注入"免闸门直写"标志——
     # 否则 emergency_direct_exec=true 时自带 skip_gate 的 buy 也能直写成交）。
@@ -1021,6 +1040,15 @@ def propose_db(conn: sqlite3.Connection, run_date: Optional[str] = None,
     now = now or datetime.now()
     if run_date is None:
         run_date = now.strftime("%Y-%m-%d")  # 决策口径统一：今天=预期执行日
+    # C-ARC-2/T4：熔断生效时批量风控入口直接短路（逐条 propose 内挡板同样兜底）
+    if exec_breaker_tripped(conn, now.strftime("%Y-%m-%d")):
+        _record_once_today(
+            conn, "exec_circuit_breaker",
+            "exec_circuit_breaker: 当日执行失败根决策数达阈值 %d，propose-db 短路"
+            % int(CFG.get("execution", {}).get("exec_breaker_threshold", 3)),
+            prefix="exec_circuit_breaker")
+        print("[propose-db] 执行失败熔断生效：跳过 run_date=%s 全部 propose" % run_date)
+        return 0
     ids = [r[0] for r in conn.execute(
         "SELECT id FROM decision WHERE run_date=? AND status='proposed' ORDER BY id",
         (run_date,)).fetchall()]

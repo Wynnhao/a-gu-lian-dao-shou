@@ -1051,6 +1051,149 @@ def test_requeue_cum_drift_guard_abandons_chase():
         shutil.rmtree(orders, ignore_errors=True)
 
 
+# ---------------- C-ARC-2/T4：执行失败熔断挡板 ----------------
+
+def _seed_f1a_event(conn, decision_id, ts):
+    """直插一条 F1a 事件（ts 显式给定，与查询口径的「当日」对齐）。"""
+    conn.execute(
+        "INSERT INTO risk_event (ts, rule, detail, decision_id) VALUES (?,?,?,?)",
+        (ts, "risk_check_reconfirm", "演练 F1a #%s" % decision_id, decision_id))
+    conn.commit()
+
+
+def test_exec_breaker_blocks_propose_and_exempts_liquidation():
+    """熔断：3 根决策执行失败 → propose 拒新单不插行 + 事件当日去重 + notify 一次；
+    kill_liquidation 补清算豁免（强平 > 熔断，CONSTRAINTS §3.3）。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        for did in (11, 12, 13):
+            _seed_f1a_event(conn, did, NOW_DATE + "T13:0%d:00" % (did % 10))
+        assert runner.exec_breaker_tripped(conn, NOW_DATE) is True
+        before = conn.execute("SELECT COUNT(*) FROM decision").fetchone()[0]
+        ev_before = conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
+                                 " rule='exec_circuit_breaker'").fetchone()[0]
+        v = runner.propose(conn, mk_decision("buy", "000001", 11.0, 100),
+                           now=NOW10, orders_dir=orders)
+        assert not v.approved and "exec breaker" in v.warnings
+        # 挡板在插行之前：不产生新决策行；事件当日只一条（notify 同步只一次）
+        assert conn.execute("SELECT COUNT(*) FROM decision").fetchone()[0] == before
+        ev = conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
+                          " rule='exec_circuit_breaker'").fetchone()[0]
+        assert ev == ev_before + 1
+        runner.propose(conn, mk_decision("buy", "000001", 11.0, 100),
+                       now=NOW10, orders_dir=orders)
+        assert conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
+                            " rule='exec_circuit_breaker'").fetchone()[0] == ev
+        # kill_liquidation 卖单豁免：正常走风控并落 pending（等人工 confirm）
+        conn.execute(
+            "INSERT INTO position (code, name, shares, avail_shares, cost, updated_at)"
+            " VALUES ('000001','平安银行',100,100,12.0,?)", (YDAY + "T09:00:00",))
+        conn.commit()
+        liq = mk_decision("sell", "000001", 11.0, 100, kill_liquidation=True)
+        v2 = runner.propose(conn, liq, now=NOW10, orders_dir=orders)
+        assert v2.approved, v2.violations
+        assert len(runner.list_pending(orders)) == 1
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_exec_breaker_same_chain_counts_one_root():
+    """同链归并：根决策 + 同根重挂 3 代的 F1a 事件只计 1 个根，不触发熔断；
+    再加 1 个 F2（execution_failed）根共 2 个仍不触发；第 3 个根触发。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        # 根决策 1（无标记）+ 三代重挂（exec_retry_of=1;attempt=n），各带 F1a 事件
+        conn.execute(
+            "INSERT INTO decision (run_date, code, action, target_weight, confidence,"
+            " reasons, risk_notes, input_snapshot, status, created_at)"
+            " VALUES (?,?,'buy',0.05,0.8,'[]','[]','{}','rejected',?)",
+            (NOW_DATE, "000001", NOW_DATE + "T10:00:00"))
+        for i in (1, 2, 3):
+            conn.execute(
+                "INSERT INTO decision (run_date, code, action, target_weight,"
+                " confidence, reasons, risk_notes, input_snapshot, status, created_at)"
+                " VALUES (?,?,'buy',0.05,0.8,?,?,'{}','rejected',?)",
+                (NOW_DATE, "000001",
+                 json.dumps(["%s1;attempt=%d" % (runner._RETRY_MARK, i)]),
+                 "[]", NOW_DATE + "T13:0%d:00" % i))
+            _seed_f1a_event(conn, 1 + i, NOW_DATE + "T13:0%d:00" % i)
+        _seed_f1a_event(conn, 1, NOW_DATE + "T10:30:00")
+        assert runner.exec_breaker_tripped(conn, NOW_DATE) is False   # 4 事件 1 根
+        # 第 2 个根：F2 execution_failed
+        conn.execute(
+            "INSERT INTO risk_event (ts, rule, detail, decision_id) VALUES "
+            "(?,?,?,?)", (NOW_DATE + "T14:00:00", "execution_failed",
+                          "成交失败 decision#50", 50))
+        conn.commit()
+        assert runner.exec_breaker_tripped(conn, NOW_DATE) is False   # 2 根 < 3
+        # 第 3 个根 → 触发
+        _seed_f1a_event(conn, 77, NOW_DATE + "T14:30:00")
+        assert runner.exec_breaker_tripped(conn, NOW_DATE) is True
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_exec_breaker_propose_db_short_circuit_and_next_day_release():
+    """propose-db 熔断短路返回 0；次一交易日（阈值查询换日）自动解除，propose 恢复。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        for did in (21, 22, 23):
+            _seed_f1a_event(conn, did, NOW_DATE + "T13:00:00")
+        # 预插一条 proposed 决策（若无熔断会被 propose_db 逐条处理）
+        conn.execute(
+            "INSERT INTO decision (run_date, code, action, target_weight, confidence,"
+            " reasons, risk_notes, input_snapshot, status, created_at)"
+            " VALUES (?,?,'buy',0.05,0.8,'[]','[]','{}','proposed',?)",
+            (NOW_DATE, "000001", NOW_DATE + "T09:00:00"))
+        conn.commit()
+        n = runner.propose_db(conn, run_date=NOW_DATE, now=NOW10)
+        assert n == 0
+        st = conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0]
+        assert st == "proposed"                       # 未被处理，原状保留
+        # 次一交易日自动解除：同一决策 propose 恢复正常走风控（闸门开启 → pending）。
+        # 推进 3 天（周末安全落到下周一~四），并为全池补当日 bar 防 health 降级。
+        later_dt = datetime.combine(_BASE + timedelta(days=3), time(10, 0))
+        later = later_dt.strftime("%Y-%m-%d")
+        for code, (latest, _prev) in DEFAULT_PRICES.items():
+            conn.execute(
+                "INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
+                " volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (code, later, latest, latest, latest, latest, 1000,
+                 latest * 1000000, 0.0, 1.0))
+        conn.commit()
+        assert runner.exec_breaker_tripped(conn, later) is False
+        v = runner.propose(conn, mk_decision("buy", "000001", 11.0, 100),
+                           now=later_dt, orders_dir=orders)
+        assert v.approved, (v.brief(), v.violations)
+        assert len(runner.list_pending(orders)) == 1
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_exec_breaker_red_alert_payload():
+    """看板红警：api_data_status 输出 exec_breaker 字段（当日存在即 tripped_today；
+    查询口径是真实系统日，事件 ts 也用真实系统日）。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    real_today = datetime.now().strftime("%Y-%m-%d")
+    _seed_f1a_event(conn, 31, real_today + "T13:00:00")
+    conn.execute(
+        "INSERT INTO risk_event (ts, rule, detail, decision_id) VALUES "
+        "(?,?,?,?)", (real_today + "T14:00:00", "exec_circuit_breaker",
+                      "exec_circuit_breaker: 演练", 31))
+    conn.commit()
+    from webapp.api.data_status import api_data_status
+    payload = api_data_status(conn, {})
+    assert payload["exec_breaker"]["tripped_today"] is True
+    assert payload["exec_breaker"]["since"] == real_today + "T14:00:00"
+
+
 # ---------------- 直接运行入口 ----------------
 
 if __name__ == "__main__":

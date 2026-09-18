@@ -134,6 +134,15 @@ def api_data_status(conn: sqlite3.Connection, qs: dict) -> dict:
     except OSError:
         pass
 
+    # 10) C-ARC-2 执行熔断红警（当日 exec_circuit_breaker 事件存在即触发；
+    #     与 fetch_log fail/empty_today 同级展示——执行链已暂停新 propose）
+    today = datetime.now().strftime("%Y-%m-%d")
+    br = conn.execute(
+        "SELECT MAX(ts) FROM risk_event WHERE rule='exec_circuit_breaker'"
+        " AND ts LIKE ?", (today + "%",)).fetchone()
+    exec_breaker = {"tripped_today": bool(br and br[0]),
+                    "since": br[0] if br and br[0] else None}
+
     return {"generated_at": datetime.now().isoformat(timespec="seconds"),
             "latest_bar_date": latest,
             "watchlist_total": len(wl_codes),
@@ -148,4 +157,5 @@ def api_data_status(conn: sqlite3.Connection, qs: dict) -> dict:
             "recent_fails": fails,
             "audit": audit,
             "session": session,
-            "quotes_audit": quotes}
+            "quotes_audit": quotes,
+            "exec_breaker": exec_breaker}
