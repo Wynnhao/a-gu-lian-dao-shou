@@ -25,7 +25,7 @@ FILES = [
     "test_quotes.py", "test_fetcher_breaker.py", "test_audit.py", "test_movers_hot.py",
     "test_webapp.py", "test_pipeline.py", "test_pipeline_full.py", "test_market.py",
     "test_repo.py", "test_limit_halt.py", "test_breadth.py", "test_macro.py",
-    "test_guard_invariant.py",
+    "test_guard_invariant.py", "test_sprint4_b.py",
 ]
 
 

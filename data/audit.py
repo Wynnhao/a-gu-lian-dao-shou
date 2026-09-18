@@ -71,17 +71,23 @@ def check_db(conn: sqlite3.Connection, limit: int = 200) -> list:
     - 除权除息日：腾讯源 pct_chg 按未复权昨收自算，送转/分红日呈假暴跌——
       前复权涨跌幅仍在停板内的行视为除权假跌（qfq 缺失时保守照报）；
     - 302 创业板新段按 ±20% 判（此前只认 300/301/688/689）。
+
+    W-B3（Sprint4，P1-10）：新增 tx_pct_divergent——source='tx' 行 pct_chg 与
+    前复权环比背离 >1pp（除权日假跌的另一半：跌幅未超停板但方向/幅度已错，
+    例如 000001 2024-06-14 存 -5.74% 实为 -0.71%）。--fix 按 qfq 环比重算。
     """
     issues = []
     rows = conn.execute(
-        "SELECT code, trade_date, open, high, low, close, volume, amount, pct_chg, close_qfq "
+        "SELECT code, trade_date, open, high, low, close, volume, amount, pct_chg, close_qfq, source "
         "FROM daily_bar ORDER BY code, trade_date").fetchall()
-    first_date, prev_qfq, row_no = {}, {}, {}
-    for code, td, o, h, l, c, v, amt, pct, cq in rows:
+    first_date, prev_qfq, prev_close, row_no = {}, {}, {}, {}
+    for code, td, o, h, l, c, v, amt, pct, cq, source in rows:
         n = row_no.setdefault(code, 0)
         first_date.setdefault(code, td)
         prev_cq = prev_qfq.get(code)
+        prev_c = prev_close.get(code)
         prev_qfq[code] = cq   # 本行处理完后即下一行的「上一行」（bad_close continue 也要更新）
+        prev_close[code] = c
         row_no[code] = n + 1
         ctx = {"kind": "", "code": code, "date": td, "detail": ""}
         def flag(kind, detail):
@@ -105,6 +111,14 @@ def check_db(conn: sqlite3.Connection, limit: int = 200) -> list:
                     pass  # 除权假跌：前复权后真实涨跌幅在停板内
                 else:
                     flag("pct_out_of_range", f"pct_chg={pct} 超过停板幅度±{lp}%")
+            # W-B3：tx 行 pct 与 qfq 环比背离 >1pp 且 d(t) 跳变（除权事件）才报——
+            # tx 加法型复权在除权段内正常日两口径天然不同，只看背离会误报上万行
+            if (source == "tx" and cq and prev_cq and prev_cq > 0
+                    and prev_c is not None and c is not None
+                    and abs((c - cq) - (prev_c - prev_cq)) > 0.01
+                    and abs(pct - (cq / prev_cq - 1) * 100) > 1.0):
+                flag("tx_pct_divergent",
+                     f"pct_chg={pct} vs qfq环比={(cq / prev_cq - 1) * 100:.2f}%")
         if amt and amt > 0 and v is not None and v > 0:
             implied = amt / c
             shares = v * 100  # 假定库内已是「手」
@@ -140,6 +154,17 @@ def fix_volume_units(conn: sqlite3.Connection) -> int:
     return fixed
 
 
+def fix_tx_pct(conn: sqlite3.Connection) -> tuple:
+    """W-B3（P1-10）：tx 源 pct_chg 按 qfq 环比重算（divergent 行），只在
+    显式 --fix 时调用。返回 (fixed, skipped_no_qfq)——skipped 为该票该行或其
+    前行无 close_qfq 而无法重算的行数（存量汇报口径）。"""
+    from data.fetcher import recalc_tx_pct
+    fixed, skipped = recalc_tx_pct(conn)
+    conn.commit()
+    log.info("tx pct 修复: %d 行（qfq 环比口径），无 qfq 跳过 %d 行", fixed, skipped)
+    return fixed, skipped
+
+
 def backup_db(conn: sqlite3.Connection) -> Path:
     """VACUUM INTO 快照备份，保留最近 BACKUP_KEEP 份；失败不阻塞主流程。"""
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -163,6 +188,7 @@ def run(fix: bool = False, backup: bool = False, limit: int = 200) -> dict:
     try:
         if fix:
             fix_volume_units(conn)
+            fix_tx_pct(conn)  # W-B3：tx pct 除权修复收纳进 --fix
         issues, total = check_db(conn, limit=limit)
         by_kind = {}
         for it in issues:

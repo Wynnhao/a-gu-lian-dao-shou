@@ -413,6 +413,16 @@ def _sec_benchmark(conn: sqlite3.Connection, trade_date: str, day_pnl: Optional[
     ).fetchone()
     if cur is None or prev is None:
         return "基准数据缺失（index_daily 无 '000300' 当日/前日数据，可运行 review/weekly.py 自动补齐）"
+    # W-B2（Sprint4，P0-5）：基准滞后守卫——index_daily 缺当日行时 cur/prev 塌缩为
+    # 同一行，bench_ret≡0 被渲染成"当日 +0.00%"（09-16 实报 +0.68% 被写成 0.00%）。
+    # 基准不是当日 → 显式标注滞后日期；相对收益仅在基准两端同日时输出。
+    if cur[0] != trade_date:
+        lines = [
+            f"- 基准滞后（最新 {cur[0]}，无 {trade_date} 收盘）："
+            f"{float(prev[1]):.2f}（{prev[0]}）→ {float(cur[1]):.2f}（{cur[0]}）",
+            "- 当日相对收益：n/a（基准非当日，错日相减已禁止；请补齐 index_daily）",
+        ]
+        return "\n".join(lines)
     bench_ret = float(cur[1]) / float(prev[1]) - 1.0
     lines = [
         f"- 沪深300收盘：{float(prev[1]):.2f}（{prev[0]}）→ {float(cur[1]):.2f}（{cur[0]}），当日 {_fmt_pct(bench_ret)}",

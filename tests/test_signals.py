@@ -414,6 +414,10 @@ def test_factor_crowding_persists_file():
     """任务 5：_write_factor_crowding 把 μ60/σ60/crowded 写入 factor_crowding.json（沙箱目录）。"""
     from signals import signals as sig
     old, _sandbox = _sandbox_signal_eval_dir()
+    # W-B1 后 IC 按 profile() 过滤；合成行未显式给 profile（列缺省
+    # 'reversal_lowvol'）→ 用环境变量把当前 profile 对齐到合成数据口径
+    old_prof = os.environ.get("AGSICKLE_SIGNALS_PROFILE")
+    os.environ["AGSICKLE_SIGNALS_PROFILE"] = "reversal_lowvol"
     conn = _synth_signal_bar_env()
     try:
         out = sig._write_factor_crowding(conn)
@@ -431,6 +435,10 @@ def test_factor_crowding_persists_file():
     finally:
         conn.close()
         _restore_signal_eval_dir(old)
+        if old_prof is None:
+            os.environ.pop("AGSICKLE_SIGNALS_PROFILE", None)
+        else:
+            os.environ["AGSICKLE_SIGNALS_PROFILE"] = old_prof
 
 
 def test_factor_crowding_empty_signal_returns_no_crowd():

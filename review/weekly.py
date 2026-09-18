@@ -110,11 +110,15 @@ def ensure_benchmark(end_date: str, conn: Optional[sqlite3.Connection] = None,
     try:
         end_d = _to_date(end_date)
         start = (end_d - timedelta(days=30)).isoformat()
-        n = conn.execute(
-            "SELECT COUNT(*) FROM index_daily WHERE index_code='000300' AND trade_date>=? AND trade_date<=?",
+        # W-B2（Sprint4，P0-5/P1-9）：兜底条件由 COUNT(*)>0 收紧为
+        # MAX(trade_date) >= end_date——"窗口内有任意历史行"会跳过补数，
+        # 指数停在数日前时基准整周错日相减。
+        row = conn.execute(
+            "SELECT MAX(trade_date) FROM index_daily WHERE index_code='000300'"
+            " AND trade_date>=? AND trade_date<=?",
             (start, end_d.isoformat()),
-        ).fetchone()[0]
-        if n and n > 0:
+        ).fetchone()
+        if row and row[0] and str(row[0])[:10] >= end_d.isoformat():
             return {"ok": True, "source": "existing", "rows": 0, "error": None}
 
         chain = [fetcher] if fetcher is not None else [_fetch_benchmark_em, _fetch_benchmark_sina]

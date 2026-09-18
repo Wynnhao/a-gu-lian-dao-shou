@@ -77,25 +77,49 @@ def _fetch_em_breadth(date_str: str) -> dict:
     except Exception as e:
         log.warning("dt_pool_em FAIL: %s", repr(e)[:140])
         out["limit_down_count"] = 0
-    # 涨跌平家数
+    # 涨跌平家数：W-B6（P1-13①）换 legu 活跃度接口——原 stock_zh_a_gdhs 是
+    # 股东户数接口（无上涨/下跌家数列），advance_decline_ratio 因此恒 NULL
+    # （生产 DB 实证）。legu 返回 上涨/涨停/下跌/跌停/平盘 + 统计日期。
     try:
-        df_gd = call_ak("gdhs_em", ak.stock_zh_a_gdhs)
-        if df_gd is not None and not df_gd.empty:
-            # 列名适配：up_count / down_count / flat_count
-            up_col = next((c for c in df_gd.columns if "上涨" in c), None)
-            dn_col = next((c for c in df_gd.columns if "下跌" in c), None)
-            if up_col and dn_col:
-                up = float(df_gd[up_col].iloc[0])
-                dn = float(df_gd[dn_col].iloc[0])
-                out["advance_decline_ratio"] = round(up / dn, 4) if dn > 0 else None
+        df_legu = call_ak("legu", ak.stock_market_activity_legu)
+        if df_legu is not None and not df_legu.empty:
+            kv = {str(r["item"]): r["value"] for _, r in df_legu.iterrows()}
+            up, dn = kv.get("上涨"), kv.get("下跌")
+            if up is not None and dn is not None and float(dn) > 0:
+                out["advance_decline_ratio"] = round(float(up) / float(dn), 4)
+                out["source"] = "em+legu"
             else:
                 out["advance_decline_ratio"] = None
         else:
             out["advance_decline_ratio"] = None
     except Exception as e:
-        log.warning("gdhs_em FAIL: %s", repr(e)[:140])
+        log.warning("legu activity FAIL: %s", repr(e)[:140])
         out["advance_decline_ratio"] = None
     # 新高新低（em 端点可能缺失，设为 None 占位）
+    out["new_high_minus_new_low"] = None
+    return out
+
+
+def _fetch_legu_breadth(date_str: str) -> dict:
+    """legu 兜底源（W-B6，P1-13）：乐咕活跃度接口独立成档。
+
+    em 涨停/跌停股池挂时，legu 仍能给全市场 涨停/跌停/上涨/下跌 家数
+    （item/value 两列长表）。返回 dict 形状与 em 源一致；接口失败抛错走下档。
+    """
+    import akshare as ak
+    out = {"source": "legu"}
+    df = call_ak("legu", ak.stock_market_activity_legu)
+    if df is None or df.empty:
+        raise RuntimeError("legu activity 返回空")
+    kv = {str(r["item"]): r["value"] for _, r in df.iterrows()}
+    up, dn = kv.get("上涨"), kv.get("下跌")
+    zt, dt = kv.get("涨停"), kv.get("跌停")
+    if up is None or dn is None:
+        raise RuntimeError(f"legu activity 缺上涨/下跌行: {list(kv)[:6]}")
+    out["advance_decline_ratio"] = round(float(up) / float(dn), 4) if float(dn) > 0 else None
+    out["limit_up_count"] = int(float(zt)) if zt is not None else None
+    out["limit_down_count"] = int(float(dt)) if dt is not None else None
+    out["limit_up_seal_rate"] = None
     out["new_high_minus_new_low"] = None
     return out
 
@@ -113,10 +137,11 @@ def _fetch_tx_breadth(date_str: str, codes: list = None) -> dict:
     codes = codes or []
     if not codes:
         try:
+            # W-B6（P2 死代码清理）：原 `SELECT code FROM watchlist` if False else
+            # 残迹已删——watchlist 表不存在，唯一路径是 daily_bar 全表分组
             conn = get_conn()
             rows = conn.execute(
-                "SELECT code FROM watchlist").fetchall() if False else \
-                conn.execute("SELECT code FROM daily_bar GROUP BY code").fetchall()
+                "SELECT code FROM daily_bar GROUP BY code").fetchall()
             codes = [r[0] for r in rows][:200]
             conn.close()
         except Exception:
@@ -165,8 +190,11 @@ def _fetch_sina_breadth(date_str: str) -> dict:
         # 简化解析：抓 "涨停:" 与 "跌停:" 后面的数字
         m_zt = re.search(r"涨停[:：]\s*(\d+)", text)
         m_dt = re.search(r"跌停[:：]\s*(\d+)", text)
-        out["limit_up_count"] = int(m_zt.group(1)) if m_zt else 0
-        out["limit_down_count"] = int(m_dt.group(1)) if m_dt else 0
+        # W-B6（P1-13③）：解析失败即 raise——此前静默写 0 涨停，z-score 被假 0 污染
+        if not m_zt or not m_dt:
+            raise ValueError("sina 页面解析失败：未找到 涨停/跌停 数字")
+        out["limit_up_count"] = int(m_zt.group(1))
+        out["limit_down_count"] = int(m_dt.group(1))
         out["limit_up_seal_rate"] = None
         out["advance_decline_ratio"] = None
         out["new_high_minus_new_low"] = None
@@ -179,16 +207,19 @@ def _fetch_sina_breadth(date_str: str) -> dict:
 # ---------------------------------------------------------------- 主入口
 
 def _fetch_breadth(date_str: str = None, codes: list = None) -> dict:
-    """三档兜底：em → tx → sina。返回 dict（至少含 source）。
+    """四档兜底：em → legu → tx → sina。返回 dict（至少含 source）。
 
     源函数通过模块属性延迟查找（便于测试 monkey-patch 单档源）。
+    全部失败 → source=None 且 limit_up_count=None（W-B6：不再造 0 值假行，
+    调用方 fetch_breadth_daily 对 None 不落库）。
     """
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
     # 紧凑日期（akshare stock_zt_pool_em 用 YYYYMMDD）
     date_compact = date_str.replace("-", "")
     this = sys.modules[__name__]
-    for name in ("_fetch_em_breadth", "_fetch_tx_breadth", "_fetch_sina_breadth"):
+    for name in ("_fetch_em_breadth", "_fetch_legu_breadth", "_fetch_tx_breadth",
+                 "_fetch_sina_breadth"):
         try:
             if name == "_fetch_tx_breadth":
                 out = this._fetch_tx_breadth(date_compact, codes)
@@ -199,7 +230,7 @@ def _fetch_breadth(date_str: str = None, codes: list = None) -> dict:
                 return out
         except Exception as e:
             log.warning("fetch_breadth source=%s FAIL: %s", name, repr(e)[:140])
-    return {"source": None, "limit_up_count": 0, "limit_down_count": 0,
+    return {"source": None, "limit_up_count": None, "limit_down_count": None,
             "limit_up_seal_rate": None, "advance_decline_ratio": None,
             "new_high_minus_new_low": None}
 
@@ -304,8 +335,22 @@ def _count_new_high_low(conn: sqlite3.Connection, window: int = 60):
     return nh - nl
 
 
+def _premarket_empty_pool(date_str: str) -> bool:
+    """W-B6（P1-13②）盘前空池判定：目标日=今天且现在还没到 9:25（集合竞价
+    未出结果）——此时涨停池必为空，采集到的 0 是"还没开市"不是"没有涨停"。"""
+    if date_str != datetime.now().strftime("%Y-%m-%d"):
+        return False
+    now = datetime.now()
+    return (now.hour, now.minute) < (9, 25)
+
+
 def fetch_breadth_daily(date_str: str = None, conn: sqlite3.Connection = None) -> dict:
-    """采集 + 写 breadth_daily 表，返回 dict（带 source 与各指标）。"""
+    """采集 + 写 breadth_daily 表，返回 dict（带 source 与各指标）。
+
+    W-B6：两类情况不落库（防 0 值假行触发 z-score 崩塌误触极端避险档）——
+    1. 四档全失败（source=None / limit_up_count=None）；
+    2. 盘前空池：目标日=今天且 <9:25，涨停/跌停计数均为 0/None。
+    """
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
     own = conn is None
@@ -315,8 +360,13 @@ def fetch_breadth_daily(date_str: str = None, conn: sqlite3.Connection = None) -
         c = get_conn()
     try:
         out = _fetch_breadth(date_str)
-        if out.get("source") is None:
-            log.warning("fetch_breadth_daily: 三档全失败")
+        if out.get("source") is None or out.get("limit_up_count") is None:
+            log.warning("fetch_breadth_daily: 四档全失败，不落库（防 0 值假行）")
+            return out
+        if (_premarket_empty_pool(date_str)
+                and not out.get("limit_up_count") and not out.get("limit_down_count")):
+            log.warning("fetch_breadth_daily: 盘前空池（%s <9:25 且计数全 0），不落 0 值行",
+                        date_str)
             return out
         # new_high_minus_new_low：daily_bar 全表扫（源无关，Fix-1）
         try:

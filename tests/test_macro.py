@@ -238,8 +238,8 @@ def test_macro_main_calls_two_fetchers():
 
 @test
 def test_premarket_refresh_bond_etf_calls_both_and_never_raises():
-    """Fix-2 步骤 3.5：premarket.refresh_bond_etf 依次调用两个 fetcher，
-    单路失败不抛（pipeline 降级继续）。"""
+    """Fix-2 步骤 3.5 → W-B7 更新：premarket.refresh_bond_etf 只调国债 fetcher
+    （ETF 份额源不存在已显式摘除），失败不抛（pipeline 降级继续）。"""
     from pipeline import premarket
     called = []
     orig_by, orig_es = macro.fetch_bond_yield, macro.fetch_etf_share
@@ -247,14 +247,12 @@ def test_premarket_refresh_bond_etf_calls_both_and_never_raises():
         macro.fetch_bond_yield = lambda *a, **kw: called.append("bond")
         macro.fetch_etf_share = lambda *a, **kw: called.append("etf")
         premarket.refresh_bond_etf()
-        assert called == ["bond", "etf"]
-        # 单路失败不阻断另一路
+        assert called == ["bond"], "W-B7 后步骤3.5不应再调 fetch_etf_share: %s" % called
+        # 失败不抛
         def _boom(*a, **kw):
             raise ConnectionError("接口冷却")
         macro.fetch_bond_yield = _boom
-        called.clear()
         premarket.refresh_bond_etf()
-        assert called == ["etf"]
     finally:
         macro.fetch_bond_yield = orig_by
         macro.fetch_etf_share = orig_es

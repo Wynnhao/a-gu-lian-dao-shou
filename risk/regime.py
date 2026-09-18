@@ -214,19 +214,17 @@ def compute_regime(conn, root: Optional[dict] = None) -> dict:
     except Exception as e:  # noqa: BLE001
         detail["bond_yield_error"] = repr(e)[:120]
 
-    # ---- Sprint 2 任务 1（P1-3）/ Fix-2：ETF 份额档位（只出方向，末尾 override）----
-    etf_signal = {"direction": None, "pct": None}
-    try:
-        etf_signal = _compute_etf_tier_shift(conn, etf_cfg)
-        detail["etf_share"] = {
-            "direction": etf_signal.get("direction"),
-            "pct": etf_signal.get("pct"),
-            "signal": ("ETF 份额单日 %+.2f%% → %s 档信号"
-                       % (etf_signal["pct"], etf_signal["direction"])
-                       if etf_signal.get("direction") else "无异动，不调整"),
-        }
-    except Exception as e:  # noqa: BLE001
-        detail["etf_share_error"] = repr(e)[:120]
+    # ---- Sprint 2 任务 1（P1-3）/ Fix-2 → W-B7 显式 no-op ----
+    # ETF 份额档位信号停用（Sprint4 W-B7，P1-14）：akshare 无任何含「份额/规模」
+    # 列的 ETF 接口（fund_etf_fund_info_em 给净值、fund_etf_fund_daily_em 给
+    # 净值/市价/折价率，2026-09-19 实测均无份额列）→ index_etf_share 恒空表，
+    # 此前的"读最近一行 pct_chg_1d"是永不命中的假兜底，其升降档 override 更是
+    # 死代码。数据源出现后再恢复（届时改接真实份额源并回填）。
+    detail["etf_share"] = {
+        "direction": None,
+        "pct": None,
+        "signal": "显式 no-op：ETF 份额数据源不存在（W-B7），档位信号停用",
+    }
 
     # ---- Sprint 2 任务 3（P1-1）：市场宽度熔断（composite < -2 → cap 0.1）----
     try:
@@ -243,30 +241,8 @@ def compute_regime(conn, root: Optional[dict] = None) -> dict:
     if caps:
         cap_final = round(min(caps), 4)
         detail["cap"] = cap_final
-        # Fix-2 min-after override：ETF 档位信号在 min(caps) 之后施加——
-        # up（底部信号）是唯一允许"往上提"的路径（避险升半配）；
-        # down（顶部信号）把满配压到半配。
-        try:
-            if etf_signal.get("direction") == "up":
-                after = max(cap_final, float(cfg["cap_half"]))
-                detail["etf_share"]["cap_before"], detail["etf_share"]["cap_after"] = \
-                    cap_final, round(after, 4)
-                cap_final = round(after, 4)
-                detail["cap"] = cap_final
-                detail["etf_share"]["signal"] = (
-                    "ETF 底部信号 → cap 升档 %.2f→%.2f" %
-                    (detail["etf_share"]["cap_before"], cap_final))
-            elif etf_signal.get("direction") == "down":
-                after = min(cap_final, float(cfg["cap_half"]))
-                detail["etf_share"]["cap_before"], detail["etf_share"]["cap_after"] = \
-                    cap_final, round(after, 4)
-                cap_final = round(after, 4)
-                detail["cap"] = cap_final
-                detail["etf_share"]["signal"] = (
-                    "ETF 顶部信号 → cap 降档 %.2f→%.2f" %
-                    (detail["etf_share"]["cap_before"], cap_final))
-        except Exception as e:  # noqa: BLE001
-            detail["etf_share_error"] = repr(e)[:120]
+        # W-B7：原 Fix-2 "ETF 升/降档 min-after override" 已随数据源下线一并删除
+        # （direction 恒 None，该分支是永不执行的死代码）。
         # 档位名统一按最终 cap 归档（RSRS 半配 × 二八避险 → 取最保守的避险档）
         if cap_final >= static_cap * 0.999:
             detail["tier"] = "满配"
@@ -390,30 +366,12 @@ def _compute_bond_yield_modifier(conn, bond_cfg: dict) -> float:
 
 
 def _compute_etf_tier_shift(conn, etf_cfg: dict) -> dict:
-    """读 index_etf_share 最近一行 pct_chg_1d（取 510300 沪深300ETF 作主信号）：
+    """W-B7（Sprint4，P1-14）显式 no-op：恒返回 direction=None。
 
-    返回 {"direction": "up"|"down"|None, "pct": float|None}（Fix-2：只出方向信号，
-    cap 调整移到 compute_regime 的 min(caps) 之后做 min-after override——
-    升档是唯一允许"往上提"的路径，放 caps 里会被 min() 覆盖成死代码）：
-
-    - pct > up_pct_threshold（默认 +2%）→ direction="up"（底部信号：避险档升半配）
-    - pct < down_pct_threshold（默认 -2%）→ direction="down"（顶部信号：满配档降半配）
-    - 否则/数据缺失 → direction=None
+    设计依据：akshare 无含「份额/规模」列的 ETF 接口（fund_etf_fund_info_em /
+    fund_etf_fund_daily_em 实测均无份额列）→ index_etf_share 恒空表，原
+    "读最近一行 pct_chg_1d 出升/降档方向"是假兜底。保留函数签名供调用方/
+    测试兼容，真实份额源出现后再恢复实现。
     """
-    up_th = float(etf_cfg.get("up_pct_threshold", 2.0))
-    down_th = float(etf_cfg.get("down_pct_threshold", -2.0))
-    try:
-        row = conn.execute(
-            "SELECT pct_chg_1d FROM index_etf_share"
-            " WHERE etf_code='510300'"
-            " ORDER BY trade_date DESC LIMIT 1").fetchone()
-        if not row or row[0] is None:
-            return {"direction": None, "pct": None}
-        pct = float(row[0])
-        if pct > up_th:
-            return {"direction": "up", "pct": pct}
-        if pct < down_th:
-            return {"direction": "down", "pct": pct}
-        return {"direction": None, "pct": pct}
-    except Exception:
-        return {"direction": None, "pct": None}
+    return {"direction": None, "pct": None,
+            "reason": "ETF 份额数据源不存在（W-B7 显式 no-op）"}

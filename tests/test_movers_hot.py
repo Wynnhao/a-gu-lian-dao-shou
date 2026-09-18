@@ -93,13 +93,14 @@ def test_movers_volume_spike_and_gain():
 def test_movers_new_low_and_crash():
     conn = _mem()
     # 5日连跌共 -15% → 急跌；且跌破前60日低点 → 新低
+    # （W-B5 后自选池口径只出 core 票，样本票改用 600519）
     conn2 = _mem()
     from datetime import date, timedelta
     d0 = date(2026, 5, 1)
     rows = []
     close = 100.0
     for i in range(70):
-        rows.append(("000001", (d0 + timedelta(days=i)).isoformat(),
+        rows.append(("600519", (d0 + timedelta(days=i)).isoformat(),
                      close * 0.999, close * 1.01, close * 0.99, close, 1000, 1e6, 0.0, 1.0))
         close *= 0.995
     # 最后5天急跌
@@ -111,13 +112,63 @@ def test_movers_new_low_and_crash():
                       " volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
                       rows)
     conn2.execute("INSERT INTO stock_info VALUES (?,?,?,?)",
-                  ("000001", "平安银行", d0.isoformat(), "x"))
-    hits = [r for r in mv.compute_watchlist_movers(conn2) if r["code"] == "000001"]
+                  ("600519", "贵州茅台", d0.isoformat(), "x"))
+    hits = [r for r in mv.compute_watchlist_movers(conn2) if r["code"] == "600519"]
     assert hits, "急跌应命中"
     text = ";".join(hits[0]["reason"])
     assert "5日" in text and ("新低" in text or "急跌" in text), hits[0]["reason"]
     conn.close()
     conn2.close()
+
+
+@test
+def test_movers_watchlist_filter_excludes_non_core():
+    """W-B5（P1-12）：自选池口径只出 watchlist_core 票——池外票（000001 不在
+    config.watchlist_core）即使触发五规则也不入池，不再全库 816 票扫池。"""
+    conn = _mem()
+    from datetime import date, timedelta
+    d0 = date(2026, 5, 1)
+    rows = []
+    close = 100.0
+    for i in range(70):
+        rows.append(("000001", (d0 + timedelta(days=i)).isoformat(),
+                     close * 0.999, close * 1.01, close * 0.99, close, 1000, 1e6, 0.0, 1.0))
+        close *= 0.995
+    for j, p in enumerate([-3.0, -3.0, -3.0, -3.0, -3.0]):
+        code, td, o, h, l, c, v, a, _, t = rows[-5 + j]
+        c2 = rows[-6 + j][5] * (1 + p / 100)
+        rows[-5 + j] = (code, td, c2 * 0.999, c2 * 1.005, c2 * 0.985, c2, 2000, a, p, t)
+    conn.executemany("INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
+                     " volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     rows)
+    conn.execute("INSERT INTO stock_info VALUES (?,?,?,?)",
+                 ("000001", "平安银行", d0.isoformat(), "x"))
+    conn.commit()
+    out = mv.compute_watchlist_movers(conn)
+    assert not out, "池外票不应进自选池异动: %s" % out
+    conn.close()
+
+
+@test
+def test_hot_stock_watchlist_filter_excludes_non_core():
+    """W-B5（P1-12）：热门个股只出 watchlist_core 票。000001 有新闻突增但池外 →
+    不入池；对照 600519（池内）同量新闻可入。"""
+    conn = _mem()
+    now = datetime.now()
+    from datetime import timedelta
+    for code in ("000001", "600519"):
+        conn.execute("INSERT INTO stock_info VALUES (?,?,?,?)",
+                     (code, "X", "x", "x"))
+        for i in range(3):
+            ts = (now - timedelta(hours=2 + i)).strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute("INSERT INTO news (code,title,content,source,url,published_at,fetched_at)"
+                         " VALUES (?,?,'','t','',?,'x')", (code, "新闻%d" % i, ts))
+    conn.commit()
+    out = hot.compute_hot_stocks(conn)
+    codes = {s["code"] for s in out}
+    assert "000001" not in codes, "池外票不应进热门个股: %s" % codes
+    assert "600519" in codes, "池内票应正常入池: %s" % codes
+    conn.close()
 
 
 @test

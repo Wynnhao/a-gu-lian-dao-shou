@@ -476,6 +476,25 @@ def _market_data_window(now=None) -> bool:
     return 915 <= hm <= 1505
 
 
+def _before_morning_open(now=None) -> bool:
+    """W-B9（P2-10）：交易日 9:15 前的早盘时段（当日 bar 尚未生成）。
+
+    此时增量窗口若包含"今天"，双源必然返回空 → 误报 empty_today
+    （09-16/17 实测 164/86 条）。与 _market_data_window 一样按 end 截到昨日处理。
+    """
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return False
+    hm = now.hour * 100 + now.minute
+    return hm < 915
+
+
+# W-B9（P2-11）：本次运行内已写 empty_today 的 {code: run_at}——run() 落 fetch_log
+# "ok" 行前检查，rows=0 且已写 empty_today 时不再补一条矛盾的 ok 行
+# （09-18 实测同一时刻 344 条 empty_today + 344 条 ok 并存）。
+_EMPTY_TODAY_WRITTEN: dict = {}
+
+
 def fetch_daily(code: str, conn: sqlite3.Connection) -> int:
     """增量拉取单只股票日K（东财优先，腾讯兜底），返回新增行数。"""
     last = repo.latest_bar_date(conn, code)
@@ -485,7 +504,9 @@ def fetch_daily(code: str, conn: sqlite3.Connection) -> int:
     end = date.today().strftime("%Y%m%d")
     # 采集保护窗内东财会返回当日未走完的部分 bar，且增量机制（start=last+1）
     # 导致该半根 bar 永不被重取覆盖——窗口内一律截到昨日。
-    if _market_data_window():
+    # W-B9（P2-10）：交易日 9:15 前同理——当日 bar 还没生成，窗口含"今天"必空，
+    # 会把正常早盘拉取误报成 empty_today。
+    if _market_data_window() or _before_morning_open():
         end = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
     # 今日 bar 是否真的缺失：已入库时增量起点 last+1 > end，双源返回空是正常
     # 幂等重跑，不能当"全源失败"误报（2026-09-15 重跑实测误写 empty_today）。
@@ -512,10 +533,11 @@ def fetch_daily(code: str, conn: sqlite3.Connection) -> int:
         if end == today_str.replace("-", "") and today_missing:
             log.error("今日日线全源失败: %s end=%s — daily_bar 不会更新，盯市/决策将沿用昨日",
                       code, end)
+            _EMPTY_TODAY_WRITTEN[code] = datetime.now().isoformat(timespec="seconds")
             try:
                 conn.execute(
                     "INSERT INTO fetch_log VALUES (?,?,?,?,?)",
-                    (code, datetime.now().isoformat(timespec="seconds"),
+                    (code, _EMPTY_TODAY_WRITTEN[code],
                      "empty_today", 0, "em+tx both empty"))
             except Exception as e:  # noqa: BLE001
                 log.warning("fetch_log empty_today 写盘失败: %s", repr(e)[:120])
@@ -552,12 +574,133 @@ def fetch_daily(code: str, conn: sqlite3.Connection) -> int:
     return len(rows)
 
 
+def recalc_tx_pct(conn: sqlite3.Connection, code: Optional[str] = None,
+                  tol_pp: float = 0.1) -> tuple:
+    """W-B3（P1-10）：tx 源 pct_chg 除权修复——除权跳变日行 pct 用 qfq 环比。
+
+    腾讯源 pct 由不复权 close 逐行差分（fetch_daily 首选 em 官方涨跌幅列，
+    tx 兜底行在除权日呈假暴跌/假暴涨，000001 2024-06-14 存 -5.74% 实为 qfq
+    口径 +1.13%）。前复权环比≈官方除息口径，qfq 在手时按它重算。
+
+    扫描范围：source='tx' 及 source IS NULL（source 列上线前的老行——生产实测
+    000001 的 tx 时代行 source 全为 NULL，同样带除权假跌签名；签名门槛保证
+    em 官方口径行不被误改）。
+
+    检测口径（计划 W-B3）：d(t)=close−close_qfq 跳变日（|Δd|>0.01，即除权
+    事件）且 |现存 pct − qfq 环比| > tol_pp 才重算。**不能**只看背离：tx 加法型
+    复权下，除权段内的正常日 qfq 环比与 raw 环比天然不同（低价高 adj 票可达
+    数 pp），全量按 qfq 环比重写会污染正常行——实测全库仅 ~7k 行是真除权错行。
+
+    - 行自身或其前一行无 close_qfq → 跳过并计数（调用方汇报）；
+    - code=None 时扫全表（存量重算 / audit --fix），指定 code 时只处理该票
+      （backfill_qfq 每次增量后调用，"未来行有 qfq 即用 qfq 环比"的落地路径）。
+
+    返回 (fixed, skipped_no_qfq)。不 commit（事务归属调用方）。
+    """
+    where, args = ("WHERE code=? AND (source='tx' OR source IS NULL)", (str(code),)) if code \
+        else ("WHERE source='tx' OR source IS NULL", ())
+    rows = conn.execute(
+        f"SELECT code, trade_date, pct_chg, close, close_qfq FROM daily_bar {where} "
+        "ORDER BY code, trade_date", args).fetchall()
+    fixed = skipped = 0
+    prev = {}
+    updates = []
+    for cd, td, pct, c, cq in rows:
+        pc, pcq = prev.get(cd, (None, None))
+        prev[cd] = (c, cq)
+        if cq is None or pcq is None or pct is None or c is None or pc is None:
+            skipped += 1
+            continue
+        d_jump = abs((c - cq) - (pc - pcq))
+        qfq_pct = (float(cq) / float(pcq) - 1.0) * 100.0
+        if d_jump > 0.01 and abs(float(pct) - qfq_pct) > tol_pp:
+            updates.append((round(qfq_pct, 4), cd, td))
+    if updates:
+        conn.executemany(
+            "UPDATE daily_bar SET pct_chg=? WHERE code=? AND trade_date=?",
+            updates)
+        fixed = len(updates)
+        log.info("tx pct 重算（除权跳变日 qfq 环比口径）: %d 行%s", fixed,
+                 f"（code={code}）" if code else "")
+    return fixed, skipped
+
+
+def rebrush_qfq_full(code: str, conn: sqlite3.Connection) -> tuple:
+    """W-B4（P1-11）：单票 qfq 全史整段重刷（close_qfq/high_qfq/low_qfq）。
+
+    - 整段单源：em_qfq 优先（只给收盘，high/low_qfq 按 close 比例同行导出），
+      失败整票换 tx_qfq（自带前复权 OHLC）——一票之内绝不混源；
+    - 覆盖范围 = 该票 daily_bar 全史（MIN(trade_date) 起），qfq 全历史重锚后
+      与 raw 行按日期对齐 UPDATE，fetch_log 留源标记（status='qfq_full_rebrush'）；
+    - 返回 (rows_written, source)；两源全挂返回 (0, "")，由调用方重试/汇报。
+    """
+    row = conn.execute(
+        "SELECT MIN(trade_date), MAX(trade_date) FROM daily_bar WHERE code=?",
+        (code,)).fetchone()
+    if not row or not row[0]:
+        return 0, ""
+    start8 = str(row[0]).replace("-", "")
+    end8 = date.today().strftime("%Y%m%d")
+    if _market_data_window():
+        end8 = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
+    df, src = None, ""
+    for src_name, fn in (("em_qfq", _hist_em_qfq), ("tx_qfq", _hist_tx_qfq)):
+        try:
+            got = fn(code, start8, end8)
+        except Exception as e:  # noqa: BLE001
+            log.info("%s qfq 全史 via %s fail: %s", code, src_name, repr(e)[:80])
+            continue
+        if got is not None and not got.empty:
+            df, src = got, src_name
+            break
+    if df is None or df.empty:
+        log.error("%s qfq 全史重刷：两源均不可用", code)
+        return 0, ""
+    raw = {d: (h, l, c) for d, h, l, c in conn.execute(
+        "SELECT trade_date, high, low, close FROM daily_bar WHERE code=?", (code,))}
+    rows = []
+    for _, r in df.iterrows():
+        d = r["date"].strftime("%Y-%m-%d")
+        cq = r["close_qfq"]
+        if pd.isna(cq) or d not in raw:
+            continue
+        hq = r.get("high_qfq") if "high_qfq" in df.columns else None
+        lq = r.get("low_qfq") if "low_qfq" in df.columns else None
+        rh, rl, rc = raw[d]
+        if (hq is None or pd.isna(hq)) and rc and rh is not None and not pd.isna(rh):
+            hq = float(rh) * float(cq) / float(rc)
+        if (lq is None or pd.isna(lq)) and rc and rl is not None and not pd.isna(rl):
+            lq = float(rl) * float(cq) / float(rc)
+        rows.append((round(float(cq), 4),
+                     round(float(hq), 4) if hq is not None and not pd.isna(hq) else None,
+                     round(float(lq), 4) if lq is not None and not pd.isna(lq) else None,
+                     code, d))
+    if not rows:
+        return 0, ""
+    conn.executemany(
+        "UPDATE daily_bar SET close_qfq=?, high_qfq=?, low_qfq=? "
+        "WHERE code=? AND trade_date=?", rows)
+    conn.execute(
+        "INSERT INTO fetch_log VALUES (?,?,?,?,?)",
+        (code, datetime.now().isoformat(timespec="seconds"),
+         "qfq_full_rebrush", len(rows), f"source={src}"))
+    conn.commit()
+    log.info("%s qfq 全史重刷 via %s: %d rows", code, src, len(rows))
+    return len(rows), src
+
+
 def backfill_qfq(code: str, conn: sqlite3.Connection) -> int:
     """回填前复权 OHLC 列（close_qfq/high_qfq/low_qfq；除权除息不再污染动量/均线/ATR）。
 
     东财 em_qfq 优先（仅收盘，high/low_qfq 由 close_qfq/close 比例同行导出），
     腾讯 tx_qfq 兜底（自带前复权 OHLC）。失败静默跳过：因子层自动回退不复权
     close，audit 会提示补跑。
+
+    W-B4（P1-11）：7 天增量窗的结构缺陷——前复权全历史重锚，只回刷 7 天会在
+    除权事件后留下永久伪跳变。修复：写窗前先比对重叠行的库内 qfq 与新拉 qfq，
+    锚点漂移（某行差 > max(0.01, 0.1%)）即判定发生除权重锚 → 该票自动全史重刷；
+    写窗后再对窗边界做一次库内不变量校验（qfq 环比深于 raw 环比 >0.3pp 非法）
+    兜底，命中同样触发全史重刷。
     """
     last_qfq = repo.latest_bar_date(conn, code, qfq_only=True)
     start = START_DATE
@@ -578,6 +721,30 @@ def backfill_qfq(code: str, conn: sqlite3.Connection) -> int:
             df, src = got, src_name
             break
     if df is None or df.empty:
+        return 0
+
+    # 锚点漂移检测：重叠行（库内已有 qfq 且本次也拉到）比值不一致 → 源端重锚
+    stored_qfq = {d: cq for d, cq in conn.execute(
+        "SELECT trade_date, close_qfq FROM daily_bar WHERE code=? "
+        "AND close_qfq IS NOT NULL", (code,))}
+    drifted = False
+    for _, r in df.iterrows():
+        d = r["date"].strftime("%Y-%m-%d")
+        cq = r["close_qfq"]
+        if pd.isna(cq) or d not in stored_qfq:
+            continue
+        old = float(stored_qfq[d])
+        if old > 0 and abs(float(cq) - old) > max(0.01, old * 0.001):
+            drifted = True
+            break
+    if drifted:
+        log.warning("%s qfq 锚点漂移（增量窗内除权重锚），转全史重刷", code)
+        n, real_src = rebrush_qfq_full(code, conn)
+        if n:
+            recalc_tx_pct(conn, code=code)
+            conn.commit()
+            return n
+        log.error("%s 全史重刷失败（两源不可用），本次增量放弃写入（防伪跳变入库）", code)
         return 0
 
     raw = {d: (h, l, c) for d, h, l, c in conn.execute(
@@ -605,9 +772,52 @@ def backfill_qfq(code: str, conn: sqlite3.Connection) -> int:
     conn.executemany(
         "UPDATE daily_bar SET close_qfq=?, high_qfq=?, low_qfq=? "
         "WHERE code=? AND trade_date=?", rows)
+    # 窗边界不变量校验：任一相邻对 qfq 环比深于 raw 环比 >0.3pp → 伪跳变，全史重刷
+    # （含窗前一日：伪跳变恰出现在"旧锚末行 → 新锚首行"的边界对上）
+    got_dates = [r[0] for r in conn.execute(
+        "SELECT trade_date FROM daily_bar WHERE code=? AND close_qfq IS NOT NULL "
+        "AND trade_date >= ? ORDER BY trade_date", (code, start))]
+    edge = conn.execute(
+        "SELECT MAX(trade_date) FROM daily_bar WHERE code=? AND trade_date < ? "
+        "AND close_qfq IS NOT NULL", (code, start)).fetchone()[0]
+    if _qfq_invariant_violated(conn, code, ([edge] if edge else []) + got_dates):
+        log.warning("%s 增量窗边界伪跳变（qfq 环比深于 raw >0.3pp），转全史重刷", code)
+        n, real_src = rebrush_qfq_full(code, conn)
+        if n:
+            recalc_tx_pct(conn, code=code)
+            conn.commit()
+            return n
+    recalc_tx_pct(conn, code=code)
     conn.commit()
     log.info("%s qfq via %s: %d rows", code, src, len(rows))
     return len(rows)
+
+
+def _qfq_invariant_violated(conn: sqlite3.Connection, code: str,
+                            dates: list, pp: float = 0.3) -> bool:
+    """库内不变量（源无关）：同一票相邻交易日，qfq 环比跌幅深于 raw 环比 >pp 个
+    百分点 → 前复权序列非法（除权重锚不完整）。dates 为升序待检日期集
+    （含窗边界各取前一日）。"""
+    if len(dates) < 2:
+        return False
+    ph = ",".join("?" * len(dates))
+    rows = conn.execute(
+        f"SELECT trade_date, close, close_qfq FROM daily_bar "
+        f"WHERE code=? AND trade_date IN ({ph}) ORDER BY trade_date",
+        (code, *dates)).fetchall()
+    by_d = {d: (c, cq) for d, c, cq in rows}
+    ds = sorted(by_d)
+    for i in range(1, len(ds)):
+        prev_d, d = ds[i - 1], ds[i]
+        pc, pcq = by_d[prev_d]
+        c, cq = by_d[d]
+        if None in (pc, pcq, c, cq) or pc <= 0 or pcq <= 0:
+            continue
+        raw_ret = float(c) / float(pc) - 1.0
+        qfq_ret = float(cq) / float(pcq) - 1.0
+        if qfq_ret < raw_ret - pp / 100.0:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------- 指数日线
@@ -739,9 +949,11 @@ def run():
         try:
             n = fetch_daily(code, conn)
             upsert_info(item, conn)
-            conn.execute("INSERT INTO fetch_log VALUES (?,?,?,?,?)",
-                         (code, datetime.now().isoformat(timespec="seconds"),
-                          "ok", n, ""))
+            # W-B9（P2-11）：rows=0 且本轮已写 empty_today → 不再补矛盾的 ok 行
+            if not (n == 0 and code in _EMPTY_TODAY_WRITTEN):
+                conn.execute("INSERT INTO fetch_log VALUES (?,?,?,?,?)",
+                             (code, datetime.now().isoformat(timespec="seconds"),
+                              "ok", n, ""))
             log.info("%s %s: +%d rows", code, item["name"], n)
         except Exception as e:
             conn.execute("INSERT INTO fetch_log VALUES (?,?,?,?,?)",

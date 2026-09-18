@@ -57,7 +57,12 @@ def _limit_band(code: str) -> float:
 
 def compute_watchlist_movers(conn: sqlite3.Connection,
                              as_of: Optional[str] = None) -> List[dict]:
-    """日线口径五类异动规则，作用于自选池（含黑名单票——展示但标注 blacklist）。"""
+    """日线口径五类异动规则，作用于自选池（watchlist_core，含黑名单票——展示但标注 blacklist）。
+
+    W-B5（Sprint4，P1-12）：循环内按可交易池过滤——此前 `wl` 只作展示标记
+    （in_watchlist），实扫 daily_bar 全库 816 票，09-14 mode='watchlist' 20 行仅
+    3 只在 core：不可交易票被当"自选池异动"注入 LLM 上下文。
+    """
     c = _cfg()
     wl = set(_wl_codes())
     try:
@@ -73,6 +78,8 @@ def compute_watchlist_movers(conn: sqlite3.Connection,
     for code, td in latest_map.items():
         if td != as_of:
             continue  # 只看最新交易日有数据的票
+        if code not in wl:
+            continue  # W-B5（P1-12）：自选池口径只出池内票（in_watchlist 标记恒 True）
         hist = conn.execute(
             "SELECT trade_date, close, high, low, volume, pct_chg, close_qfq FROM daily_bar "
             "WHERE code=? ORDER BY trade_date DESC LIMIT 61", (code,)).fetchall()

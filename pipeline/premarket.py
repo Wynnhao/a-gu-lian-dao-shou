@@ -8,6 +8,7 @@ if str(BASE) not in sys.path:
 import argparse
 import logging
 import logging.handlers
+import os
 from datetime import date, datetime
 
 from data import fetcher, news
@@ -64,20 +65,18 @@ def check_watchdog(conn) -> list:
 
 
 def refresh_bond_etf() -> None:
-    """步骤 3.5：10Y 国债收益率 + ETF 份额刷新（Fix-2 pipeline 接入）。
+    """步骤 3.5：10Y 国债收益率刷新（Fix-2 pipeline 接入）。
 
-    regime.compute_regime 消费这两张表；任一失败只 warning 继续，不阻断盘前。
+    W-B7（Sprint4，P1-14）：ETF 份额刷新已摘除——akshare 无含份额列的接口
+    （实测 fund_etf_fund_info_em / fund_etf_fund_daily_em 均无），fetch_etf_share
+    在生产恒为空转；regime 的 ETF 档位信号已显式 no-op。任一失败只 warning
+    继续，不阻断盘前。
     """
     try:
         macro_mod.fetch_bond_yield()
         log.info("步骤3.5 fetch_bond_yield 完成")
     except Exception as e:
         log.error("步骤3.5 fetch_bond_yield FAIL（继续）: %s", repr(e))
-    try:
-        macro_mod.fetch_etf_share()
-        log.info("步骤3.5 fetch_etf_share 完成")
-    except Exception as e:
-        log.error("步骤3.5 fetch_etf_share FAIL（继续）: %s", repr(e))
 
 
 def main(argv=None) -> int:
@@ -109,6 +108,17 @@ def main(argv=None) -> int:
 
     conn = fetcher.get_conn()
     try:
+        # 1.2 指数日线刷新（W-B2 / P1-9：ensure_index_daily 此前全仓零调用方，
+        # index_daily 无任何自动刷新链路 → 000905 停在 09-15、日报基准恒错日。
+        # 逐码接入，失败仅告警不阻断盘前；AGSICKLE_DISABLE_FETCHER=1 同门短路）
+        if os.environ.get("AGSICKLE_DISABLE_FETCHER") != "1":
+            try:
+                for _code in macro_mod.INDEX_CODES:
+                    n_idx = fetcher.ensure_index_daily(conn, _code)
+                    log.info("步骤1.2 ensure_index_daily %s: +%s 行", _code, n_idx)
+            except Exception as e:  # noqa: BLE001
+                log.error("步骤1.2 指数日线刷新 FAIL（继续）: %s", repr(e))
+
         latest = conn.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()[0]
         if not latest:
             msg = "行情全失败：daily_bar 无任何数据，放弃盘前流程"

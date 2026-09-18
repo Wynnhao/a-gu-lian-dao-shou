@@ -257,13 +257,18 @@ def _factor_from_bars(bars: pd.DataFrame, code: str,
     atr_pct = (a / denom) if (a is not None and denom and denom > 0) else None
     turn20 = _f(to.iloc[-TURN20_WINDOW:].mean()) if to.notna().any() else None
 
+    # W-B4①（Sprint4，P2-1）：above_ma60 与 ma60 同口径——ma60 由前复权 close
+    # 计算，现价也必须用前复权收盘比较（raw 现价 vs qfq 均线在除权票上恒错）
+    _last_factor_close = _f(close.iloc[-1])
+
     signals = {
         "ma_trend": trend,
         "ma5": _f(ma5), "ma20": _f(ma20), "ma60": _f(ma60),
         "rsi_14": _f(r), "atr_14": _f(a), "atr_pct": _f(atr_pct),
         "mom_20d": _f(m), "mom_5d": _f(m5), "turnover_pct": _f(tp),
         "turn20": turn20,
-        "above_ma60": bool(_f(ma60) is not None and last_close > _f(ma60)),
+        "above_ma60": bool(_f(ma60) is not None and _last_factor_close is not None
+                           and _last_factor_close > _f(ma60)),
         "close": _f(last_close), "pct_chg": _f(last["pct_chg"]),
         "adj_close": _f(close.iloc[-1]),
     }
@@ -552,9 +557,10 @@ def _crowding_next_state(prev: dict, mu: Optional[float], sigma: Optional[float]
 
 
 def _record_crowding_state_event(conn: sqlite3.Connection, from_state: str,
-                                 to_state: str, mu: Optional[float]) -> None:
+                                 to_state: str, mu: Optional[float],
+                                 note: str = "") -> None:
     """state 迁移写 risk_event（rule='factor_crowding_state'，同日同迁移去重）。
-    失败仅 warning（不阻断信号计算）。"""
+    note：附加说明（如 W-B1 数据修复中间态标注）。失败仅 warning（不阻断信号计算）。"""
     try:
         today = datetime.now().strftime("%Y-%m-%d")
         n = conn.execute(
@@ -564,21 +570,31 @@ def _record_crowding_state_event(conn: sqlite3.Connection, from_state: str,
         if n > 0:
             return
         from risk.engine import record_event
-        record_event(conn, "factor_crowding_state",
-                     f"因子拥挤 state 迁移 {from_state}→{to_state}"
-                     f"（mu60={mu}）")
+        detail = (f"因子拥挤 state 迁移 {from_state}→{to_state}"
+                  f"（mu60={mu}）")
+        if note:
+            detail += f"；{note}"
+        record_event(conn, "factor_crowding_state", detail)
         log.info("因子拥挤 state 迁移留痕: %s→%s", from_state, to_state)
     except Exception as e:  # noqa: BLE001
         log.warning("factor_crowding_state 写 risk_event 失败（不阻断）: %s",
                     repr(e))
 
 
-def _write_factor_crowding(conn: sqlite3.Connection) -> dict:
+def _write_factor_crowding(conn: sqlite3.Connection, event_note: str = "") -> dict:
     """从 signal 表 + daily_bar 算 score 近 12 个月滚动 IC，维护 factor_crowding.json。
 
     Fix-3 滞回状态机：json 维护 state（active/cooling/off）+ active_since +
     cooling_count；crowded = state in ("active","cooling")（规则 20 兼容字段）。
     计算不可用（样本不足等）时保留旧 state——熔断不因一次计算失败而意外解除。
+
+    W-B1（Sprint4，P0-2）：IC 样本按当前 profile 过滤（兼容 NULL profile 旧行）——
+    momentum（时序分，高=赢家）与 reversal（截面分，高=输家）构造上负相关，
+    混 profile 截面 RankIC 是无效统计量（生产曾以 state=active 驱动规则 20）。
+    已知局限：RankIC 仍为全样本池化口径（P2-15，另行排期）。
+
+    event_note：非空时写进 state 迁移 risk_event 的 detail（W-B1 重算的
+    "数据修复中间态" 标注）。
 
     风控规则 20 (rule_factor_crowding) 在 buy 端读 crowded 字段，目标权重 > 5%
     自动压回；权重降级（_score_cross_section）只在 state == "active" 时启用。
@@ -601,15 +617,20 @@ def _write_factor_crowding(conn: sqlite3.Connection) -> dict:
                 mu: Optional[float] = None) -> None:
         out["crowded"] = out["state"] in ("active", "cooling")
         if state_change and from_state is not None and conn is not None:
-            _record_crowding_state_event(conn, from_state, out["state"], mu)
+            _record_crowding_state_event(conn, from_state, out["state"], mu,
+                                         note=event_note)
         _persist_factor_crowding(out)
 
     try:
+        # W-B1：只取当前 profile 的分（profile IS NULL 兼容迁移前旧行，
+        # 写法与 review/signal_eval.py:_signal_frame 同款）
+        cur_prof = profile()
         rows = conn.execute(
             "SELECT code, as_of, score FROM signal WHERE score IS NOT NULL"
-        ).fetchall()
+            " AND (profile = ? OR profile IS NULL)", (cur_prof,)).fetchall()
         if not rows:
-            out["reason"] = "signal 表为空（保留旧 state）"
+            out["reason"] = (f"signal 表为空或无 profile={cur_prof} 行"
+                             "（保留旧 state）")
             _finish()
             return out
         sig = pd.DataFrame(rows, columns=["code", "as_of", "score"])

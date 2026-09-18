@@ -147,13 +147,17 @@ def test_fetch_breadth_daily_em_source_writes_table():
 
 @test
 def test_fetch_breadth_daily_three_sources_all_fail():
-    """em + sina 都抛错；tx 拿不到行情（mock 空）；最终 0 数据落库。"""
+    """em + legu + sina 都抛错；tx 拿不到行情（mock 空）；最终不落数据。"""
     conn = _mem_conn()
     try:
         from data import fetcher as fetcher_mod
         orig = fetcher_mod.call_ak
         fetcher_mod.call_ak = lambda source, fn, *a, **kw: (_ for _ in ()).throw(
             ConnectionError("em 冷却"))
+        # W-B6：legu 兜底档走 breadth 模块全局 call_ak，同样置障（否则真出网）
+        orig_legu_call = breadth_mod.call_ak
+        breadth_mod.call_ak = lambda source, fn, *a, **kw: (_ for _ in ()).throw(
+            ConnectionError("legu 冷却"))
         orig_sina = breadth_mod._fetch_sina_breadth
         breadth_mod._fetch_sina_breadth = lambda d: (_ for _ in ()).throw(
             ConnectionError("sina 也挂"))
@@ -165,11 +169,13 @@ def test_fetch_breadth_daily_three_sources_all_fail():
             out = fetch_breadth_daily("2026-09-16", conn=conn)
         finally:
             fetcher_mod.call_ak = orig
+            breadth_mod.call_ak = orig_legu_call
             breadth_mod._fetch_sina_breadth = orig_sina
             quotes_mod.get_live_prices = orig_quotes
-        # 三档全失败 → 不写库
+        # 四档全失败 → 不写库，且不造 0 值假行（W-B6）
         n = conn.execute("SELECT COUNT(*) FROM breadth_daily").fetchone()[0]
-        assert n == 0, f"三档全失败不应落库，实得 {n} 行（source={out.get('source')}）"
+        assert n == 0, f"四档全失败不应落库，实得 {n} 行（source={out.get('source')}）"
+        assert out.get("limit_up_count") is None, out
     finally:
         conn.close()
 

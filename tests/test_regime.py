@@ -240,22 +240,27 @@ def test_regime_bond_above_threshold_no_constraint():
         conn.close()
 
 
-def test_regime_etf_share_down_2pct_caps_to_half():
-    """ETF 510300 单日 -2% 跌 → direction=down（顶部信号；Fix-2 改方向语义）"""
+def test_regime_etf_share_noop_no_source():
+    """W-B7（P1-14）：ETF 份额数据源不存在（akshare 无份额列接口）→
+    _compute_etf_tier_shift 显式 no-op，恒 direction=None 且注明原因，
+    即便表里有历史行也不再出方向信号。"""
     from risk.regime import _compute_etf_tier_shift
     conn = _mem_conn()
     try:
         _seed_etf(conn, -3.5)
         cfg = {"up_pct_threshold": 2.0, "down_pct_threshold": -2.0}
         sig = _compute_etf_tier_shift(conn, cfg)
-        assert sig["direction"] == "down"
-        assert sig["pct"] == -3.5
+        assert sig["direction"] is None
+        assert sig["pct"] is None
+        assert "no-op" in (sig.get("reason") or "") or "数据源" in (sig.get("reason") or "")
+        _seed_etf(conn, +5.0)
+        assert _compute_etf_tier_shift(conn, cfg)["direction"] is None
     finally:
         conn.close()
 
 
 def test_regime_etf_share_no_move_returns_none():
-    """ETF 510300 单日变动在 ±2% 内 → direction=None（不调整）"""
+    """ETF 510300 单日变动在 ±2% 内 → direction=None（W-B7 后恒 None）"""
     from risk.regime import _compute_etf_tier_shift
     conn = _mem_conn()
     try:
@@ -284,35 +289,32 @@ def _seed_dual_shelter(conn):
 
 
 def test_regime_etf_upgrades_shelter_to_half():
-    """升档：二八避险 0.2 + ETF 单日 +3%（底部信号）→ min(caps)=0.2 被
-    min-after override 提到 cap_half=0.5（唯一允许往上提的路径）。"""
+    """W-B7：ETF 档位信号显式 no-op——即便表里有 +3% 历史行，二八避险 0.2
+    不再被 override 提档（原 Fix-2 min-after override 已随数据源下线删除）。"""
     conn = _mem_conn()
     try:
         _seed_dual_shelter(conn)
         _seed_etf(conn, +3.0)
         r = compute_regime(conn, root=CFG)
         assert r["dual_mom"]["big"] < 0 and r["dual_mom"]["small"] < 0
-        assert r["etf_share"]["direction"] == "up"
-        assert abs(r["etf_share"]["cap_before"] - 0.20) < 1e-9
-        assert abs(r["cap"] - 0.50) < 1e-9
-        assert abs(r["etf_share"]["cap_after"] - 0.50) < 1e-9
-        assert r["tier"] == "半配"
+        assert r["etf_share"]["direction"] is None
+        assert "no-op" in r["etf_share"]["signal"]
+        assert abs(r["cap"] - 0.20) < 1e-9   # cap 不被提档
+        assert r["tier"] == "避险"
     finally:
         conn.close()
 
 
 def test_regime_etf_downgrades_to_half():
-    """降档：国债弱（cap 0.8×0.8=0.64）+ ETF 单日 -3%（顶部信号）→ cap 压到
-    cap_half=0.5。"""
+    """W-B7：ETF 档位信号显式 no-op——-3% 历史行不再触发降档，cap 保持
+    min(caps)=0.64（国债乘子 0.8×静态 0.8）。"""
     conn = _mem_conn()
     try:
         _seed_bond(conn, -20.0)
         _seed_etf(conn, -3.0)
         r = compute_regime(conn, root=CFG)
-        assert r["etf_share"]["direction"] == "down"
-        assert abs(r["etf_share"]["cap_before"] - 0.64) < 1e-6
-        assert abs(r["cap"] - 0.50) < 1e-9
-        assert abs(r["etf_share"]["cap_after"] - 0.50) < 1e-9
+        assert r["etf_share"]["direction"] is None
+        assert abs(r["cap"] - 0.64) < 1e-6   # 不被压到 cap_half
         assert r["tier"] == "半配"
     finally:
         conn.close()

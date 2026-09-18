@@ -110,7 +110,11 @@ def compute_hot_themes(conn: sqlite3.Connection, window_days: int = 2) -> List[d
 
 
 def compute_hot_stocks(conn: sqlite3.Connection) -> List[dict]:
-    """自选池个股新闻突增：近24小时条数 ≥min_news 且 ≥stock_vs_avg×前7日日均。"""
+    """自选池个股新闻突增：近24小时条数 ≥min_news 且 ≥stock_vs_avg×前7日日均。
+
+    W-B5（Sprint4，P1-12）：候选集由 stock_info 全表（all_codes，816 票）收紧为
+    watchlist_core——不可交易票的新闻热度不该进"自选池热门个股"。
+    """
     cfg = _cfg()
     min_news = int(cfg.get("stock_min_news", 3))
     vs_avg = float(cfg.get("stock_vs_avg", 2.0))
@@ -124,7 +128,12 @@ def compute_hot_stocks(conn: sqlite3.Connection) -> List[dict]:
         bl_ok = {c: ok for c, (ok, _) in check_blacklist(conn).items()}
     except Exception:
         bl_ok = {}
-    codes = repo.all_codes(conn)
+    try:
+        from common.config import core_codes
+        core = set(core_codes())
+    except Exception:  # noqa: BLE001
+        core = set(repo.all_codes(conn))  # 兜底：配置异常时退回全表（原行为）
+    codes = [c for c in repo.all_codes(conn) if c in core]
     for code in codes:
         if bl_ok.get(code, True) is False:
             continue  # 黑名单票不进热门池（N/ST/次新）

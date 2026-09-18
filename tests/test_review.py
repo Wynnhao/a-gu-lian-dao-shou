@@ -335,14 +335,33 @@ def test_weekly_benchmark_missing_degrades():
 
 def test_ensure_benchmark_existing_skips_fetch():
     conn = make_conn()
-    conn.execute("INSERT OR REPLACE INTO index_daily (index_code, trade_date, close) VALUES ('000300','2024-01-10',4000.0)")
+    conn.execute("INSERT OR REPLACE INTO index_daily (index_code, trade_date, close) VALUES ('000300','2024-01-12',4000.0)")
     conn.commit()
 
     def _should_not_run(start8, end8):
-        raise AssertionError("已有近期数据时不应发起抓取")
+        raise AssertionError("已有截至 end_date 的数据时不应发起抓取")
 
     r = weekly.ensure_benchmark("2024-01-12", conn, fetcher=_should_not_run)
     assert r["ok"] is True and r["source"] == "existing" and r["rows"] == 0
+    conn.close()
+
+
+def test_ensure_benchmark_stale_row_triggers_fetch():
+    """W-B2（P0-5）：兜底条件 COUNT>0 → MAX(trade_date)>=end_date——窗口内只有
+    陈旧行（停更于 01-10 < end 01-12）必须触发补数，不再"有历史行即跳过"。"""
+    conn = make_conn()
+    conn.execute("INSERT OR REPLACE INTO index_daily (index_code, trade_date, close) VALUES ('000300','2024-01-10',4000.0)")
+    conn.commit()
+    import pandas as pd
+
+    def fake_fetch(start8, end8):
+        return pd.DataFrame({"date": ["2024-01-11", "2024-01-12"], "close": [4010.0, 4020.0]})
+
+    r = weekly.ensure_benchmark("2024-01-12", conn, fetcher=fake_fetch)
+    assert r["ok"] is True and r["rows"] == 2 and r["source"] == "fake_fetch", r
+    latest = conn.execute(
+        "SELECT MAX(trade_date) FROM index_daily WHERE index_code='000300'").fetchone()[0]
+    assert latest == "2024-01-12"
     conn.close()
 
 
@@ -494,6 +513,11 @@ def test_profile_verdict_both_lost_switch(tmp_path=None):
     finally:
         if backup is not None:
             target.write_bytes(backup)
+        elif target.exists():
+            # Sprint4 批次B 末处置加固：原文件不存在（已退役为 .invalid）时
+            # 必须删除合成产物——测试不得把假 backtest_result.json 留在生产
+            # 路径复活已退役文件（2026-09-19 实测复活事故）。
+            target.unlink()
 
 
 def test_profile_verdict_only_c_vote_switch_low_confidence(tmp_path=None):
@@ -523,6 +547,11 @@ def test_profile_verdict_only_c_vote_switch_low_confidence(tmp_path=None):
     finally:
         if backup is not None:
             target.write_bytes(backup)
+        elif target.exists():
+            # Sprint4 批次B 末处置加固：原文件不存在（已退役为 .invalid）时
+            # 必须删除合成产物——测试不得把假 backtest_result.json 留在生产
+            # 路径复活已退役文件（2026-09-19 实测复活事故）。
+            target.unlink()
 
 
 def test_profile_verdict_red_line_overrides(tmp_path=None):
@@ -563,6 +592,11 @@ def test_profile_verdict_red_line_overrides(tmp_path=None):
     finally:
         if backup is not None:
             target.write_bytes(backup)
+        elif target.exists():
+            # Sprint4 批次B 末处置加固：原文件不存在（已退役为 .invalid）时
+            # 必须删除合成产物——测试不得把假 backtest_result.json 留在生产
+            # 路径复活已退役文件（2026-09-19 实测复活事故）。
+            target.unlink()
 
 
 def test_profile_verdict_three_profile_alts_pick_best():
@@ -616,6 +650,11 @@ def test_profile_verdict_three_profile_alts_pick_best():
         sig_mod.profile = orig_profile
         if backup is not None:
             target.write_bytes(backup)
+        elif target.exists():
+            # Sprint4 批次B 末处置加固：原文件不存在（已退役为 .invalid）时
+            # 必须删除合成产物——测试不得把假 backtest_result.json 留在生产
+            # 路径复活已退役文件（2026-09-19 实测复活事故）。
+            target.unlink()
 
 
 def test_profile_verdict_abstain_when_bt_missing(tmp_path=None):
@@ -639,6 +678,11 @@ def test_profile_verdict_abstain_when_bt_missing(tmp_path=None):
     finally:
         if backup is not None:
             target.write_bytes(backup)
+        elif target.exists():
+            # Sprint4 批次B 末处置加固：原文件不存在（已退役为 .invalid）时
+            # 必须删除合成产物——测试不得把假 backtest_result.json 留在生产
+            # 路径复活已退役文件（2026-09-19 实测复活事故）。
+            target.unlink()
 
 
 def test_profile_verdict_compat_with_weekly():

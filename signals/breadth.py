@@ -10,6 +10,7 @@ import logging.handlers
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Optional
 
 BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
@@ -65,6 +66,24 @@ def _breadth_cfg() -> dict:
     return out
 
 
+def _freshness_floor(conn: sqlite3.Connection) -> Optional[str]:
+    """W-B6（P2-5）新鲜度闸门地板：daily_bar 最近 2 个交易日中较早者。
+
+    breadth 最新行早于该地板 → 视为陈旧。daily_bar 不足 2 个交易日 → None
+    （无法判定，不启闸）。
+    """
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT trade_date FROM daily_bar "
+            "ORDER BY trade_date DESC LIMIT 2").fetchall()
+        dates = sorted(str(r[0]) for r in rows if r and r[0])
+        if len(dates) < 2:
+            return None
+        return dates[0]
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def compute_breadth_factor(conn: sqlite3.Connection, threshold: float = None,
                             override_cap: float = None) -> dict:
     """regime 旁路：breadth_composite < threshold → override_cap（极端避险）。
@@ -72,6 +91,9 @@ def compute_breadth_factor(conn: sqlite3.Connection, threshold: float = None,
     threshold/override_cap 缺省从 config.json breadth 段读（extreme_threshold /
     override_cap），无 config 时用代码缺省 -2.0 / 0.1。
     返回 {"composite": float|None, "override_cap": float|None, "reason": str}。
+
+    W-B6（P2-5）新鲜度闸门：最新行早于最近 2 个交易日 → composite 按 None 处理
+    ——断供数周的陈旧 composite 不再无限生效（规则 20 极端避险档不被旧状态误触）。
     """
     cfg = _breadth_cfg()
     if threshold is None:
@@ -81,6 +103,12 @@ def compute_breadth_factor(conn: sqlite3.Connection, threshold: float = None,
     data = read_breadth(conn)
     composite = data.get("breadth_composite")
     out = {"composite": composite, "override_cap": None, "reason": ""}
+    floor = _freshness_floor(conn)
+    if floor is not None and str(data.get("date") or "") < floor:
+        out["composite"] = None
+        out["reason"] = (f"breadth 数据陈旧（最新 {data.get('date')} < "
+                         f"最近2交易日门槛 {floor}），闸门关闭不生效")
+        return out
     if composite is None:
         out["reason"] = data.get("reason") or "breadth_composite 缺失"
         return out

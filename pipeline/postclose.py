@@ -182,6 +182,38 @@ def main(argv=None) -> int:
     except Exception as e:
         log.error("步骤1 fetcher.run FAIL（继续用已有数据复盘）: %s", repr(e))
 
+    # 1.1 指数日线刷新（W-B2 / P1-9 / P0-5 守卫的根因修复：日报基准此前无任何
+    # 盘后自动刷新链路，缺当日行时 cur/prev 塌缩同一天 → 恒 +0.00%。自开短连接
+    # 逐码 ensure，失败仅告警；AGSICKLE_DISABLE_FETCHER=1 时与日线采集同门短路）
+    if os.environ.get("AGSICKLE_DISABLE_FETCHER") != "1":
+        try:
+            from data.macro import INDEX_CODES
+            _conn_idx = fetcher.get_conn()
+            try:
+                for _code in INDEX_CODES:
+                    n_idx = fetcher.ensure_index_daily(_conn_idx, _code)
+                    log.info("步骤1.1 ensure_index_daily %s: +%s 行", _code, n_idx)
+            finally:
+                _conn_idx.close()
+        except Exception as e:  # noqa: BLE001
+            log.error("步骤1.1 指数日线刷新 FAIL（继续）: %s", repr(e))
+
+    # 1.15 市场宽度补采（W-B6 / P1-13：此前只有盘前 9:00 采集，当日收盘后的
+    # 涨跌停/涨跌家数无采集点，advance_decline_ratio 长期为空）
+    if os.environ.get("AGSICKLE_DISABLE_FETCHER") != "1":
+        try:
+            from data import breadth as _breadth
+            _conn_br = fetcher.get_conn()
+            try:
+                br = _breadth.fetch_breadth_daily(conn=_conn_br)
+                log.info("步骤1.15 市场宽度补采：source=%s, 涨停=%s, 跌停=%s, ADR=%s",
+                         br.get("source"), br.get("limit_up_count"),
+                         br.get("limit_down_count"), br.get("advance_decline_ratio"))
+            finally:
+                _conn_br.close()
+        except Exception as e:  # noqa: BLE001
+            log.error("步骤1.15 市场宽度补采 FAIL（继续）: %s", repr(e))
+
     # 1.5 动态池刷新（收盘正式口径：异动规则基于当日完整日线）
     try:
         conn0 = fetcher.get_conn()

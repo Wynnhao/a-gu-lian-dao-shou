@@ -5,7 +5,7 @@ import logging.handlers
 import os
 import sys
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import akshare as ak
@@ -79,63 +79,11 @@ def rolling_price_pct(dates: list, closes: list, years: int = 5) -> list:
     return out
 
 
-def _daily_src(src: str, code: str, start: str, end: str) -> list:
-    """单指数日线 -> [(index_code, 'YYYY-MM-DD', close)]，仅取 start 之后。"""
-    if src == "index_zh_a_hist":  # 东财，symbol 不带后缀，中文列 日期/收盘
-        df = ak.index_zh_a_hist(symbol=code, period="daily",
-                                start_date=start, end_date=end)
-        if df is None or df.empty:
-            return []
-        rows = [(code, pd.Timestamp(d).strftime("%Y-%m-%d"), float(c))
-                for d, c in zip(df["日期"], df["收盘"])]
-    else:  # 新浪/腾讯兜底，symbol 需带交易所前缀
-        sym = _index_symbol(code)
-        df = (ak.stock_zh_index_daily(symbol=sym) if src == "stock_zh_index_daily"
-              else ak.stock_zh_index_daily_tx(symbol=sym))
-        if df is None or df.empty:
-            return []
-        rows = [(code, pd.Timestamp(d).strftime("%Y-%m-%d"), float(c))
-                for d, c in zip(df["date"], df["close"])]
-    cutoff = pd.Timestamp(start).strftime("%Y-%m-%d")
-    return [r for r in rows if r[1] >= cutoff]
-
-
-def fetch_index_daily(codes=None, start: str = "20180101") -> dict:
-    """各指数日线入库 index_daily，依次尝试 东财/新浪/腾讯 源，返回 {code: 新增行数}。"""
-    if codes is None:
-        codes = list(INDEX_CODES)
-    end = date.today().strftime("%Y%m%d")
-    conn = get_conn()
-    out = {}
-    for code in codes:
-        new = 0
-        for src in ("index_zh_a_hist", "stock_zh_index_daily", "stock_zh_index_daily_tx"):
-            try:
-                rows = _daily_src(src, code, start, end)
-                time.sleep(0.8)  # 温和限速
-            except Exception as e:
-                log.warning("index_daily %s via %s FAIL: %s", code, src, repr(e)[:140])
-                continue
-            if not rows:
-                log.warning("index_daily %s via %s 返回空", code, src)
-                continue
-            cnt_before = conn.execute(
-                "SELECT COUNT(*) FROM index_daily WHERE index_code=?", (code,)
-            ).fetchone()[0]
-            conn.executemany("INSERT OR IGNORE INTO index_daily VALUES (?, ?, ?)", rows)
-            conn.commit()
-            new = conn.execute(
-                "SELECT COUNT(*) FROM index_daily WHERE index_code=?", (code,)
-            ).fetchone()[0] - cnt_before
-            log.info("index_daily %s via %s: %d 行, 新增 %d", code, src, len(rows), new)
-            break
-        if not new and conn.execute(
-                "SELECT 1 FROM index_daily WHERE index_code=? LIMIT 1", (code,)
-        ).fetchone() is None:
-            log.error("index_daily %s 全部数据源失败", code)
-        out[code] = new
-    conn.close()
-    return out
+# W-B2（Sprint4，P1-9）：原 fetch_index_daily 死函数及其 _daily_src 助手已删除——
+# 其 `INSERT OR IGNORE INTO index_daily VALUES (?,?,?)` 为 3 列 vs 表 5 列
+# (index_code, trade_date, close, high, low)，EXPLAIN 实测必报错，且 OR IGNORE
+# 语义弱于 fetcher.ensure_index_daily 的 OR REPLACE（无盘中截断、无三源兜底、
+# 不补 high/low）。统一入口：fetcher.ensure_index_daily(conn, code) 逐码调用。
 
 
 def _fetch_series(chain: list):
@@ -270,7 +218,14 @@ def _fetch_bond_yield_one(issuer: str) -> list:
         if issuer == "em":
             df = call_ak("bond_em", ak.bond_zh_us_rate)
         elif issuer == "tx":
-            df = call_ak("bond_tx", ak.bond_china_yield)
+            # W-B8（Sprint4，P1-15）：不传参时 akshare 默认窗口 2020-02~2021-01，
+            # em 挂时会把两年前旧收益率 INSERT OR REPLACE 伪装成"更新成功"。
+            # 传最近 40 天窗口（end-start 需小于一年，40 天足够算 20 日 delta）。
+            end = date.today()
+            start = end - timedelta(days=40)
+            df = call_ak("bond_tx", ak.bond_china_yield,
+                         start_date=start.strftime("%Y%m%d"),
+                         end_date=end.strftime("%Y%m%d"))
         else:
             return rows
     except Exception as e:
@@ -302,6 +257,14 @@ def _fetch_bond_yield_one(issuer: str) -> list:
             rows.append((d, y, issuer))
         except (TypeError, ValueError):
             continue
+    # W-B8（P1-15）新鲜度闸门：末行早于今日-7 天 → 整体弃用（不装"更新成功"）
+    if rows:
+        latest = max(r[0] for r in rows)
+        stale_before = (date.today() - timedelta(days=7)).isoformat()
+        if latest < stale_before:
+            log.warning("bond %s 数据陈旧（末行 %s < %s），弃用不写库",
+                        issuer, latest, stale_before)
+            return []
     return rows
 
 
@@ -403,6 +366,12 @@ def _fetch_etf_share_one(etf_code: str, issuer: str) -> list:
 def fetch_etf_share(codes: list = None, conn: sqlite3.Connection = None) -> dict:
     """ETF 份额入库（沪深300 + 中证500）。
 
+    W-B7（Sprint4，P1-14）实测结论：akshare 无任何含「份额/规模」列的 ETF 接口
+    （fund_etf_fund_info_em 净值列、fund_etf_fund_daily_em 净值/市价/折价率列，
+    均实测无份额列）→ 本函数在生产上恒返回空 dict，index_etf_share 恒空表。
+    regime 的 ETF 档位信号已随之显式 no-op（见 risk/regime.py）。函数保留供
+    历史调用方/测试兼容；pipeline 已不再调度。
+
     兜底链：em 主 → tx 兜底（端点不存在则跳过）。
     返回 {etf_code: 行数}。conn=None 时用 get_conn()（生产），测试可注入 :memory:。
     """
@@ -440,17 +409,21 @@ def fetch_etf_share(codes: list = None, conn: sqlite3.Connection = None) -> dict
 
 
 def main():
-    print("== P1.5 指数日线入库 ==")
-    for code, n in fetch_index_daily().items():
-        print(f"  {code}: +{n} 行")
+    print("== P1.5 指数日线入库（W-B2：统一走 fetcher.ensure_index_daily）==")
+    from data.fetcher import ensure_index_daily
+    conn = get_conn()
+    try:
+        for code in INDEX_CODES:
+            n = ensure_index_daily(conn, code)
+            print(f"  {code}: +{n} 行")
+    finally:
+        conn.close()
     print("== P1.5 指数估值分位入库 ==")
     for code, r in fetch_index_valuation().items():
         print(f"  {code}: {r}")
-    print("== P1.3 国债 + ETF（Sprint 2）==")
+    print("== P1.3 国债（Sprint 2；ETF 份额源不存在，W-B7 已显式停用）==")
     for code, n in fetch_bond_yield().items():
         print(f"  国债 {code}: +{n} 行")
-    for code, n in fetch_etf_share().items():
-        print(f"  ETF {code}: +{n} 行")
 
 
 if __name__ == "__main__":
