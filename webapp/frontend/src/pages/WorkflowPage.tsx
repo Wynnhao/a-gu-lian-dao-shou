@@ -1,5 +1,5 @@
-import { useMemo } from "react";
-import { ExternalLink } from "lucide-react";
+import { useMemo, useState } from "react";
+import { ChevronDown, ChevronRight, ExternalLink } from "lucide-react";
 import { ChartCard } from "@/components/ChartCard";
 import { DecisionTable, TradeMiniCard } from "@/components/DecisionTable";
 import { DataStatusPanel } from "@/components/DataStatusPanel";
@@ -408,51 +408,7 @@ export function OverviewPage({ onNavigate }: { onNavigate?: (p: "workflow") => v
         </Panel>
 
         {/* 黑名单 / 数据健康 */}
-        <Panel
-          title="数据健康与黑名单"
-          caliber={<>PASS {passed.length} · 拦截 {blocked.length}</>}
-          bodyClassName="p-0"
-        >
-          <div className="space-y-2 px-3 py-2.5">
-            {(ov?.health_issues ?? []).length > 0 ? (
-              <ul className="space-y-0.5 text-table text-warn">
-                {(ov?.health_issues ?? []).map((x, i) => (
-                  <li key={i}>· {x}</li>
-                ))}
-              </ul>
-            ) : (
-              <p className="text-table text-muted-foreground">数据健康：OK（无告警）</p>
-            )}
-          </div>
-          <div className="max-h-[280px] overflow-y-auto border-t">
-            <table className="w-full text-table">
-              <thead className="sticky top-0 bg-card">
-                <tr className="border-b text-left text-[11px] font-semibold text-muted-foreground [&>th]:px-2 [&>th]:py-1.5">
-                  <th>代码</th>
-                  <th>名称</th>
-                  <th>状态</th>
-                  <th>原因</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(ov?.blacklist ?? []).map((b) => (
-                  <tr key={b.code} className="border-b border-border/70">
-                    <td className="num px-2 py-1">{b.code}</td>
-                    <td className="px-2 py-1">{b.name}</td>
-                    <td className="px-2 py-1">
-                      {b.ok ? (
-                        <Badge variant="success">PASS</Badge>
-                      ) : (
-                        <Badge variant="destructive">BLOCK</Badge>
-                      )}
-                    </td>
-                    <td className="px-2 py-1 text-muted-foreground">{b.reason}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Panel>
+        <HealthBlacklistPanel passed={passed} blocked={blocked} healthIssues={ov?.health_issues ?? []} blacklist={ov?.blacklist ?? []} />
       </div>
     </div>
   );
@@ -465,4 +421,101 @@ function PipelineStrip() {
   if (workflow.err) return <div className="p-3"><ErrorBar msg={workflow.err} onRetry={workflow.refetch} /></div>;
   if (stages.length === 0) return <EmptyState msg="流水线状态不可用" reason={workflow.loading ? "加载中…" : "/api/workflow 无数据"} />;
   return <PipelineFlow stages={stages} className="px-1.5 py-1" />;
+}
+
+/** 数据健康 + 黑名单面板：默认折叠长列表，避免首屏占用过高。
+ *
+ * 设计要点：
+ * - health_issues 最多展开前 3 条，超过折叠到"查看全部 N 项"——这类告警通常
+ *   是同一根因（fetcher 故障导致一批票滞后），Top 3 已经能定位问题；
+ * - blacklist 表默认只展示 BLOCK 行，PASS 通过徽章/计数可见，展开后再显示全表；
+ * - 健康 OK 状态以浅灰文案收尾，避免空白行。 */
+function HealthBlacklistPanel({
+  passed, blocked, healthIssues, blacklist,
+}: {
+  passed: { code: string; name: string; ok: boolean; reason: string }[];
+  blocked: { code: string; name: string; ok: boolean; reason: string }[];
+  healthIssues: string[];
+  blacklist: { code: string; name: string; ok: boolean; reason: string }[];
+}) {
+  const HEALTH_PREVIEW = 3;
+  const [showAllHealth, setShowAllHealth] = useState(false);
+  const [showAllBl, setShowAllBl] = useState(false);
+
+  const healthVisible = showAllHealth ? healthIssues : healthIssues.slice(0, HEALTH_PREVIEW);
+  const healthHidden = healthIssues.length - healthVisible.length;
+  const blVisible = showAllBl ? blacklist : blacklist.filter((b) => !b.ok);
+  const blHidden = blacklist.length - blVisible.length;
+
+  return (
+    <Panel
+      title="数据健康与黑名单"
+      caliber={<>PASS {passed.length} · 拦截 {blocked.length}</>}
+      bodyClassName="p-0"
+    >
+      <div className="px-3 py-2.5">
+        {healthIssues.length > 0 ? (
+          <>
+            <ul className="space-y-0.5 text-table text-warn">
+              {healthVisible.map((x, i) => (
+                <li key={i}>· {x}</li>
+              ))}
+            </ul>
+            {healthIssues.length > HEALTH_PREVIEW && (
+              <button
+                type="button"
+                onClick={() => setShowAllHealth((v) => !v)}
+                className="mt-1 inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+              >
+                {showAllHealth ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                {showAllHealth ? "收起" : `查看全部 ${healthIssues.length} 项（+${healthHidden}）`}
+              </button>
+            )}
+          </>
+        ) : (
+          <p className="text-table text-muted-foreground">数据健康：OK（无告警）</p>
+        )}
+      </div>
+      <div className="border-t">
+        {blacklist.length === 0 ? (
+          <p className="px-3 py-2.5 text-table text-muted-foreground">黑名单空</p>
+        ) : (
+          <div className="max-h-[280px] overflow-y-auto">
+            <table className="w-full text-table">
+              <thead className="sticky top-0 bg-card">
+                <tr className="border-b text-left text-[11px] font-semibold text-muted-foreground [&>th]:px-2 [&>th]:py-1.5">
+                  <th>代码</th>
+                  <th>名称</th>
+                  <th>状态</th>
+                  <th>原因</th>
+                </tr>
+              </thead>
+              <tbody>
+                {blVisible.map((b) => (
+                  <tr key={b.code} className="border-b border-border/70">
+                    <td className="num px-2 py-1">{b.code}</td>
+                    <td className="px-2 py-1">{b.name}</td>
+                    <td className="px-2 py-1">
+                      {b.ok ? <Badge variant="success">PASS</Badge> : <Badge variant="destructive">BLOCK</Badge>}
+                    </td>
+                    <td className="px-2 py-1 text-muted-foreground">{b.reason}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {blacklist.length > blocked.length && (
+          <button
+            type="button"
+            onClick={() => setShowAllBl((v) => !v)}
+            className="flex w-full items-center justify-center gap-1 border-t border-line/60 py-1.5 text-[11px] text-muted-foreground hover:text-foreground"
+          >
+            {showAllBl ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+            {showAllBl ? "收起 PASS 行" : `展开 ${blHidden} 条 PASS（默认仅显示拦截 ${blocked.length} 条）`}
+          </button>
+        )}
+      </div>
+    </Panel>
+  );
 }

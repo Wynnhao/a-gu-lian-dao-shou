@@ -25,14 +25,15 @@ import sqlite3
 from datetime import date, datetime
 from typing import Optional, Tuple
 
-from common.config import load, snapshot
+from common.config import active_profile, core_codes, core_watchlist, load, snapshot
 from data import repo
 from data.fetcher import get_conn
 from data.news import get_recent_news
 from risk.blacklist import check_blacklist, health_check
 
 CFG = snapshot()  # 统一配置层：import 期冻结 + 硬键校验 fail-fast
-WATCHLIST = CFG.get("watchlist", [])
+WATCHLIST = core_watchlist(CFG)          # 策略可交易池（51 只）
+WATCHLIST_EXT = CFG.get("watchlist_extended", [])  # 仅供观察
 START_CASH = float(CFG.get("execution", {}).get("paper_start_cash", 1000000.0))
 PRICE_GUARD_PCT = float(CFG.get("risk", {}).get("price_guard_pct", 0.02))
 MAX_SINGLE_WEIGHT = float(CFG.get("risk", {}).get("max_single_weight", 0.20))
@@ -98,9 +99,81 @@ def _signals_profile() -> str:
     """当前 score profile（热读 config，避免为此引入 signals 导入链）。"""
     try:
         p = load().get("signals", {}).get("profile", "reversal_lowvol")
-        return p if p in ("reversal_lowvol", "momentum") else "reversal_lowvol"
+        return p if p in ("reversal_lowvol", "reversal_lowvol_v2", "momentum") \
+            else "reversal_lowvol"
     except Exception:
         return "reversal_lowvol"
+
+
+def _profile_verdict_latest() -> tuple:
+    """读 signal_eval/latest.json 取最新一次 evaluate 输出里的 profile_verdict
+    （目录经 review.signal_eval._signal_eval_dir()，支持环境变量注入做测试隔离）。
+
+    返回 (verdict_dict_or_None, missing_reason_or_None)。
+    """
+    try:
+        from review.signal_eval import _signal_eval_dir
+        latest = _signal_eval_dir() / "latest.json"
+        if not latest.exists():
+            return None, "signal_eval/latest.json 不存在（先跑 review.signal_eval）"
+        payload = json.loads(latest.read_text(encoding="utf-8"))
+        v = payload.get("profile_verdict")
+        if not v:
+            return None, "latest.json 无 profile_verdict 字段"
+        return v, None
+    except (OSError, ValueError) as e:
+        return None, f"latest.json 读取失败：{type(e).__name__}: {e}"
+
+
+def _factor_crowding() -> dict:
+    """读 factor_crowding.json（任务 5：规则 20 熔断态；路径同 signals 模块）。
+
+    永远返回 dict；缺文件/解析失败 → crowded=False + reason 说明。
+    """
+    from signals.signals import _factor_crowding_path
+    path = _factor_crowding_path()
+    try:
+        if not path.exists():
+            return {"crowded": False, "reason": "factor_crowding.json 不存在（首次运行）"}
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return {"crowded": False, "reason": f"读取失败：{type(e).__name__}: {e}"}
+
+
+def _bond_etf_signals(conn: sqlite3.Connection) -> dict:
+    """读 index_bond_yield + index_etf_share 最新一行（任务 1：P1-3）。
+
+    永远返回 dict；缺表/空表 → 各自为空 dict + reason。
+    """
+    out = {"bond_yield": {}, "etf_share": {}, "reason": ""}
+    try:
+        row = conn.execute(
+            "SELECT trade_date, yield, delta_20d_bp, source FROM index_bond_yield"
+            " WHERE index_code='10Y_CN' ORDER BY trade_date DESC LIMIT 1").fetchone()
+        if row:
+            out["bond_yield"] = {
+                "trade_date": row[0], "yield": row[1],
+                "delta_20d_bp": row[2], "source": row[3],
+            }
+    except Exception as e:  # noqa: BLE001
+        out["reason"] += f"bond 读取失败：{type(e).__name__}: {e}; "
+    try:
+        rows = conn.execute(
+            "SELECT etf_code, trade_date, share, pct_chg_1d FROM index_etf_share"
+            " WHERE etf_code IN ('510300','510500')"
+            " ORDER BY etf_code, trade_date DESC").fetchall()
+        seen = set()
+        for code, d, s, pct in rows:
+            if code in seen:
+                continue
+            seen.add(code)
+            out["etf_share"][code] = {"trade_date": d, "share": s, "pct_chg_1d": pct}
+    except Exception as e:  # noqa: BLE001
+        out["reason"] += f"etf 读取失败：{type(e).__name__}: {e}; "
+    if not out["bond_yield"] and not out["etf_share"]:
+        out["reason"] = ("index_bond_yield 与 index_etf_share 均为空"
+                          "（先跑 data.macro）")
+    return out
 
 
 # ---------------------------------------------------------------- 组装
@@ -128,6 +201,7 @@ def build_bundle(run_date: Optional[str] = None,
         bundle["generated_at"] = datetime.now().isoformat(timespec="seconds")
         bundle["prompt_version"] = PROMPT_VERSION
         bundle["watchlist"] = [dict(x) for x in WATCHLIST]
+        bundle["watchlist_extended"] = [dict(x) for x in WATCHLIST_EXT]
 
         # ---- 数据健康 ----
         try:
@@ -148,13 +222,27 @@ def build_bundle(run_date: Optional[str] = None,
             bundle["blacklist"] = {}
             bundle["blacklist_error"] = f"黑名单检查失败：{type(e).__name__}: {e}"
 
-        # ---- 信号（signal 表 evidence_date 全部行）----
+        # ---- 信号（当前 profile + 可交易池；错配修复：不混口径、不含扩展观察池）----
         try:
+            _want = active_profile()
+            _wl = set(core_codes())
+            # 口径选择：优先当前 profile；该日无行时回退到当日行数最多的 profile
+            # （场景：刚切 profile 尚未重算，回退比给出空包更有用，且如实标注）
+            _pick = c.execute(
+                "SELECT profile, COUNT(*) AS n FROM signal WHERE as_of=?"
+                " GROUP BY profile ORDER BY (profile=?) DESC, n DESC LIMIT 1",
+                (ev, _want)).fetchone()
+            _prof = _pick[0] if _pick else _want
             rows = c.execute(
-                "SELECT code, signals, score, as_of FROM signal WHERE as_of=? ORDER BY code",
-                (ev,)).fetchall()
+                "SELECT code, signals, score, as_of FROM signal"
+                " WHERE as_of=? AND profile=? ORDER BY code",
+                (ev, _prof)).fetchall()
             sigs = []
+            _dropped = 0
             for code, raw, score, as_of in rows:
+                if _wl and str(code) not in _wl:
+                    _dropped += 1          # 扩展观察池/全市场票不进决策包
+                    continue
                 try:
                     parsed = json.loads(raw) if raw else {}
                 except Exception:
@@ -162,12 +250,21 @@ def build_bundle(run_date: Optional[str] = None,
                 sigs.append({"code": code, "signals": parsed,
                              "score": _f(score), "as_of": as_of})
             bundle["signals"] = sigs
+            _pool_key = ("watchlist_core" if (load().get("watchlist_core")
+                                            or load().get("watchlist_extended"))
+                         else "watchlist")
+            bundle["signal_scope"] = {"profile": _prof, "pool": _pool_key,
+                                      "codes": len(sigs),
+                                      "dropped_non_core": _dropped,
+                                      "profile_fallback": bool(_pick and _prof != _want),
+                                      "requested_profile": _want}
             if not sigs:
-                latest = c.execute("SELECT MAX(as_of) FROM signal").fetchone()[0]
+                latest = c.execute("SELECT MAX(as_of) FROM signal WHERE profile=?",
+                                   (_prof,)).fetchone()[0]
                 bundle["signals_missing"] = (
-                    f"signal 表无 as_of={ev} 的行"
-                    + (f"（最新 as_of={latest}，需先运行 signals.compute_all）" if latest
-                       else "（表为空，需先运行 signals.compute_all）"))
+                    f"signal 表无 as_of={ev} / profile={_prof} 的行"
+                    + (f"（该 profile 最新 as_of={latest}，需先运行 signals.compute_all）"
+                       if latest else "（该 profile 无数据，需先运行 signals.compute_all）"))
         except Exception as e:
             bundle["signals"] = []
             bundle["signals_missing"] = f"信号读取失败：{type(e).__name__}: {e}"
@@ -240,6 +337,36 @@ def build_bundle(run_date: Optional[str] = None,
             bundle["score_profile"] = _signals_profile()
         except Exception as e:
             bundle["regime"] = {"error": f"{type(e).__name__}: {e}"}
+
+        # ---- profile_verdict（任务 1：读 latest.json 注入决策层）----
+        verdict, v_missing = _profile_verdict_latest()
+        bundle["profile_verdict_latest"] = verdict
+        if v_missing:
+            bundle["profile_verdict_missing"] = v_missing
+
+        # ---- factor_crowding（任务 5：规则 20 熔断态注入 LLM）----
+        bundle["factor_crowding"] = _factor_crowding()
+
+        # ---- bond_yield + etf_share（Sprint 2 任务 1：P1-3 regime 旁路）----
+        try:
+            bundle["bond_etf_signals"] = _bond_etf_signals(c)
+        except Exception as e:
+            bundle["bond_etf_signals"] = {"reason": f"读取失败：{type(e).__name__}: {e}"}
+
+        # ---- earnings events（Sprint 2 任务 2：P1-4 业绩预告关键词事件）----
+        try:
+            from signals.earnings import refresh as _earnings_refresh
+            bundle["earnings_events_latest"] = _earnings_refresh(conn=c, days=3)
+        except Exception as e:
+            bundle["earnings_events_latest"] = None
+            bundle["earnings_events_missing"] = f"earnings.refresh 失败：{type(e).__name__}: {e}"
+
+        # ---- market breadth（Sprint 2 任务 3：P1-1 市场宽度）----
+        try:
+            from signals.breadth import read_breadth
+            bundle["breadth_composite"] = read_breadth(c)
+        except Exception as e:
+            bundle["breadth_composite"] = {"reason": f"读取失败：{type(e).__name__}: {e}"}
 
         # ---- 组合状态（持仓补现价/市值/浮盈/权重/止损参考价）----
         try:
@@ -360,7 +487,12 @@ _OUTPUT_RULES = """## 决策输出要求（prompt_version={pv}）
 6. `confidence` 取值 [0,1]；`target_weight` 取值 [0, {maxw}]（hold/watch 的 target_weight 恒为 0）；
    置信度 < {minconf} 时当日只出报告不下单。
 7. **遵守"市场环境总闸"**：当日全部买入的 target_weight 合计不得超过当前总仓位上限
-   （见 regime 一节，当前 {captop}）；触及上限时优先输出减仓/持有，不要输出加仓。"""
+   （见 regime 一节，当前 {captop}）；触及上限时优先输出减仓/持有，不要输出加仓。
+8. **因子拥挤熔断（Sprint 1 任务 5）**：当 bundle.factor_crowding.crowded=True 时，
+   buy 单 confidence 必须 ≥ 0.7（否则改 hold/watch），且 target_weight ≤ 5%（即使人工填更高，
+   风控规则 20 也会自动压回 5%）。
+9. **业绩预告事件（Sprint 2 任务 2）**：当 bundle.earnings_events_latest[code].net ≤ -2 时，
+   该票禁止 buy（即使其他信号看好）。"""
 
 
 def _md_table(headers: list, rows: list) -> str:
@@ -409,6 +541,136 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120) -> str:
     else:
         lines.append("（无黑名单数据）")
     lines.append("")
+
+    # profile_verdict（v1.4：B+C 投票 + MDD 红线）
+    v = bundle.get("profile_verdict_latest")
+    if v:
+        lines.append("## Score Profile Verdict（v1.4）")
+        lines.append("")
+        lines.append(f"- profile: **{v.get('profile')}**（备选: {v.get('other_profile')}）")
+        lines.append(f"- verdict: **{v.get('verdict')}** → suggest: `{v.get('suggest_profile')}`")
+        if v.get("red_line_triggered"):
+            lines.append(f"- ⚠️ **MDD 红线触发**（阈值 {v['thresholds']['mdd_red_line']:.0%}，"
+                         f"current={v['C']['current']:.2%}）→ 无条件 hold")
+        votes = v.get("votes") or {}
+        lines.append(f"- 投票: B_switch={votes.get('b_switch')}, "
+                     f"C_switch={votes.get('c_switch')}, "
+                     f"{votes.get('votes_switch')}/{votes.get('votes_total')}")
+        B, C = v.get("B") or {}, v.get("C") or {}
+        if B.get("current") is not None:
+            lines.append(f"- B (年化超额 vs HS300): cur={B['current']:.2%}, "
+                         f"alt={B['alt']:.2%}, gap={B['gap']:+.2%}")
+        if C.get("current") is not None:
+            lines.append(f"- C (MDD): cur={C['current']:.2%}, "
+                         f"alt={C['alt']:.2%}, gap={C['gap']:+.2%}")
+        abstains = v.get("abstains") or []
+        if abstains:
+            lines.append(f"- 弃权维度: {', '.join(abstains)}（{v.get('abstain_reason', '')}）")
+        lines.append(f"- 切换永远需要人工确认并留痕，系统不自动切")
+        lines.append("")
+    elif bundle.get("profile_verdict_missing"):
+        lines.append(f"## Score Profile Verdict（v1.4）")
+        lines.append("")
+        lines.append(f"- ⚠️ {bundle['profile_verdict_missing']}")
+        lines.append("")
+
+    # factor_crowding（任务 5：规则 20）
+    fc = bundle.get("factor_crowding")
+    if fc:
+        lines.append("## Factor Crowding（规则 20 熔断态）")
+        lines.append("")
+        if fc.get("crowded"):
+            lines.append(f"- ⚠️ **拥挤熔断生效**：buy 单 target_weight > 5% 自动压回")
+            lines.append(f"- μ60={fc.get('mu60')}, σ60={fc.get('sigma60')}, "
+                         f"buckets={fc.get('n_buckets')}")
+            lines.append("- LLM 倾向 hold（confidence ≥ 0.7 才允许 buy）")
+        else:
+            lines.append(f"- 正常：{fc.get('reason', '')}")
+        lines.append("")
+
+    # bond_yield + etf_share（Sprint 2 任务 1：P1-3）
+    be = bundle.get("bond_etf_signals")
+    if be:
+        lines.append("## 国债 + ETF 旁路（P1-3）")
+        lines.append("")
+        by = be.get("bond_yield") or {}
+        if by:
+            delta = by.get("delta_20d_bp")
+            delta_str = f"{delta:+.2f}bp" if isinstance(delta, (int, float)) else "n/a"
+            lines.append(f"- **10Y 国债收益率**：{by.get('yield', 'n/a'):.3f}% "
+                         f"（20 日变动 {delta_str}，{by.get('trade_date', '?')}，"
+                         f"source={by.get('source', '?')}）")
+            if isinstance(delta, (int, float)) and delta < -15:
+                lines.append("- ⚠️ 国债下行 → cap × 0.8（避险情绪）")
+        else:
+            lines.append("- 10Y 国债：缺数据（先跑 `python3 -m data.macro` 抓国债）")
+        et = be.get("etf_share") or {}
+        for code in ("510300", "510500"):
+            row = et.get(code)
+            if row:
+                pct = row.get("pct_chg_1d")
+                pct_str = f"{pct:+.2f}%" if isinstance(pct, (int, float)) else "n/a"
+                lines.append(f"- **ETF {code}**：{pct_str}（{row.get('trade_date', '?')}）")
+                if isinstance(pct, (int, float)) and pct > 2.0:
+                    lines.append(f"  - ⚠️ 份额 +{pct:.2f}% → 避险档升到半配")
+                elif isinstance(pct, (int, float)) and pct < -2.0:
+                    lines.append(f"  - ⚠️ 份额 {pct:.2f}% → 满配档降到半配")
+        if not et:
+            lines.append("- ETF 510300/510500：缺数据")
+        if be.get("reason") and (not by and not et):
+            lines.append(f"- ⚠️ {be['reason']}")
+        lines.append("")
+
+    # earnings events（Sprint 2 任务 2：P1-4 业绩预告）
+    ee = bundle.get("earnings_events_latest")
+    if ee:
+        lines.append("## 业绩预告事件（P1-4 · 近 3 日）")
+        lines.append("")
+        if not ee:
+            lines.append("- 无正/负面业绩信号命中（news 表 3 日内 0 关键词命中）")
+        else:
+            lines.append("| code | positive | negative | net | 摘要 |")
+            lines.append("|---|---:|---:|---:|---|")
+            for code in sorted(ee.keys()):
+                d = ee[code]
+                pos = d.get("positive", 0)
+                neg = d.get("negative", 0)
+                net = d.get("net", 0)
+                samples = d.get("samples_pos", [])[:1] + d.get("samples_neg", [])[:1]
+                sample_str = "；".join(samples)[:80] if samples else "—"
+                flag = "🚫禁买" if net <= -2 else ("⚠️利好" if net >= 2 else "")
+                lines.append(f"| {code} | {pos} | {neg} | {net} {flag} | {sample_str} |")
+        lines.append("")
+    elif bundle.get("earnings_events_missing"):
+        lines.append(f"## 业绩预告事件（P1-4）")
+        lines.append("")
+        lines.append(f"- ⚠️ {bundle['earnings_events_missing']}")
+        lines.append("")
+
+    # market breadth（Sprint 2 任务 3：P1-1）
+    br = bundle.get("breadth_composite")
+    if br:
+        lines.append("## 市场宽度（P1-1 · A 股微盘踩踏预警）")
+        lines.append("")
+        if br.get("date"):
+            lines.append(f"- date: **{br['date']}** · source: {br.get('source', '?')}")
+            lines.append(f"- 涨停家数: {br.get('limit_up_count', 'n/a')}")
+            lines.append(f"- 跌停家数: {br.get('limit_down_count', 'n/a')}")
+            if br.get("limit_up_seal_rate") is not None:
+                lines.append(f"- 封板率: {br['limit_up_seal_rate']:.0%}")
+            if br.get("advance_decline_ratio") is not None:
+                lines.append(f"- 涨跌家数比: {br['advance_decline_ratio']:.2f}")
+            if br.get("new_high_minus_new_low") is not None:
+                lines.append(f"- 新高新低差: {br['new_high_minus_new_low']:+d}")
+            comp = br.get("breadth_composite")
+            if comp is not None:
+                flag = "🚫极端避险" if comp < -2 else ("⚠️弱势" if comp < -1 else "")
+                lines.append(f"- **breadth_composite**: {comp:.2f} {flag}")
+            else:
+                lines.append("- breadth_composite: n/a（数据不足）")
+        else:
+            lines.append(f"- ⚠️ {br.get('reason', 'breadth_daily 空（先跑 data.breadth）')}")
+        lines.append("")
 
     # 信号（补 ATR占比/换手分位/5日动量/均线结构/价格口径——md 此前丢掉了决策关键列）
     lines += [f"## 技术信号（as_of={ev}，score profile={bundle.get('score_profile', '见config')}）", ""]

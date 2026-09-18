@@ -55,20 +55,75 @@ def fnum(val: Any, default: float = 0.0) -> float:
 
 # ---------------------------------------------------------------- 风控快照（复用 risk/blacklist.py，单一事实源——此前双维护存在口径漂移风险）
 
-def health_issues_of(conn: sqlite3.Connection) -> List[str]:
+def health_issues_of(conn: sqlite3.Connection, scope: str = "watchlist") -> List[str]:
+    """数据健康告警。
+
+    scope="watchlist" 只看自选池（日常看板口径）；scope="all" 看全 universe。
+    列表里同时包含"当日缺失"（今天该有却没有）和"长期滞后"（最新 bar 落后
+    全局最新日 1 天以上）——后者用「(停 N 天)」后缀标注，便于 UI 折叠。
+    """
+    from datetime import datetime
     from risk.blacklist import health_check
-    return health_check(conn)
+    if scope == "all":
+        return health_check(conn)
+
+    wl = _watchlist_codes()
+    if not wl:
+        return []
+    ph = ",".join("?" * len(wl))
+    rows = q_all(conn, f"SELECT code, name, MAX(trade_date) AS latest "
+                       f"FROM stock_info LEFT JOIN daily_bar USING(code) "
+                       f"WHERE code IN ({ph}) GROUP BY code, name", wl)
+    issues: List[str] = []
+    global_latest = q_one(conn, "SELECT MAX(trade_date) AS d FROM daily_bar")
+    global_latest = global_latest["d"] if global_latest else None
+    today = datetime.now().date()
+    for r in rows:
+        latest = r["latest"]
+        if latest is None:
+            issues.append(f"{r['code']} {r['name']} 缺少全部日线")
+            continue
+        try:
+            ld = datetime.fromisoformat(str(latest)).date()
+        except ValueError:
+            continue
+        if global_latest and ld.isoformat() != global_latest:
+            lag = (today - ld).days
+            issues.append(f"{r['code']} {r['name']} 停在 {latest}（滞后 {lag} 天）")
+    return issues
 
 
-def blacklist_of(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+def blacklist_of(conn: sqlite3.Connection, scope: str = "watchlist") -> List[Dict[str, Any]]:
+    """黑名单快照。
+
+    scope="watchlist" 只看自选池（日常看板口径，PASS/BLOCK 比例直观）；
+    scope="all" 看全 universe（含历史 holdings / 信号命中票）——少数场合需要。
+    """
     from risk.blacklist import check_blacklist
-    names = {r["code"]: r["name"] for r in
-             q_all(conn, "SELECT code, name FROM stock_info")}
+    bl = check_blacklist(conn)
+    if scope == "all":
+        names = {r["code"]: r["name"] for r in
+                 q_all(conn, "SELECT code, name FROM stock_info")}
+    else:
+        wl = set(_watchlist_codes())
+        bl = {c: v for c, v in bl.items() if c in wl}
+        names = {r["code"]: r["name"] for r in
+                 q_all(conn, f"SELECT code, name FROM stock_info "
+                             f"WHERE code IN ({','.join('?' * len(wl))})", tuple(wl))}
     out: List[Dict[str, Any]] = []
-    for code, (ok, reason) in sorted(check_blacklist(conn).items()):
+    for code, (ok, reason) in sorted(bl.items()):
         out.append({"code": code, "name": names.get(code, code),
                     "ok": bool(ok), "reason": reason or "-"})
     return out
+
+
+def _watchlist_codes() -> List[str]:
+    """自选池代码列表（复用 common.config.snapshot，与 risk/blacklist 一致口径）。"""
+    try:
+        from common.config import snapshot
+        return [str(w["code"]) for w in (snapshot().get("watchlist") or [])]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def latest_bar(conn: sqlite3.Connection, code: str) -> Optional[dict]:

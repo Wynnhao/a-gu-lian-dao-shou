@@ -104,6 +104,13 @@ def _fetch_tencent(codes: List[str]) -> Dict[str, dict]:
                 "time": f[30] if len(f) > 30 else now_iso,
                 "name": f[1] if len(f) > 1 else "",
                 "source": "tencent",
+                # Sprint 1 任务3：规则21 跌停封单应急 + 与公式兜底交叉验证
+                # 字段索引沿用本函数"市场类型 + 1"的内部偏移约定（与 f[33]/f[34] 同款）
+                "ask1_price": float(f[21]) if len(f) > 21 and f[21] else None,
+                "ask1_vol": float(f[22]) if len(f) > 22 and f[22] else None,  # 单位：手
+                "float_mv": float(f[42]) if len(f) > 42 and f[42] else None,  # 流通市值，元
+                "limit_up": float(f[45]) if len(f) > 45 and f[45] else None,
+                "limit_down": float(f[46]) if len(f) > 46 and f[46] else None,
             }
         except (ValueError, IndexError):
             continue

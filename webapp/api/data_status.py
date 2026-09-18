@@ -64,7 +64,9 @@ def api_data_status(conn: sqlite3.Connection, qs: dict) -> dict:
                       "count": int(row[2] or 0) if row else 0})
 
     # 4) 信号/决策新鲜度
-    sig = conn.execute("SELECT MAX(as_of), COUNT(*) FROM signal").fetchone()
+    from common.config import active_profile
+    sig = conn.execute("SELECT MAX(as_of), COUNT(*) FROM signal WHERE profile=?",
+                       (active_profile(),)).fetchone()
     dec = conn.execute(
         "SELECT run_date, COUNT(*) FROM decision WHERE run_date="
         "(SELECT MAX(run_date) FROM decision) GROUP BY run_date").fetchone()

@@ -10,13 +10,13 @@
 
 | 动作 | 方式 |
 |---|---|
-| 打开看板 | 双击 **`启动控制台.command`**（或 `python3 webapp/server.py` → http://127.0.0.1:8317） |
+| 打开看板 | 双击 **`启动控制台.command`**（或 `.venv/bin/python3 /webapp/server.py` → http://127.0.0.1:8317） |
 | 看门狗安装/卸载 | 双击 **`看门狗开关.command`**（按当前状态自动切换；装好后需一次性授权，步骤脚本会打印） |
-| 跑测试 | `python3 tests/run_all.py`（10 个文件 158 用例，全部离线，聚合入口；也可逐个直跑） |
+| 跑测试 | `.venv/bin/python3 /tests/run_all.py`（10 个文件 158 用例，全部离线，聚合入口；也可逐个直跑） |
 | 重建前端 | `cd webapp/frontend && npm run build`（产物 → webapp/dist，Storybook: `npm run storybook`） |
-| 补跑漏掉的任务 | `python3 pipeline/catchup.py`（幂等，随时可跑；4 个 cron 首步也会自动跑它） |
-| 回填信号全史 | `python3 -m signals.signals --backfill`（逐日重算 signal 表，幂等；score 口径变更后必须重跑） |
-| 回补中证800宇宙 | `python3 -m data.universe800`（腾讯源，幂等可续跑；回测宇宙去幸存者化） |
+| 补跑漏掉的任务 | `.venv/bin/python3 /pipeline/catchup.py`（幂等，随时可跑；4 个 cron 首步也会自动跑它） |
+| 回填信号全史 | `.venv/bin/python3 /-m signals.signals --backfill`（逐日重算 signal 表，幂等；score 口径变更后必须重跑） |
+| 回补中证800宇宙 | `.venv/bin/python3 /-m data.universe800`（腾讯源，幂等可续跑；回测宇宙去幸存者化） |
 
 ## 每日节奏（交易日，4 个 ZCode cron 已建）
 
@@ -38,7 +38,7 @@
 A股镰刀手/
 ├── README.md                 ← 本索引
 ├── 技术方案.md                # 总体设计、分阶段计划、验收标准（§5）与当前状态（§7）
-├── config.json               # 全局配置：watchlist(82只·8题材组×10+2未分组)/blacklist_rules/risk/pools/execution
+├── config.json               # 全局配置：watchlist(86只·8题材组；watchlist_core=51只可交易 / watchlist_extended=35只仅观察)/blacklist_rules/risk/pools/execution
 ├── 启动控制台.command          # 双击启动看板（后台常驻+自动开浏览器）
 ├── 看门狗开关.command          # 双击安装/卸载漏开机兜底看门狗（launchd，自动切换状态）
 ├── deploy/
@@ -95,7 +95,7 @@ A股镰刀手/
 │   │   └── dist/             # 构建产物（server 优先服务）
 │   └── static/               # 旧版前端（已被 dist 替代，保留备用）
 │
-├── tests/                    # 10 个测试文件 158 用例（python3 tests/run_all.py 聚合直跑，全离线）
+├── tests/                    # 10 个测试文件 158 用例（.venv/bin/python3 tests/run_all.py 聚合直跑，全离线）
 │   ├── test_risk_engine.py(39) test_regime.py(11) test_execution.py(25) test_signals.py(27)
 │   ├── test_ai_pipeline.py(17) test_review.py(15) test_webapp.py(4) test_news_macro.py(7)
 │   ├── test_quotes.py(7) test_movers_hot.py(6)；run_all.py 为聚合入口
@@ -117,7 +117,7 @@ A股镰刀手/
 ├── data/market.db            # SQLite 数据库（WAL 模式，14张表，见下）
 └── logs/backup/              # 每日 VACUUM INTO 备份（保留 30 份）
 │
-├── requirements.txt          # Python 依赖锁定（复现：python3 -m venv .venv && pip install -r）
+├── requirements.txt          # Python 依赖锁定（复现：python3 -m venv .venv && pip install -r；裸 python3 仅用于建 venv，运行时必须用 .venv/bin/python3）
 ├── deploy/
 │   ├── com.agsickle.catchup.plist  # launchd 看门狗定义（经 deploy/run_catchup.sh 统一入口）
 │   └── run_catchup.sh              # 解释器选择包装脚本（.venv 优先，回退系统 python3）
@@ -146,7 +146,7 @@ A股镰刀手/
 | execution 新增 | slippage_bps(滑点10) / volume_participation_cap(成交量参与1%) / sim_limit_halt(停板模拟) |
 | notify | enabled/osascript/webhook_url —— kill、回读失败、成交失败、pending 生成推送 |
 | data | start_date / source_cooldown_min / source_max_fail —— 采集与熔断 |
-| signals | profile: reversal_lowvol（默认，截面 rank 打分）或 momentum（时序）
+| signals | profile: **momentum（当前生效，时序）** / reversal_lowvol 与 reversal_lowvol_v2（截面 rank，可切）
 
 ## 看板 API 索引（webapp/server.py，全部 JSON）
 
@@ -168,6 +168,6 @@ A股镰刀手/
 
 - ✅ P1~P5 全部落地；2026-09-13 多维审查 40+ 项修复完成（见 docs/优化修复纪要.md）；136 测试全绿；账本干净基线（¥1,000,000 空仓）
 - ✅ 2026-09-14 策略库审查落地：score 截面化+signal 全史回填（18,946 样本）+复权 OHLC 全库覆盖（腾讯源）+市场环境总闸+ATR 自适应止损+profile 切换判据+中证800 宇宙回补（详见 docs/策略库.md §10）
-- ⏳ 待办 1：一次性人工操作——①看门狗授权（双击看门狗开关后按打印步骤）；②`python3 -m data.audit --fix` 修复存量量纲；③东财解封后跑 `python3 data/fetcher.py`（腾讯源已回填复权列，东财恢复后再跑一次统一口径）
+- ⏳ 待办 1：一次性人工操作——①看门狗授权（双击看门狗开关后按打印步骤）；②`.venv/bin/python3 /-m data.audit --fix` 修复存量量纲；③东财解封后跑 `.venv/bin/python3 /data/fetcher.py`（腾讯源已回填复权列，东财恢复后再跑一次统一口径）
 - ⏳ 待办 2：同花顺实机演练 3 次（按 execution/runbook_ths.md）；mode=ui 已被代码层硬拒，演练需 AGSICKLE_ALLOW_UI=1
 - ▶ 就绪后进入 **P6：连续 20 交易日模拟盘试运行**（验收口径见技术方案 §5.5；决策质量/信号有效性统计链路已就绪）

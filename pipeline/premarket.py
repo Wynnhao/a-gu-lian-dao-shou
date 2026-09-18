@@ -62,12 +62,40 @@ def check_watchdog(conn) -> list:
     return problems
 
 
+def refresh_bond_etf() -> None:
+    """步骤 3.5：10Y 国债收益率 + ETF 份额刷新（Fix-2 pipeline 接入）。
+
+    regime.compute_regime 消费这两张表；任一失败只 warning 继续，不阻断盘前。
+    """
+    try:
+        macro_mod.fetch_bond_yield()
+        log.info("步骤3.5 fetch_bond_yield 完成")
+    except Exception as e:
+        log.error("步骤3.5 fetch_bond_yield FAIL（继续）: %s", repr(e))
+    try:
+        macro_mod.fetch_etf_share()
+        log.info("步骤3.5 fetch_etf_share 完成")
+    except Exception as e:
+        log.error("步骤3.5 fetch_etf_share FAIL（继续）: %s", repr(e))
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="盘前流水线：数据准备 + 决策输入包落盘")
     ap.add_argument("--date", default=None, dest="run_date",
                     help="运行日期 YYYY-MM-DD（默认今天=预期执行日；证据自动取最新交易日）")
     args = ap.parse_args(argv)
     log.info("==== premarket start ====")
+
+    # 0.5 跌停应急单超时兜底（Fix-4 / D1：昨日未 confirm 的 emergency_scan 单，
+    # 09:14 后自动 confirm(confirmed_by=emergency_timeout_failsafe)；此前仅通知）
+    try:
+        from signals import limit_halt
+        fs = limit_halt.premarket_failsafe()
+        if fs.get("pending"):
+            log.info("步骤0.5 应急单兜底：pending=%s executed=%s notified=%s",
+                     fs["pending"], fs["executed"], fs["notified"])
+    except Exception as e:
+        log.error("步骤0.5 应急单兜底 FAIL（继续）: %s", repr(e))
 
     # 0. 看门狗心跳体检（兜底层自检——此前兜底失效无人知晓）
     watchdog_problems: list = []
@@ -109,6 +137,9 @@ def main(argv=None) -> int:
                 log.info("步骤3 index_valuation 最新 %s（滞后 %d 天 ≤3），跳过", row, lag)
         except Exception as e:
             log.error("步骤3 估值刷新 FAIL（继续）: %s", repr(e))
+
+        # 3.5 国债收益率 + ETF 份额（Sprint 2 任务 1 / Fix-2：接 pipeline 防数据永陈旧）
+        refresh_bond_etf()
 
         # 4. 黑名单 + 数据健康
         try:
@@ -160,6 +191,42 @@ def main(argv=None) -> int:
                      m["count"], m["mode"], len(h["themes"]), len(h["stocks"]))
         except Exception as e:
             log.error("步骤6.5 动态池 FAIL（继续）: %s", repr(e))
+
+        # 6.6 业绩预告关键词分类（Sprint 2 任务 2 P1-4）：写 news_earnings 表，
+        # bundle.py 步骤 7 读取 → LLM 决策依据
+        try:
+            from signals import earnings
+            ee = earnings.refresh(conn=conn, days=3, min_net_score=2)
+            log.info("步骤6.6 业绩预告：%d 票命中关键词（净分 ≥ 2）", len(ee))
+        except Exception as e:
+            log.error("步骤6.6 earnings.refresh FAIL（继续）: %s", repr(e))
+
+        # 6.7 市场宽度（Sprint 2 任务 3 P1-1）：采集涨停/跌停家数等 → 写
+        # breadth_daily 表；regime.py compute_regime 自动读
+        try:
+            from data import breadth
+            br = breadth.fetch_breadth_daily(conn=conn)
+            log.info("步骤6.7 市场宽度：source=%s, 涨停=%s, 跌停=%s",
+                     br.get("source"),
+                     br.get("limit_up_count"),
+                     br.get("limit_down_count"))
+        except Exception as e:
+            log.error("步骤6.7 fetch_breadth_daily FAIL（继续）: %s", repr(e))
+
+        # 6.8 信号有效性评估 + 落盘（任务 1）：必须在写 bundle 前完成，
+        # 否则 bundle 读 latest.json 时取到的是昨日旧值。
+        try:
+            from review.signal_eval import evaluate, _persist_latest
+            payload = evaluate(conn)
+            persist = _persist_latest(payload)
+            if persist.get("error"):
+                log.warning("步骤6.8 signal_eval 落盘失败（不阻断）: %s",
+                            persist["error"])
+            else:
+                log.info("步骤6.8 signal_eval 落盘 OK: %s",
+                         persist.get("date"))
+        except Exception as e:
+            log.error("步骤6.8 signal_eval FAIL（不阻断）: %s", repr(e))
 
         # 7. 决策输入包
         try:

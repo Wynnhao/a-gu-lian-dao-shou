@@ -4,7 +4,7 @@
 1. launchd 看门狗（deploy/com.agsickle.catchup.plist，StartInterval=1800）——
    macOS launchd 语义：错过的 StartInterval 触发会在唤醒后合并执行一次，
    这正是"没开机"场景的兜底入口（cron/ZCode cron 均为纯跳过）。
-2. 手动/任意会话运行：python3 pipeline/catchup.py（幂等，随时可跑）。
+2. 手动/任意会话运行：.venv/bin/python3 pipeline/catchup.py（幂等，随时可跑）。
 
 补跑内容（全部确定性脚本，不含 LLM 决策）：
 - 增量行情（交易时段自动防盘中部分bar，见 fetcher P1-1 防护）；

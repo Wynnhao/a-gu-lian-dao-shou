@@ -150,7 +150,18 @@ export function DecisionTable({
                   <span className="num text-tiny text-muted-foreground">{r.code}</span>
                 </TableCell>
                 <TableCell>{actionLabel(r.action)}</TableCell>
-                <TableCell className="num text-right">{fmtPct(r.target_weight * 100)}</TableCell>
+                <TableCell className="num text-right">
+                  {r.action === "buy" ? (
+                    fmtPct(r.target_weight * 100)
+                  ) : (
+                    <span
+                      className="text-muted-foreground"
+                      title="卖出/观察/持有不设目标权重（仅建仓有仓位比例）"
+                    >
+                      —
+                    </span>
+                  )}
+                </TableCell>
                 <TableCell className="num text-right">{r.confidence.toFixed(2)}</TableCell>
                 <TableCell>
                   <div className="flex items-center gap-1.5">

@@ -24,8 +24,11 @@ data/*.db-shm
 data/*.db-wal
 data/*.sqlite
 data/*.sqlite3
+data/*.db.bak*
 logs/*.log
 logs/*.json
+logs/*.lock
+logs/*.jsonl
 logs/orders/
 logs/reports/
 logs/session/
@@ -33,6 +36,12 @@ logs/quotes/
 logs/backup/
 logs/state/
 logs/review_html/
+logs/signal_eval/
+logs/backtest/
+logs/launchd/
+
+# ---------- 本地工具工作区 ----------
+.lark-draft/
 
 # ---------- ZCode 本地 ----------
 .zcode/

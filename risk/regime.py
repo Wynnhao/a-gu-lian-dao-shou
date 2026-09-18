@@ -63,16 +63,31 @@ _VOL_DEFAULTS = {
     "window": 20,              # 已实现波动回看窗口（交易日）
     "min_samples": 21,         # 至少需要 window+1 个净值点
 }
+
+# Sprint 2 任务 1（P1-3）：10Y 国债 + ETF 份额旁路默认
+_BOND_DEFAULTS = {
+    "delta_bp_threshold": -15,    # 20 日变动 < -15bp → cap × 0.8
+    "downside_mult": 0.8,         # 乘子
+}
+_ETF_DEFAULTS = {
+    "up_pct_threshold": 2.0,      # 单日 +2% → 避险档升到半配
+    "down_pct_threshold": -2.0,   # 单日 -2% → 满配档降到半配
+}
 STATIC_CAP_FALLBACK = 1.0     # cap 缺省（无约束；engine 仍取 min(静态上限, cap)）
 
 
 def _cfg(root: Optional[dict]) -> Tuple[dict, dict]:
+    """返回 (regime_cfg, vol_cfg, bond_cfg, etf_cfg) 四元组。"""
     cfg = root or {}
     r = dict(_DEFAULTS)
     r.update(cfg.get("regime", {}) or {})
     v = dict(_VOL_DEFAULTS)
     v.update(cfg.get("vol_target", {}) or {})
-    return r, v
+    b = dict(_BOND_DEFAULTS)
+    b.update(cfg.get("bond_yield", {}) or {})
+    e = dict(_ETF_DEFAULTS)
+    e.update(cfg.get("etf_share", {}) or {})
+    return r, v, b, e
 
 
 def _static_total_cap(root: Optional[dict]) -> float:
@@ -131,8 +146,11 @@ def dual_momentum(close_big: pd.Series, close_small: pd.Series,
 
 
 def compute_regime(conn, root: Optional[dict] = None) -> dict:
-    """RSRS 三档 + 二八开关 → (档位名, 绝对 cap, 明细)。数据缺失降级为无约束。"""
-    cfg, _ = _cfg(root)
+    """RSRS 三档 + 二八开关 → (档位名, 绝对 cap, 明细)。数据缺失降级为无约束。
+
+    Sprint 2 任务 1（P1-3）：增加第 5/6 路——10Y 国债乘子 + ETF 份额档位调整。
+    """
+    cfg, _, bond_cfg, etf_cfg = _cfg(root)
     static_cap = _static_total_cap(root)
     detail = {"rsrs": None, "dual_mom": None, "tier": None, "cap": None}
     if not cfg.get("enabled", True):
@@ -186,10 +204,70 @@ def compute_regime(conn, root: Optional[dict] = None) -> dict:
     except Exception as e:  # noqa: BLE001
         detail["dual_mom_error"] = repr(e)[:120]
 
+    # ---- Sprint 2 任务 1（P1-3）：国债乘子（20 日收益率变动 < -15bp → cap × 0.8）----
+    try:
+        bond_mult = _compute_bond_yield_modifier(conn, bond_cfg)
+        detail["bond_yield"] = {"mult": bond_mult}
+        if bond_mult < 1.0:
+            caps.append(round(static_cap * bond_mult, 4))
+            detail["bond_yield"]["signal"] = "10Y 收益率下行，cap 压至 ×{:.2f}".format(bond_mult)
+    except Exception as e:  # noqa: BLE001
+        detail["bond_yield_error"] = repr(e)[:120]
+
+    # ---- Sprint 2 任务 1（P1-3）/ Fix-2：ETF 份额档位（只出方向，末尾 override）----
+    etf_signal = {"direction": None, "pct": None}
+    try:
+        etf_signal = _compute_etf_tier_shift(conn, etf_cfg)
+        detail["etf_share"] = {
+            "direction": etf_signal.get("direction"),
+            "pct": etf_signal.get("pct"),
+            "signal": ("ETF 份额单日 %+.2f%% → %s 档信号"
+                       % (etf_signal["pct"], etf_signal["direction"])
+                       if etf_signal.get("direction") else "无异动，不调整"),
+        }
+    except Exception as e:  # noqa: BLE001
+        detail["etf_share_error"] = repr(e)[:120]
+
+    # ---- Sprint 2 任务 3（P1-1）：市场宽度熔断（composite < -2 → cap 0.1）----
+    try:
+        from signals.breadth import compute_breadth_factor
+        bf = compute_breadth_factor(conn)
+        detail["breadth"] = {"composite": bf.get("composite"),
+                             "reason": bf.get("reason")}
+        if bf.get("override_cap") is not None:
+            caps.append(bf["override_cap"])
+            detail["breadth"]["override_cap"] = bf["override_cap"]
+    except Exception as e:  # noqa: BLE001
+        detail["breadth_error"] = repr(e)[:120]
+
     if caps:
         cap_final = round(min(caps), 4)
         detail["cap"] = cap_final
-        # 档位名统一按最终 cap 归档（RSRS 半配 × 二八避险 → 取更保守的避险档）
+        # Fix-2 min-after override：ETF 档位信号在 min(caps) 之后施加——
+        # up（底部信号）是唯一允许"往上提"的路径（避险升半配）；
+        # down（顶部信号）把满配压到半配。
+        try:
+            if etf_signal.get("direction") == "up":
+                after = max(cap_final, float(cfg["cap_half"]))
+                detail["etf_share"]["cap_before"], detail["etf_share"]["cap_after"] = \
+                    cap_final, round(after, 4)
+                cap_final = round(after, 4)
+                detail["cap"] = cap_final
+                detail["etf_share"]["signal"] = (
+                    "ETF 底部信号 → cap 升档 %.2f→%.2f" %
+                    (detail["etf_share"]["cap_before"], cap_final))
+            elif etf_signal.get("direction") == "down":
+                after = min(cap_final, float(cfg["cap_half"]))
+                detail["etf_share"]["cap_before"], detail["etf_share"]["cap_after"] = \
+                    cap_final, round(after, 4)
+                cap_final = round(after, 4)
+                detail["cap"] = cap_final
+                detail["etf_share"]["signal"] = (
+                    "ETF 顶部信号 → cap 降档 %.2f→%.2f" %
+                    (detail["etf_share"]["cap_before"], cap_final))
+        except Exception as e:  # noqa: BLE001
+            detail["etf_share_error"] = repr(e)[:120]
+        # 档位名统一按最终 cap 归档（RSRS 半配 × 二八避险 → 取最保守的避险档）
         if cap_final >= static_cap * 0.999:
             detail["tier"] = "满配"
         elif cap_final >= float(cfg["cap_half"]) * 0.999:
@@ -201,7 +279,7 @@ def compute_regime(conn, root: Optional[dict] = None) -> dict:
 
 def compute_vol_target(conn, root: Optional[dict] = None) -> dict:
     """组合已实现波动 → 波动率目标仓位 cap（绝对值）。样本不足 → cap=None。"""
-    cfg, v = _cfg(root)
+    cfg, v, _, _ = _cfg(root)
     static_cap = _static_total_cap(root)
     out = {"enabled": bool(v.get("enabled", True)), "cap": None}
     if not out["enabled"]:
@@ -282,3 +360,60 @@ def stop_loss_line(base_pct: float, atr_pct: Optional[float],
     if atr_pct is None or atr_pct <= 0:
         return base
     return max(base, float(atr_mult) * float(atr_pct))
+
+
+# ============================================================
+# Sprint 2 任务 1（P1-3）：10Y 国债乘子 + ETF 份额档位调整
+# ============================================================
+
+def _compute_bond_yield_modifier(conn, bond_cfg: dict) -> float:
+    """读 index_bond_yield 最近一行 delta_20d_bp：
+
+    - delta < bond_cfg["delta_bp_threshold"]（默认 -15bp）→ return downside_mult（默认 0.8）
+    - 否则或数据缺失 → return 1.0（不约束）
+    """
+    threshold = float(bond_cfg.get("delta_bp_threshold", -15))
+    mult = float(bond_cfg.get("downside_mult", 0.8))
+    try:
+        row = conn.execute(
+            "SELECT delta_20d_bp FROM index_bond_yield"
+            " WHERE index_code='10Y_CN'"
+            " ORDER BY trade_date DESC LIMIT 1").fetchone()
+        if not row or row[0] is None:
+            return 1.0
+        delta = float(row[0])
+        if delta < threshold:
+            return mult
+        return 1.0
+    except Exception:
+        return 1.0
+
+
+def _compute_etf_tier_shift(conn, etf_cfg: dict) -> dict:
+    """读 index_etf_share 最近一行 pct_chg_1d（取 510300 沪深300ETF 作主信号）：
+
+    返回 {"direction": "up"|"down"|None, "pct": float|None}（Fix-2：只出方向信号，
+    cap 调整移到 compute_regime 的 min(caps) 之后做 min-after override——
+    升档是唯一允许"往上提"的路径，放 caps 里会被 min() 覆盖成死代码）：
+
+    - pct > up_pct_threshold（默认 +2%）→ direction="up"（底部信号：避险档升半配）
+    - pct < down_pct_threshold（默认 -2%）→ direction="down"（顶部信号：满配档降半配）
+    - 否则/数据缺失 → direction=None
+    """
+    up_th = float(etf_cfg.get("up_pct_threshold", 2.0))
+    down_th = float(etf_cfg.get("down_pct_threshold", -2.0))
+    try:
+        row = conn.execute(
+            "SELECT pct_chg_1d FROM index_etf_share"
+            " WHERE etf_code='510300'"
+            " ORDER BY trade_date DESC LIMIT 1").fetchone()
+        if not row or row[0] is None:
+            return {"direction": None, "pct": None}
+        pct = float(row[0])
+        if pct > up_th:
+            return {"direction": "up", "pct": pct}
+        if pct < down_th:
+            return {"direction": "down", "pct": pct}
+        return {"direction": None, "pct": pct}
+    except Exception:
+        return {"direction": None, "pct": None}

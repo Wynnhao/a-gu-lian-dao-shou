@@ -6,7 +6,7 @@ import { Panel } from "@/components/Panel";
 import { Inspect } from "@/components/Inspector";
 import { EChart } from "@/components/EChart";
 import { KlineCard } from "@/pages/SignalsPage";
-import { apiGet, type ConceptGroup, type ConceptStock, type ConceptsData, type DynamicPools } from "@/lib/api";
+import { apiGet, type ConceptGroup, type ConceptStock, type ConceptsData, type DynamicPools, type DynPoolRow } from "@/lib/api";
 import { useApi } from "@/lib/hooks";
 import { useRefresh } from "@/lib/refresh";
 import { chartPalette, useTheme } from "@/lib/theme";
@@ -23,7 +23,9 @@ function Chg({ v }: { v: number | null }) {
   return <span className={cn("font-mono tabular-nums", cls)}>{fmtPct(v)}</span>;
 }
 
-function StockRow({ s, onSelect }: { s: ConceptStock; onSelect: () => void }) {
+function StockRow({ s, onSelect, markObservation = false }: {
+  s: ConceptStock; onSelect: () => void; markObservation?: boolean;
+}) {
   const basis = `daily_bar${s.source ? " · " + s.source : ""}`;
   return (
     <button
@@ -35,6 +37,9 @@ function StockRow({ s, onSelect }: { s: ConceptStock; onSelect: () => void }) {
       <span className="font-mono text-muted-foreground">{s.code}</span>
       <span className="truncate font-medium">
         {s.name}
+        {markObservation && (
+          <Badge variant="outline" className="ml-1.5 px-1 py-0 text-[10px]">观察</Badge>
+        )}
         {s.blacklisted && (
           <Badge variant="destructive" className="ml-1.5 px-1 py-0 text-[10px]">
             禁交易
@@ -187,6 +192,130 @@ function WatchHeatmap({
   );
 }
 
+/* 热门池紧凑渲染：题材与个股各自 Top 8 折叠 + 板块榜 Badge 横向
+   - 题材行：左标题 + 右"热度 X"；样本标题全部进 title 悬停
+   - 个股行：code / 名称 / 涨跌幅 / 强度 四列（与异动池一致）；样本标题进 title 悬停
+   - 板块榜：Badge 横向，超过 5 个收起到 "展开全部" */
+const HOT_PREVIEW = 8;
+const BOARDS_PREVIEW = 5;
+
+function HotPoolPanel({
+  themes,
+  stocks,
+  boards,
+  stockMap,
+}: {
+  themes: DynPoolRow[];
+  stocks: DynPoolRow[];
+  boards: { board: string; pct_chg: number }[];
+  stockMap: Map<string, { name: string; close: number | null; pct_chg: number | null }>;
+}) {
+  const [expandTheme, setExpandTheme] = useState(false);
+  const [expandStock, setExpandStock] = useState(false);
+  const [expandBoard, setExpandBoard] = useState(false);
+
+  return (
+    <div>
+      {/* 题材行 */}
+      {themes.map((t, idx) => (
+        <div
+          key={t.code}
+          className={cn(
+            "flex items-center justify-between border-b border-line/60 px-3 py-1.5 text-xs",
+            idx >= HOT_PREVIEW && !expandTheme && "hidden",
+          )}
+          title={`${t.name}｜${t.reasons.join(" · ")}`}
+        >
+          <span className="min-w-0 flex-1 truncate font-medium">{t.name}</span>
+          <span className="ml-2 shrink-0 font-mono text-[11px] text-muted-foreground">
+            热度 {t.strength.toFixed(0)}
+          </span>
+        </div>
+      ))}
+      {themes.length > HOT_PREVIEW && (
+        <button
+          type="button"
+          onClick={() => setExpandTheme((v) => !v)}
+          className="block w-full px-3 py-1 text-left text-[11px] text-muted-foreground hover:bg-accent/5"
+        >
+          {expandTheme ? "收起" : `展开全部 (${themes.length})`}
+        </button>
+      )}
+
+      {/* 个股行：与异动池四列对齐 */}
+      {stocks.map((h, idx) => {
+        const st = stockMap.get(h.code);
+        const name = st?.name && st.name !== h.code ? st.name : h.name;
+        return (
+          <div
+            key={h.code}
+            className={cn(
+              "flex min-w-0 items-baseline gap-1.5 border-b border-line/60 px-3 py-[5px] text-xs",
+              idx >= HOT_PREVIEW && !expandStock && "hidden",
+            )}
+            title={`${h.code} ${name}｜${h.reasons.join(" · ")}`}
+          >
+            <span className="w-[50px] shrink-0 font-mono text-muted-foreground">{h.code}</span>
+            <span className="min-w-0 flex-1 truncate font-medium">{name}</span>
+            {st?.close != null && (
+              <span className="shrink-0 font-mono tabular-nums">{fmtNum(st.close)}</span>
+            )}
+            <span className="w-[52px] shrink-0 text-right">
+              <Chg v={st?.pct_chg ?? null} />
+            </span>
+            <span className="w-[30px] shrink-0 text-right font-mono text-[11px] text-muted-foreground">
+              ×{h.strength.toFixed(1)}
+            </span>
+          </div>
+        );
+      })}
+      {stocks.length > HOT_PREVIEW && (
+        <button
+          type="button"
+          onClick={() => setExpandStock((v) => !v)}
+          className="block w-full px-3 py-1 text-left text-[11px] text-muted-foreground hover:bg-accent/5"
+        >
+          {expandStock ? "收起" : `展开全部 (${stocks.length})`}
+        </button>
+      )}
+
+      {themes.length === 0 && stocks.length === 0 && (
+        <div className="px-3 py-3 text-xs text-muted-foreground">当前无热门题材/个股</div>
+      )}
+
+      {/* 板块榜：Badge 横向 */}
+      {boards.length > 0 && (
+        <div className="border-t border-line/60 px-3 py-2 text-[11px] text-muted-foreground">
+          <span className="mr-1.5">板块榜：</span>
+          <span className="inline-flex flex-wrap gap-1">
+            {boards.map((b, idx) => (
+              <Badge
+                key={b.board}
+                variant="outline"
+                className={cn(
+                  "border-line px-1.5 py-0 text-[11px] font-mono tabular-nums",
+                  idx >= BOARDS_PREVIEW && !expandBoard && "hidden",
+                )}
+              >
+                {b.board} {fmtPct(b.pct_chg)}
+              </Badge>
+            ))}
+            {boards.length > BOARDS_PREVIEW && (
+              <button
+                type="button"
+                onClick={() => setExpandBoard((v) => !v)}
+                className="rounded border border-line px-1.5 py-0 text-[11px] hover:bg-accent/5"
+              >
+                {expandBoard ? "收起" : `更多 (${boards.length - BOARDS_PREVIEW})`}
+              </button>
+            )}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function GroupsPage() {
   const { manualTick } = useRefresh();
   const { dark } = useTheme();
@@ -278,36 +407,8 @@ export function GroupsPage() {
             )}
           </Panel>
           <Panel title="热门池" caliber={<>题材热度 + 个股新闻突增 · 仅观察不可交易</>} bodyClassName="p-0">
-            {pools.data.hot_theme.map((t) => (
-              <div key={t.code} className="border-b border-line/60 px-3 py-1.5 text-xs">
-                <div className="flex items-center justify-between">
-                  <span className="font-medium">{t.name}</span>
-                  <span className="font-mono text-[11px] text-muted-foreground">热度 {t.strength.toFixed(0)}</span>
-                </div>
-                <div className="mt-0.5 text-[11px] text-muted-foreground">{(t.reasons[0] ?? "")}{t.reasons[1] ? ` · ${t.reasons[1]}` : ""}</div>
-              </div>
-            ))}
-            {pools.data.hot_stock.map((h) => (
-              <div key={h.code} className="border-b border-line/60 px-3 py-1.5 text-xs">
-                <div className="flex items-center justify-between">
-                  <span>
-                    <span className="font-mono text-muted-foreground">{h.code}</span>
-                    {" "}<span className="font-medium">{h.name}</span>
-                    <span className="ml-1.5 text-[10px] text-muted-foreground">新闻突增</span>
-                  </span>
-                  <span className="font-mono text-[11px] text-muted-foreground">×{h.strength.toFixed(1)}</span>
-                </div>
-                <div className="mt-0.5 text-[11px] text-muted-foreground">{(h.reasons[0] ?? "")}</div>
-              </div>
-            ))}
-            {pools.data.hot_theme.length === 0 && pools.data.hot_stock.length === 0 && (
-              <div className="px-3 py-3 text-xs text-muted-foreground">当前无热门题材/个股</div>
-            )}
-            {pools.data.boards.length > 0 && (
-              <div className="px-3 py-2 text-[11px] text-muted-foreground">
-                板块榜：{pools.data.boards.slice(0, 5).map((b) => `${b.board} ${fmtPct(b.pct_chg)}`).join(" · ")}
-              </div>
-            )}
+            {/* 单行紧凑，样本标题全部折叠到 title 悬停提示里（与异动池一致） */}
+            <HotPoolPanel themes={pools.data.hot_theme} stocks={pools.data.hot_stock} boards={pools.data.boards} stockMap={stockMap} />
           </Panel>
         </div>
       )}
@@ -350,8 +451,19 @@ export function GroupsPage() {
           {groups.map((g) => (
             <Panel
               key={g.name}
-              title={g.name}
-              caliber={<>{g.stocks.length} 只 · 点击行看K线</>}
+              title={
+                <span className="flex items-center gap-1.5">
+                  {g.name}
+                  {g.observation_only && (
+                    <Badge variant="warn" className="px-1 py-0 text-[10px]">仅观察</Badge>
+                  )}
+                </span>
+              }
+              caliber={
+                g.observation_only
+                  ? <>{g.stocks.length} 只 · 不可 buy/sell（未入可交易池）· 点击行看K线</>
+                  : <>{g.stocks.length} 只 · 可交易 {g.tradable_count ?? g.stocks.length} 只 · 点击行看K线</>
+              }
               bodyClassName="p-0"
             >
               <div className="grid grid-cols-[64px_minmax(0,1fr)_72px_72px_64px_56px] gap-1
@@ -365,6 +477,7 @@ export function GroupsPage() {
               </div>
               {g.stocks.map((s) => (
                 <StockRow key={g.name + s.code} s={s}
+                  markObservation={!g.observation_only && s.tradable === false}
                   onSelect={() => { setActiveCode(s.code); setActiveName(s.name); }} />
               ))}
             </Panel>

@@ -58,7 +58,9 @@ def api_workflow(conn: sqlite3.Connection, qs: dict) -> dict:
         + "黑名单拦截 %d/%d" % (blocked, len(bl))))
 
     # ④ 信号计算
-    sig = q_one(conn, "SELECT MAX(as_of) AS d, COUNT(*) AS n FROM signal")
+    from common.config import active_profile
+    sig = q_one(conn, "SELECT MAX(as_of) AS d, COUNT(*) AS n FROM signal"
+                      " WHERE profile=?", (active_profile(),))
     sig_ok = sig["d"] == run_date and sig["n"] > 0
     stages.append(_stage(
         "signals", "信号计算", "MA/RSI/动量/换手分位 → score",

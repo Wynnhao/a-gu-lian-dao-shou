@@ -107,6 +107,32 @@ def main() -> int:
         if breaches:
             notify("单票止损预警", "；".join(f"{c} {l:.0%}" for c, l in breaches))
 
+        # 3.6) 规则 21 跌停应急主动扫描（Fix-4：stuck 计数 + 5日预警 + ≥3只 kill）
+        # Fix B：传当日实时快照判"当日跌停"——缺省回退日线收盘会把条件①退化成
+        # 检测昨日的跌停（昨日跌停今日反弹仍计数，3 只即假触发 72h kill）；
+        # prev_close 用快照自带昨收（当日跌停价的正确基准）
+        try:
+            from signals import limit_halt
+            lp_live, pc_live = {}, {}
+            for c, q in live.items():
+                if not isinstance(q, dict):
+                    continue
+                if q.get("price") is not None:
+                    lp_live[str(c)] = float(q["price"])
+                if q.get("prev_close") is not None:
+                    pc_live[str(c)] = float(q["prev_close"])
+            lh = limit_halt.run_intraday_scan(conn, now=now, latest_prices=lp_live,
+                                              prev_close=pc_live)
+            if lh["hit"]:
+                print("[sweep] 跌停应急扫描命中：%s（stuck days=%s）"
+                      % (lh["hit"], lh["stuck"]["days"]))
+                if lh["enforce"]["kill"]:
+                    print("[sweep] 同日 ≥3 只 stuck → kill_switch 已触发")
+            else:
+                print("[sweep] 跌停应急扫描：无命中")
+        except Exception as e:
+            print("[sweep] 跌停应急扫描 FAIL（继续）: %r" % e)
+
         # 4) pending 单漂移
         drifts = _pending_drift(conn, now)
 

@@ -6,8 +6,17 @@ BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
+import os
 import sqlite3
+import tempfile
 from datetime import datetime, timedelta
+
+# 规则20 经 signals.read_factor_crowding() 读 logs/signal_eval/factor_crowding.json；
+# 不隔离时会读到**生产**拥挤状态——2026-09-17 盘后生产激活 crowded=true 后，
+# 本文件 12 个买入用例被真实状态压到 5% 上限而批量失败。指向空沙箱目录，
+# 缺文件 → crowded=False（与 test_signals 的 K3 沙箱同模式）。
+os.environ.setdefault("AGSICKLE_SIGNAL_EVAL_DIR",
+                      tempfile.mkdtemp(prefix="agsickle_re_se_"))
 
 from risk.engine import (RiskContext, Verdict, check, record_event, apply_kill_switch,
                          limit_pct, in_trading_session)
@@ -31,6 +40,16 @@ SAT = datetime(2026, 9, 12, 10, 0, 0)     # 周六
 
 
 def mk_ctx(**over) -> RiskContext:
+    # 规则20 全局读 factor_crowding.json：同进程更早执行的 pipeline 类测试会经
+    # compute_all 向共享沙箱目录落盘 crowded=true 的合成状态，污染本文件与拥挤度
+    # 无关的规则用例。逐用例重置为非拥挤。env 守卫：绝不写生产 logs/signal_eval/。
+    if os.environ.get("AGSICKLE_SIGNAL_EVAL_DIR"):
+        import json as _json
+        from signals.signals import _factor_crowding_path
+        p = _factor_crowding_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_json.dumps({"crowded": False, "reason": "test_risk_engine 重置"}),
+                     encoding="utf-8")
     base = dict(
         now=WED,
         positions={},
@@ -134,14 +153,20 @@ def test_violation_limit_up_buy():
 
 
 def test_violation_limit_down_sell():
-    """跌停价卖出：昨收10.00，跌停9.00，卖价9.00 ≤ 跌停价 → 拒卖。"""
+    """跌停价卖出（浮亏不破止损线）：昨收10.00，跌停9.00，卖价9.00 → 拒卖。
+
+    Sprint 1 任务 4 起：浮亏破止损线 + 跌停价 → 规则 21 触发并豁免规则 14。
+    本 case 用成本 9.5（浮亏仅 5.3% < 8% 止损基础线）让规则 21 不触发，
+    保留"规则 14 拒卖"的原始语义。
+    """
     ctx = mk_ctx(latest_prices={"600519": 1500.0, "000001": 9.0, "300750": 12.0},
                  positions={"000001": {"name": "平安银行", "shares": 1000,
-                                       "avail_shares": 1000, "cost": 12.0}})
+                                       "avail_shares": 1000, "cost": 9.5}})
     v = check(mk_dec("sell", "000001", 9.0, 100), ctx, CFG)
     assert not v.approved
     assert hit(v, "跌停")
     assert len(v.violations) == 1
+    assert v.emergency_pending is None  # 浮亏未破线 → 规则 21 不应触发
 
 
 def test_violation_low_confidence_report_only():
@@ -515,6 +540,222 @@ def test_stop_loss_breaches_uses_atr_line():
                         latest_prices=ctx.latest_prices,
                         atr_pct={"300750": 0.03})
     assert [c for c, _ in stop_loss_breaches(ctx_narrow, CFG)] == ["300750"]
+
+
+# ---------------- Sprint 1 任务 4：规则 21 跌停封单应急 ----------------
+
+def test_rule21_limit_halt_emergency_trigger_with_seal():
+    """条件①②③ 全满足：卖价=跌停价 + 封单比 5% + 浮亏破止损线 → 触发，写 risk_event。"""
+    # 600519 主板 ±10%，昨收 1490，跌停价 = 1490 * 0.9 = 1341.00
+    # 持仓成本 1500（> 跌停价，浮亏约 10.6% > 8% 止损基础线）
+    ctx = mk_ctx(
+        positions={"600519": {"name": "贵州茅台", "shares": 100,
+                              "avail_shares": 100, "cost": 1500.0}},
+        latest_prices={"600519": 1341.0},
+        prev_close={"600519": 1490.0},
+        # 流通市值 1.64 万亿，ask1_vol 50000 手 → 5000000 股
+        # 5000000 / (1.64e12/1341) ≈ 0.41% < 3% 不构成死封
+        # 改：ask1_vol=3000000 手 = 3e8 股，3e8/1.22e9 ≈ 24.6% 强封单
+        live_quotes={"600519": {"price": 1341.0, "ask1_vol": 3000000,
+                                "float_mv": 1.64e12}},
+    )
+    d = mk_dec("sell", "600519", 1341.0, 100)
+    v = check(d, ctx, CFG)
+    assert v.emergency_pending is not None, "规则 21 必须触发"
+    assert v.emergency_pending["code"] == "600519"
+    assert v.emergency_pending["rule"] == "limit_halt_emergency"
+    # 规则 14 必须放行（豁免生效），不应有 "跌停保护：委托卖价" violation
+    assert not hit(v, "跌停保护：委托卖价"), \
+        "emergency_pending_skip 必须豁免规则 14，violations=%s" % v.violations
+    # warnings 应有"跌停应急路径激活"
+    assert any("跌停应急路径激活" in w for w in v.warnings), v.warnings
+    # decision 加了 emergency_pending_skip
+    assert d.get("emergency_pending_skip") is True
+
+
+def test_rule21_seal_missing_data_still_triggers():
+    """条件② 缺数据时静默跳过（按"通过"处理），仅条件①+③ 也触发应急。"""
+    ctx = mk_ctx(
+        positions={"600519": {"name": "贵州茅台", "shares": 100,
+                              "avail_shares": 100, "cost": 1500.0}},
+        latest_prices={"600519": 1341.0},
+        prev_close={"600519": 1490.0},
+        # live_quotes 不给 600519 → 条件② 缺失
+    )
+    d = mk_dec("sell", "600519", 1341.0, 100)
+    v = check(d, ctx, CFG)
+    assert v.emergency_pending is not None, "条件② 缺数据时仍应触发"
+    # warnings 应注明"条件②缺数据"
+    assert any("条件②缺数据" in w for w in v.warnings), v.warnings
+
+
+def test_rule21_seal_ratio_below_threshold_blocks():
+    """条件② 封单比 < 3% → 不构成死封 → 不触发。"""
+    ctx = mk_ctx(
+        positions={"600519": {"name": "贵州茅台", "shares": 100,
+                              "avail_shares": 100, "cost": 1500.0}},
+        latest_prices={"600519": 1341.0},
+        prev_close={"600519": 1490.0},
+        # ask1_vol=10000 手 = 1e6 股 / 1.22e9 ≈ 0.08% < 3%
+        live_quotes={"600519": {"price": 1341.0, "ask1_vol": 10000,
+                                "float_mv": 1.64e12}},
+    )
+    d = mk_dec("sell", "600519", 1341.0, 100)
+    v = check(d, ctx, CFG)
+    assert v.emergency_pending is None, "封单比不足 3% 时不应触发"
+
+
+def test_rule21_regular_sell_below_limit_still_rejected():
+    """未带 emergency_pending_skip 标记的普通 sell 单，跌停价仍被规则 14 拒卖。"""
+    # 用一个不触发规则 21 的场景：cost=1400，浮亏只有 4.2% < 8% → 条件③ 不满足
+    # 但卖价=跌停价 → 规则 14 仍应拒卖
+    ctx = mk_ctx(
+        positions={"600519": {"name": "贵州茅台", "shares": 100,
+                              "avail_shares": 100, "cost": 1400.0}},
+        latest_prices={"600519": 1341.0},
+        prev_close={"600519": 1490.0},
+        # 故意不传 live_quotes，且浮亏不破止损线 → 规则 21 不触发
+    )
+    d = mk_dec("sell", "600519", 1341.0, 100)
+    v = check(d, ctx, CFG)
+    # 规则 21 未触发，无豁免
+    assert v.emergency_pending is None
+    # 规则 14 仍应拒卖
+    assert hit(v, "跌停保护：委托卖价")
+    assert d.get("emergency_pending_skip") is None or \
+           d.get("emergency_pending_skip") is False
+
+
+# ---------------- Sprint 2 任务 4：skip_gate 标志 ----------------
+
+def test_rule21_sets_skip_gate_flag():
+    """规则 21 触发时同步给 decision 加 skip_gate / confirmed_by flag（让 runner 走 B 路径）。"""
+    ctx = mk_ctx(
+        positions={"600519": {"name": "贵州茅台", "shares": 100,
+                              "avail_shares": 100, "cost": 1500.0}},
+        latest_prices={"600519": 1341.0},
+        prev_close={"600519": 1490.0},
+        live_quotes={"600519": {"price": 1341.0, "ask1_vol": 3000000,
+                                "float_mv": 1.64e12}},
+    )
+    d = mk_dec("sell", "600519", 1341.0, 100)
+    v = check(d, ctx, CFG)
+    assert v.emergency_pending is not None
+    # Sprint 2 新增：skip_gate + confirmed_by 必须被规则 21 写入
+    assert d.get("skip_gate") is True, "规则 21 必须写 skip_gate=True"
+    assert d.get("confirmed_by") == "emergency_rule21"
+    # 旧的 emergency_pending_skip 仍保留（向后兼容规则 14 豁免）
+    assert d.get("emergency_pending_skip") is True
+
+
+def test_regular_sell_does_not_set_skip_gate():
+    """普通 sell 单（非跌停应急）不应有 skip_gate 标志。"""
+    # 成本 9.5，浮亏仅 5.3%，不触发规则 21
+    ctx = mk_ctx(
+        positions={"000001": {"name": "平安银行", "shares": 1000,
+                              "avail_shares": 1000, "cost": 9.5}},
+        latest_prices={"000001": 9.0},
+        prev_close={"000001": 10.0},
+    )
+    d = mk_dec("sell", "000001", 9.5, 100)
+    v = check(d, ctx, CFG)
+    # 普通 sell 单：规则 21 未触发，无 skip_gate
+    assert v.emergency_pending is None
+    assert not d.get("skip_gate"), "普通 sell 单不应有 skip_gate flag"
+
+
+# ---------------- P0-5：sell 单豁免"仅业绩预告负面"黑名单拦截 ----------------
+# 注意：本节必须位于 __main__ 块之前——run_all.py 以 subprocess 直接执行本文件，
+# __main__ 末尾 sys.exit() 会使其后定义的测试永不执行（Fix-5 节即因此仅 pytest 可见）。
+
+
+def test_is_earnings_only_helper():
+    """is_earnings_only：仅业绩预告负面→True；含 ST 等→False；空/'-'→False。"""
+    from risk.blacklist import is_earnings_only
+    assert is_earnings_only("业绩预告负面（net=-3）") is True
+    assert is_earnings_only("业绩预告负面（net=-2）; 业绩预告负面（net=-3）") is True
+    assert is_earnings_only("ST标的") is False
+    assert is_earnings_only("业绩预告负面（net=-3）; ST标的") is False
+    assert is_earnings_only("上市仅30天 < 60天") is False
+    assert is_earnings_only("-") is False
+    assert is_earnings_only("") is False
+
+
+def test_rule_blacklist_sell_exempts_earnings_only():
+    """P0-5：sell + 仅业绩预告负面 → 豁免放行（无 violation，有豁免 warning）。"""
+    from risk.engine import rule_blacklist
+    ctx = mk_ctx(blacklist={"600519": (False, "业绩预告负面（net=-3）")})
+    v = Verdict()
+    rule_blacklist(mk_dec("sell", "600519", 1400.0, 100), ctx, CFG, v)
+    assert v.violations == [], f"sell 应豁免业绩预告拦截，实得 {v.violations}"
+    assert any("黑名单豁免" in w for w in v.warnings), v.warnings
+
+
+def test_rule_blacklist_sell_still_blocks_st():
+    """P0-5：sell + ST（非业绩预告）→ 仍拦截，豁免不生效。"""
+    from risk.engine import rule_blacklist
+    ctx = mk_ctx(blacklist={"600519": (False, "ST标的")})
+    v = Verdict()
+    rule_blacklist(mk_dec("sell", "600519", 1400.0, 100), ctx, CFG, v)
+    assert len(v.violations) == 1 and "黑名单" in v.violations[0]
+
+
+def test_rule_blacklist_sell_mixed_reasons_still_blocks():
+    """P0-5：sell + 业绩预告负面 & ST 混合 → 仍拦截（含非豁免理由）。"""
+    from risk.engine import rule_blacklist
+    ctx = mk_ctx(blacklist={"600519": (False, "业绩预告负面（net=-3）; ST标的")})
+    v = Verdict()
+    rule_blacklist(mk_dec("sell", "600519", 1400.0, 100), ctx, CFG, v)
+    assert len(v.violations) == 1 and "黑名单" in v.violations[0]
+
+
+def test_rule_blacklist_buy_never_exempts_earnings():
+    """P0-5：buy + 仅业绩预告负面 → 仍拦截（豁免只给 sell 止损出口）。"""
+    from risk.engine import rule_blacklist
+    ctx = mk_ctx(blacklist={"600519": (False, "业绩预告负面（net=-3）")})
+    v = Verdict()
+    rule_blacklist(mk_dec("buy", "600519", 1500.0, 100), ctx, CFG, v)
+    assert len(v.violations) == 1 and "黑名单" in v.violations[0]
+
+
+# ---------------- Fix-5：blacklist 业绩预告负面硬拦截 ----------------
+# （原位于 __main__ 块 sys.exit() 之后，run_all.py 直接执行时永不运行——补丁批
+#  Fix D 前移到此处使其真正被执行；pytest 下位置无差）
+
+def test_blacklist_earnings_negative_net_blocks():
+    """news_earnings 近 3 日 net ≤ −2 → ok=False；net=0 / 无数据 / 过期 → ok=True。"""
+    from datetime import date as _date
+    from data.fetcher import DDL
+    from risk.blacklist import check_blacklist
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(DDL)
+    today = _date.today().isoformat()
+    try:
+        conn.execute("INSERT INTO stock_info VALUES ('600001','正常票','2020-01-01','x')")
+        conn.execute("INSERT INTO stock_info VALUES ('600002','负面票','2020-01-01','x')")
+        conn.execute("INSERT INTO stock_info VALUES ('600003','抵消票','2020-01-01','x')")
+        # 600002：纯负面 net=-3 → 拦
+        conn.execute("INSERT INTO news_earnings VALUES ('600002',?, 'negative', 3, '[]')",
+                     (today,))
+        # 600003：正负抵消 net=0 → 放行
+        conn.execute("INSERT INTO news_earnings VALUES ('600003',?, 'positive', 2, '[]')",
+                     (today,))
+        conn.execute("INSERT INTO news_earnings VALUES ('600003',?, 'negative', 2, '[]')",
+                     (today,))
+        conn.commit()
+        bl = check_blacklist(conn)
+        assert bl["600001"][0] is True
+        assert bl["600002"][0] is False and "业绩预告负面" in bl["600002"][1], bl["600002"]
+        assert bl["600003"][0] is True
+        # 老日期（>3 天前）不参与
+        conn.execute("DELETE FROM news_earnings")
+        conn.execute("INSERT INTO news_earnings VALUES ('600002', '2020-01-01',"
+                     " 'negative', 9, '[]')")
+        conn.commit()
+        bl2 = check_blacklist(conn)
+        assert bl2["600002"][0] is True
+    finally:
+        conn.close()
 
 
 # ---------------- 直接运行入口 ----------------

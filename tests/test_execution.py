@@ -99,6 +99,20 @@ def set_gate(enabled: bool):
     return _Gate()
 
 
+def set_emergency_direct(enabled: bool):
+    """临时切换 execution.emergency_direct_exec（P1-6：skip_gate 直写总开关）。"""
+    class _ED:
+        def __enter__(self):
+            self.old = runner.CFG["execution"].get("emergency_direct_exec", False)
+            runner.CFG["execution"]["emergency_direct_exec"] = enabled
+            return self
+
+        def __exit__(self, *exc):
+            runner.CFG["execution"]["emergency_direct_exec"] = self.old
+            return False
+    return _ED()
+
+
 def trade_rows(conn, **cond):
     sql = "SELECT id, trade_date, code, side, price, shares, amount, order_id, status," \
           " shots, confirmed_by FROM trade"
@@ -377,6 +391,114 @@ def test_propose_gate_writes_pending_then_confirm_executes():
         assert st == "executed"
         assert runner.list_pending(orders) == []       # pending 文件已清理
         assert runner.confirm(conn, 1, now=NOW10, orders_dir=orders) is None  # 重复确认拒绝
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def _seed_rule21_market(conn) -> None:
+    """真实规则21 触发数据：000001 昨收 10.90 → 跌停价 9.81；今收=9.81（跌停）；
+    持仓成本 12.0 → 浮亏 18.25% ≥ 基础止损线 8%（signal 表为空 → ATR 缺省回基础线）。"""
+    seed_market(conn, prices={"000001": (9.81, 10.90)})
+    conn.execute(
+        "INSERT INTO position (code, name, shares, avail_shares, cost, updated_at)"
+        " VALUES (?,?,?,?,?,?)",
+        ("000001", "平安银行", 200, 200, 12.0, NOW_DATE + "T09:00:00"))
+    conn.commit()
+
+
+def test_propose_skip_gate_defaults_to_pending_gate():
+    """P1-6：真实规则21 触发（跌停价卖单+浮亏破线，skip_gate 由引擎在 check 内
+    设置）+ emergency_direct_exec 默认 false → **不得**直写成交，必须落 pending
+    人工闸门（恪守"绝不自动成交"总原则）。P0-4：limit_halt_emergency 事件由
+    flush_events 带 decision_id 落库（engine 不再直写生产库）。"""
+    conn = fresh_conn()
+    _seed_rule21_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        d = mk_decision("sell", "000001", 9.81, 200)
+        with set_emergency_direct(False):
+            v = runner.propose(conn, d, now=NOW10, orders_dir=orders)
+        assert v.approved, v.violations
+        assert d.get("skip_gate") is True, "规则21 应在 check 内设置 skip_gate"
+        # 默认开关关：skip_gate 单仍走人工闸门 → 写 pending、不成交
+        pend = runner.list_pending(orders)
+        assert len(pend) == 1, "emergency_direct_exec=false 时 skip_gate 单必须落 pending"
+        assert len(trade_rows(conn)) == 0, "默认不得自动成交"
+        st = conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0]
+        assert st == "approved", f"应停在 approved 等人工确认，实得 {st}"
+        # P0-4：事件落库走调用方 flush_events，且带 decision_id（可归因）
+        ev = conn.execute(
+            "SELECT detail, decision_id FROM risk_event"
+            " WHERE rule='limit_halt_emergency'").fetchall()
+        assert len(ev) == 1 and ev[0][1] == 1, ev
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_propose_skip_gate_direct_exec_requires_switch():
+    """P1-6：仅当 execution.emergency_direct_exec=true 显式开启时，规则21 应急单
+    才绕过 pending 闸门直写成交，confirmed_by=emergency_rule21 落审计。"""
+    conn = fresh_conn()
+    _seed_rule21_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        d = mk_decision("sell", "000001", 9.81, 200)
+        with set_emergency_direct(True):
+            v = runner.propose(conn, d, now=NOW10, orders_dir=orders)
+        assert v.approved, v.violations
+        assert d.get("skip_gate") is True
+        # 开关开：skip_gate=True → 直接成交，不写 pending
+        pend = runner.list_pending(orders)
+        assert len(pend) == 0, "emergency_direct_exec=true 时不应写 pending"
+        assert len(trade_rows(conn)) == 1
+        row = trade_rows(conn)[0]
+        assert row[3] == "sell" and row[8] == "filled"
+        assert row[10] == "emergency_rule21", \
+            "confirmed_by 必须为 emergency_rule21 落审计"
+        st = conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0]
+        assert st in ("executed", "executed_unverified"), \
+            f"skip_gate 直写路径 status 必须 executed 系列，实得 {st}"
+        ev = conn.execute(
+            "SELECT decision_id FROM risk_event"
+            " WHERE rule='limit_halt_emergency'").fetchall()
+        assert len(ev) == 1 and ev[0][0] == 1, ev
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_propose_injected_skip_gate_never_direct_writes():
+    """审查补丁批 Fix A：决策输入携带 skip_gate/confirmed_by 一律剥离——即使
+    emergency_direct_exec=true 也不得凭注入直写（snapshot 存 LLM 原始 JSON，
+    恢复这些键等于允许输入自带"免闸门"标志，buy 也能直写、审计可伪造）。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        d = mk_decision("sell", "000001", 11.0, 100,
+                        skip_gate=True, confirmed_by="hacker")
+        conn.execute(
+            "INSERT INTO position (code, name, shares, avail_shares, cost, updated_at)"
+            " VALUES (?,?,?,?,?,?)",
+            ("000001", "平安银行", 1000, 1000, 11.0, NOW_DATE + "T09:00:00"))
+        conn.commit()
+        with set_emergency_direct(True):
+            v = runner.propose(conn, d, now=NOW10, orders_dir=orders)
+        assert v.approved, v.violations
+        assert not d.get("skip_gate"), "propose 必须剥离注入的 skip_gate"
+        assert d.get("confirmed_by") is None, "propose 必须剥离注入的 confirmed_by"
+        assert len(runner.list_pending(orders)) == 1, "注入单必须走人工闸门"
+        assert len(trade_rows(conn)) == 0, "注入不得自动成交"
+        # 落库 snapshot 不得携带注入键（_decision_from_row 恢复面保持干净）
+        snap = conn.execute(
+            "SELECT input_snapshot FROM decision WHERE id=1").fetchone()[0]
+        assert "skip_gate" not in snap and "confirmed_by" not in snap, snap
+        # buy 同理：注入 + 开关开 → 仍走闸门（直写仅限规则21 的 sell）
+        d2 = mk_decision("buy", "600519", 1500.0, 100,
+                         skip_gate=True, confirmed_by="hacker")
+        with set_emergency_direct(True):
+            v2 = runner.propose(conn, d2, now=NOW10, orders_dir=orders)
+        assert v2.approved and len(trade_rows(conn)) == 0
+        assert len(runner.list_pending(orders)) == 2
     finally:
         shutil.rmtree(orders, ignore_errors=True)
 

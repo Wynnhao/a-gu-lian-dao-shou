@@ -191,6 +191,147 @@ def test_stop_loss_line():
     assert abs(stop_loss_line(0.08, None, 2.0) - 0.08) < 1e-9   # 缺失 → 基础线
 
 
+# ---------------- Sprint 2 任务 1：国债乘子 + ETF 档位调整 ----------------
+
+def _seed_bond(conn, delta_bp: float):
+    """向 index_bond_yield 写一行（今日）"""
+    conn.execute(
+        "INSERT OR REPLACE INTO index_bond_yield"
+        " (index_code, trade_date, yield, delta_20d_bp, source) VALUES (?,?,?,?,?)",
+        ("10Y_CN", "2026-09-16", 2.50, delta_bp, "em"))
+    conn.commit()
+
+
+def _seed_etf(conn, pct_chg: float):
+    """向 index_etf_share 写一行 510300 沪深300ETF（今日）"""
+    conn.execute(
+        "INSERT OR REPLACE INTO index_etf_share"
+        " (etf_code, trade_date, share, pct_chg_1d, source) VALUES (?,?,?,?,?)",
+        ("510300", "2026-09-16", 1000000.0, pct_chg, "em"))
+    conn.commit()
+
+
+def test_regime_bond_downside_caps_position():
+    """国债 20 日变动 < -15bp → cap × 0.8（避险情绪）"""
+    from risk.regime import _compute_bond_yield_modifier
+    conn = _mem_conn()
+    try:
+        _seed_bond(conn, -20.0)
+        cfg = {"delta_bp_threshold": -15.0, "downside_mult": 0.8}
+        mult = _compute_bond_yield_modifier(conn, cfg)
+        assert mult == 0.8
+        # compute_regime 集成验证：detail.bond_yield.mult == 0.8
+        r = compute_regime(conn, root=CFG)
+        assert r["bond_yield"]["mult"] == 0.8
+        assert "cap 压至" in r["bond_yield"].get("signal", "")
+    finally:
+        conn.close()
+
+
+def test_regime_bond_above_threshold_no_constraint():
+    """国债 20 日变动 > -15bp → 乘子 1.0，不约束"""
+    from risk.regime import _compute_bond_yield_modifier
+    conn = _mem_conn()
+    try:
+        _seed_bond(conn, -5.0)
+        cfg = {"delta_bp_threshold": -15.0, "downside_mult": 0.8}
+        assert _compute_bond_yield_modifier(conn, cfg) == 1.0
+    finally:
+        conn.close()
+
+
+def test_regime_etf_share_down_2pct_caps_to_half():
+    """ETF 510300 单日 -2% 跌 → direction=down（顶部信号；Fix-2 改方向语义）"""
+    from risk.regime import _compute_etf_tier_shift
+    conn = _mem_conn()
+    try:
+        _seed_etf(conn, -3.5)
+        cfg = {"up_pct_threshold": 2.0, "down_pct_threshold": -2.0}
+        sig = _compute_etf_tier_shift(conn, cfg)
+        assert sig["direction"] == "down"
+        assert sig["pct"] == -3.5
+    finally:
+        conn.close()
+
+
+def test_regime_etf_share_no_move_returns_none():
+    """ETF 510300 单日变动在 ±2% 内 → direction=None（不调整）"""
+    from risk.regime import _compute_etf_tier_shift
+    conn = _mem_conn()
+    try:
+        _seed_etf(conn, 0.5)
+        cfg = {"up_pct_threshold": 2.0, "down_pct_threshold": -2.0}
+        assert _compute_etf_tier_shift(conn, cfg)["direction"] is None
+        _seed_etf(conn, -0.3)
+        assert _compute_etf_tier_shift(conn, cfg)["direction"] is None
+    finally:
+        conn.close()
+
+
+# ---------------- Fix-2：ETF 升/降档 min-after override ----------------
+# RSRS 的 OLS β 对构造方式敏感（渐变/跳变都会失真），改用确定性极强的
+# 二八避险（cap 0.2）与国债乘子（0.8×0.8=0.64）作基础 cap 载体，
+# ETF override 语义与载体无关。
+
+def _seed_dual_shelter(conn):
+    """近 20 日大小盘双跌 → 二八避险档 cap=0.2（无 H/L → RSRS 不参与）。"""
+    n = 120
+    flat = [1000.0] * (n - 20)
+    big = flat + [1000.0 * (1 - 0.01 * i) for i in range(1, 21)]
+    small = flat + [800.0 * (1 - 0.015 * i) for i in range(1, 21)]
+    _seed_index(conn, "000300", big)
+    _seed_index(conn, "000905", small)
+
+
+def test_regime_etf_upgrades_shelter_to_half():
+    """升档：二八避险 0.2 + ETF 单日 +3%（底部信号）→ min(caps)=0.2 被
+    min-after override 提到 cap_half=0.5（唯一允许往上提的路径）。"""
+    conn = _mem_conn()
+    try:
+        _seed_dual_shelter(conn)
+        _seed_etf(conn, +3.0)
+        r = compute_regime(conn, root=CFG)
+        assert r["dual_mom"]["big"] < 0 and r["dual_mom"]["small"] < 0
+        assert r["etf_share"]["direction"] == "up"
+        assert abs(r["etf_share"]["cap_before"] - 0.20) < 1e-9
+        assert abs(r["cap"] - 0.50) < 1e-9
+        assert abs(r["etf_share"]["cap_after"] - 0.50) < 1e-9
+        assert r["tier"] == "半配"
+    finally:
+        conn.close()
+
+
+def test_regime_etf_downgrades_to_half():
+    """降档：国债弱（cap 0.8×0.8=0.64）+ ETF 单日 -3%（顶部信号）→ cap 压到
+    cap_half=0.5。"""
+    conn = _mem_conn()
+    try:
+        _seed_bond(conn, -20.0)
+        _seed_etf(conn, -3.0)
+        r = compute_regime(conn, root=CFG)
+        assert r["etf_share"]["direction"] == "down"
+        assert abs(r["etf_share"]["cap_before"] - 0.64) < 1e-6
+        assert abs(r["cap"] - 0.50) < 1e-9
+        assert abs(r["etf_share"]["cap_after"] - 0.50) < 1e-9
+        assert r["tier"] == "半配"
+    finally:
+        conn.close()
+
+
+def test_regime_etf_no_signal_no_intervention():
+    """ETF 变动在阈值内 → direction=None，cap 保持 min(caps)=0.64 不被干预。"""
+    conn = _mem_conn()
+    try:
+        _seed_bond(conn, -20.0)
+        _seed_etf(conn, +0.5)
+        r = compute_regime(conn, root=CFG)
+        assert r["etf_share"]["direction"] is None
+        assert abs(r["cap"] - 0.64) < 1e-6
+        assert r["tier"] == "半配"  # 0.64 ∈ [cap_half, static_cap) → 半配
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     import traceback
     fns = [(n, f) for n, f in sorted(globals().items())

@@ -33,6 +33,24 @@ from typing import List
 
 # ---- 测试隔离 env（必须在 import 任何项目模块之前设置）----
 _TMP_ROOT = Path(tempfile.mkdtemp(prefix="agsickle_pipefull_"))
+# 本文件的 env 修改从不逐用例恢复（整文件隔离设计）；teardown_module 恢复，
+# 避免与其它测试文件同进程跑（pytest tests/*.py）时泄漏 AGSICKLE_DB 等到后续文件
+_ORIG_ENV = dict(os.environ)
+
+
+def _restore_env():
+    # 只动 AGSICKLE_ 前缀——碰其它键（如 PYTEST_CURRENT_TEST）会破坏 pytest 自身
+    for k in list(os.environ):
+        if k.startswith("AGSICKLE_") and k not in _ORIG_ENV:
+            os.environ.pop(k, None)
+    os.environ.update({k: v for k, v in _ORIG_ENV.items()
+                       if k.startswith("AGSICKLE_")})
+
+
+def teardown_module(module=None):
+    _restore_env()
+
+
 os.environ.setdefault("AGSICKLE_DISABLE_LIVE_QUOTES", "1")
 os.environ.setdefault("AGSICKLE_DISABLE_NOTIFY", "1")
 os.environ.setdefault("AGSICKLE_DISABLE_SLIPPAGE", "1")
@@ -43,6 +61,9 @@ os.environ.setdefault("AGSICKLE_DISABLE_SPOT", "1")
 os.environ.setdefault("AGSICKLE_STATE_DIR", str(_TMP_ROOT / "state"))
 os.environ.setdefault("AGSICKLE_ORDERS_DIR", str(_TMP_ROOT / "state"))
 os.environ.setdefault("AGSICKLE_BACKUP_DIR", str(_TMP_ROOT / "backup"))
+# signal_eval 沙箱：compute_all/premarket 会写 factor_crowding.json，缺此隔离时
+# 直跑（run_all 之外）会把合成拥挤状态写进**生产** logs/signal_eval/
+os.environ.setdefault("AGSICKLE_SIGNAL_EVAL_DIR", str(_TMP_ROOT / "signal_eval"))
 
 _MOCK_QUOTES_FILE = _TMP_ROOT / "mock_quotes.json"
 
@@ -289,8 +310,8 @@ def test_catchup_signal_misalign_triggers_premarket():
     today_str = _seed_db(bars=True)
     today = date.fromisoformat(today_str)
     conn = sqlite3.connect(os.environ["AGSICKLE_DB"])
-    conn.execute("INSERT INTO signal (code, as_of, signals, score) VALUES "
-                 "('600519', ?, '{}', 0.5)", ((today - timedelta(days=1)).isoformat(),))
+    conn.execute("INSERT INTO signal (code, as_of, signals, score, profile) VALUES "
+                 "('600519', ?, '{}', 0.5, 'reversal_lowvol')", ((today - timedelta(days=1)).isoformat(),))
     conn.commit()
     conn.close()
     # 当日新鲜 bundle（mtime=今天）

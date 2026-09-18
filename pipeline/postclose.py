@@ -6,6 +6,7 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 import argparse
+import fcntl
 import logging
 import logging.handlers
 import os
@@ -32,6 +33,10 @@ log.propagate = False
 # 测试隔离：AGSICKLE_REPORTS_DIR 覆盖产物目录（import 期读 env，与 runner.ORDERS_DIR 同模式）
 REPORTS_DIR = Path(os.environ.get("AGSICKLE_REPORTS_DIR") or (BASE / "logs" / "reports"))
 
+# 单实例锁：catchup 步骤4 调起 postclose 子进程，与 15:30 cron 同时触发时只允许一份跑。
+# POSIX flock 在进程退出时由内核自动释放（close-on-exec 语义），无需 finally 显式 unlock。
+LOCK_FILE = BASE / "logs" / ".postclose.lock"
+
 
 def _write_pending(trade_date: str, today_iso: str) -> Path:
     """今日 daily_bar 缺失时,写 PENDING-YYYY-MM-DD.md 兜底（绝不覆写昨日日报）。"""
@@ -47,8 +52,8 @@ def _write_pending(trade_date: str, today_iso: str) -> Path:
         "- **不要**根据本文件做任何下单决策；盯市与止损沿用上一交易日数据。\n"
         "- 数据源恢复后跑：\n"
         "  ```\n"
-        "  python -m pipeline.catchup --date %s\n"
-        "  python -m pipeline.postclose --date %s\n"
+        "  .venv/bin/python3 pipeline/catchup.py --date %s\n"
+        "  .venv/bin/python3 pipeline/postclose.py --date %s\n"
         "  ```\n"
         "- 止损自检（步骤2.5）已独立于 daily_bar 完成，详见 logs/risk_event 表。\n"
     ) % (today_iso, datetime.now().isoformat(timespec="seconds"),
@@ -124,6 +129,22 @@ def main(argv=None) -> int:
     ap.add_argument("--skip-stop-loss-check", action="store_true",
                     help="跳过步骤2.5 止损自检（调试用）")
     args = ap.parse_args(argv)
+
+    # 单实例锁：避免 catchup 子进程 + cron 双触发并发写 market.db。
+    # 锁文件 mtime 由内核维护；进程死亡立即释放，不依赖 stale 阈值。
+    try:
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _lock_fh = open(LOCK_FILE, "w")
+    except OSError as e:
+        log.error("postclose 锁文件初始化失败：%s", e)
+        return 1
+    try:
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.warning("已有实例在跑（锁 %s 被占），本次退出", LOCK_FILE)
+        print("[postclose] 已有实例在跑（锁 %s 被占），本次退出" % LOCK_FILE)
+        return 0
+
     log.info("==== postclose start ====")
 
     # 1. 补齐当日日线
@@ -231,6 +252,16 @@ def main(argv=None) -> int:
             log.error("步骤3 weekly_report FAIL（不影响日报）: %s", repr(e))
     else:
         log.info("步骤3 今天非周五且未指定 --weekly，跳过周报")
+
+    # 3.5 规则 21 跌停应急主动扫描（Fix-4 / D1：扫描 → propose 应急单（run_date=次日）
+    # → 通知；confirm 优先，次日 09:14 未确认由 premarket 兜底自动执行）
+    try:
+        from signals import limit_halt
+        r = limit_halt.run_postclose_scan()
+        log.info("步骤3.5 跌停应急扫描：scanned=%s proposed=%s skipped=%s",
+                 r["scanned"], r["proposed"], r["skipped"])
+    except Exception as e:
+        log.error("步骤3.5 跌停应急扫描 FAIL（继续）: %s", repr(e))
 
     # 4. 输出
     print("[postclose] ===== 盘后流程完成 trade_date=%s =====" % trade_date)

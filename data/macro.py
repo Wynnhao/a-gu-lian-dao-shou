@@ -15,7 +15,7 @@ BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
-from data.fetcher import get_conn  # noqa: E402
+from data.fetcher import get_conn, call_ak  # noqa: E402  (Sprint 2 任务1: call_ak 熔断接入)
 
 log = logging.getLogger("macro")
 log.setLevel(logging.INFO)
@@ -249,6 +249,195 @@ def fetch_index_valuation(codes=None, years: int = 5) -> dict:
     return out
 
 
+# ============================================================
+# Sprint 2 任务 1（P1-3）：10Y 国债收益率 + ETF 份额
+# ============================================================
+
+BOND_CODES = ["10Y_CN"]                   # 10 年期国债收益率（CGB 10Y）
+ETF_CODES = ["510300", "510500"]          # 沪深300ETF + 中证500ETF
+
+
+def _fetch_bond_yield_one(issuer: str) -> list:
+    """单源拉 10Y 国债收益率日频。返回 [(trade_date, yield, source), ...]。
+
+    issuer ∈ {"em", "tx"}：
+    - em: ak.bond_zh_us_rate()（中国国债收益率曲线）
+    - tx: 暂用 ak.bond_china_yield() 兜底（akshare 提供多接口）
+    """
+    rows: list = []
+    try:
+        if issuer == "em":
+            df = call_ak("bond_em", ak.bond_zh_us_rate)
+        elif issuer == "tx":
+            df = call_ak("bond_tx", ak.bond_china_yield)
+        else:
+            return rows
+    except Exception as e:
+        log.warning("bond %s FAIL: %s", issuer, repr(e)[:140])
+        return rows
+    if df is None or df.empty:
+        return rows
+    # 列名适配：akshare 不同版本列名差异
+    col_date = "日期" if "日期" in df.columns else (
+        "date" if "date" in df.columns else df.columns[0])
+    col_yield = None
+    for cand in ("10年", "10年期", "10Y", "yield_10y", "中债国债到期收益率:10年"):
+        if cand in df.columns:
+            col_yield = cand
+            break
+    if col_yield is None:
+        # 兜底：找包含"10"的数值列
+        for c in df.columns:
+            if c != col_date and "10" in str(c):
+                col_yield = c
+                break
+    if col_yield is None:
+        log.warning("bond %s 列名不识别: %s", issuer, list(df.columns)[:8])
+        return rows
+    for _, row in df.iterrows():
+        try:
+            d = str(row[col_date])[:10]
+            y = float(row[col_yield])
+            rows.append((d, y, issuer))
+        except (TypeError, ValueError):
+            continue
+    return rows
+
+
+def fetch_bond_yield(codes: list = None, conn: sqlite3.Connection = None) -> dict:
+    """10Y 国债收益率入库。
+
+    兜底链：bond_em → bond_tx。任一成功即写入。
+    返回 {code: 行数}。conn=None 时用 get_conn()（生产），测试可注入 :memory:。
+    """
+    import sqlite3 as _sq3
+    codes = codes or BOND_CODES
+    out: dict = {}
+    own = conn is None
+    c = conn or get_conn()
+    try:
+        rows: list = []
+        source = None
+        for issuer in ("em", "tx"):
+            sub = _fetch_bond_yield_one(issuer)
+            if sub:
+                rows = sub
+                source = issuer
+                break
+        if not rows:
+            log.warning("fetch_bond_yield: 全源失败")
+            return out
+        # 按日期升序，算 20 日 delta bp
+        rows.sort(key=lambda x: x[0])
+        n = 0
+        for i, (d, y, src) in enumerate(rows):
+            if i < 20:
+                delta = None
+            else:
+                # 取 20 个交易日之前的值（rows 已排序，近似 20 日）
+                prev_y = rows[i - 20][1]
+                delta = round((y - prev_y) * 100, 2)  # 百分比→bp
+            c.execute(
+                "INSERT OR REPLACE INTO index_bond_yield"
+                " (index_code, trade_date, yield, delta_20d_bp, source) VALUES (?,?,?,?,?)",
+                ("10Y_CN", d, y, delta, source))
+            n += 1
+        c.commit()
+        out["10Y_CN"] = n
+        log.info("fetch_bond_yield: 写入 %d 行（source=%s）", n, source)
+    finally:
+        if own:
+            c.close()
+    return out
+
+
+def _fetch_etf_share_one(etf_code: str, issuer: str) -> list:
+    """单源单 ETF 拉份额日频。返回 [(trade_date, share, pct_chg_1d, source), ...]。
+
+    issuer ∈ {"em", "tx"}：
+    - em: ak.fund_etf_fund_info_em(fund=etf_code)
+    - tx: ak.fund_etf_fund_info_tx（若端点存在）
+    """
+    rows: list = []
+    try:
+        if issuer == "em":
+            df = call_ak("etf_em", ak.fund_etf_fund_info_em, fund=etf_code)
+        elif issuer == "tx":
+            # akshare 历史端点 fund_etf_fund_info_tx 可能不存在，容错
+            fn = getattr(ak, "fund_etf_fund_info_tx", None)
+            if fn is None:
+                return rows
+            df = call_ak("etf_tx", fn, fund=etf_code)
+        else:
+            return rows
+    except Exception as e:
+        log.warning("etf %s %s FAIL: %s", etf_code, issuer, repr(e)[:140])
+        return rows
+    if df is None or df.empty:
+        return rows
+    # 列名适配
+    col_date = "净值日期" if "净值日期" in df.columns else (
+        "trade_date" if "trade_date" in df.columns else df.columns[0])
+    col_share = None
+    for cand in ("份额", "基金份额", "total_share", "总份额"):
+        if cand in df.columns:
+            col_share = cand
+            break
+    if col_share is None:
+        log.warning("etf %s 份额列不识别: %s", etf_code, list(df.columns)[:8])
+        return rows
+    prev = None
+    for _, row in df.iterrows():
+        try:
+            d = str(row[col_date])[:10]
+            s = float(row[col_share])
+            pct = round((s - prev) / prev * 100, 2) if prev and prev > 0 else None
+            rows.append((d, s, pct, issuer))
+            prev = s
+        except (TypeError, ValueError):
+            continue
+    return rows
+
+
+def fetch_etf_share(codes: list = None, conn: sqlite3.Connection = None) -> dict:
+    """ETF 份额入库（沪深300 + 中证500）。
+
+    兜底链：em 主 → tx 兜底（端点不存在则跳过）。
+    返回 {etf_code: 行数}。conn=None 时用 get_conn()（生产），测试可注入 :memory:。
+    """
+    codes = codes or ETF_CODES
+    out: dict = {}
+    own = conn is None
+    c = conn or get_conn()
+    try:
+        for code in codes:
+            rows: list = []
+            source = None
+            for issuer in ("em", "tx"):
+                sub = _fetch_etf_share_one(code, issuer)
+                if sub:
+                    rows = sub
+                    source = issuer
+                    break
+            if not rows:
+                log.warning("fetch_etf_share %s: 全源失败", code)
+                continue
+            n = 0
+            for d, s, pct, src in rows:
+                c.execute(
+                    "INSERT OR REPLACE INTO index_etf_share"
+                    " (etf_code, trade_date, share, pct_chg_1d, source) VALUES (?,?,?,?,?)",
+                    (code, d, s, pct, source))
+                n += 1
+            out[code] = n
+            log.info("fetch_etf_share %s: 写入 %d 行（source=%s）", code, n, source)
+        c.commit()
+    finally:
+        if own:
+            c.close()
+    return out
+
+
 def main():
     print("== P1.5 指数日线入库 ==")
     for code, n in fetch_index_daily().items():
@@ -256,6 +445,11 @@ def main():
     print("== P1.5 指数估值分位入库 ==")
     for code, r in fetch_index_valuation().items():
         print(f"  {code}: {r}")
+    print("== P1.3 国债 + ETF（Sprint 2）==")
+    for code, n in fetch_bond_yield().items():
+        print(f"  国债 {code}: +{n} 行")
+    for code, n in fetch_etf_share().items():
+        print(f"  ETF {code}: +{n} 行")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,9 @@ def api_concepts(conn: sqlite3.Connection, qs: dict) -> dict:
 
     分组来自 config.watchlist[].concepts（可多归属）；无标签的归入"未分组"。
     """
+    from common.config import core_codes
     wl = _srv().load_config().get("watchlist", [])
+    core = set(core_codes())          # 可交易池（watchlist_core）；其余成员仅观察
     bl = {b["code"]: b for b in blacklist_of(conn)}
     sig = {r["code"]: r for r in api_signals(conn, {})}
     bars = {}
@@ -33,6 +35,7 @@ def api_concepts(conn: sqlite3.Connection, qs: dict) -> dict:
         bar = bars.get(code) or {}
         b = bl.get(code) or {}
         return {"code": code, "name": name,
+                "tradable": (code in core) if core else True,
                 "close": bar.get("close"), "pct_chg": bar.get("pct_chg"),
                 "bar_date": bar.get("date"), "amount": bar.get("amount"),
                 "source": bar.get("source"),
@@ -54,10 +57,18 @@ def api_concepts(conn: sqlite3.Connection, qs: dict) -> dict:
                 groups[t] = []
                 order.append(t)
             groups[t].append(row)
-    out = [{"name": t, "stocks": groups[t]} for t in order]
+    def _group(name: str, stocks: list) -> dict:
+        n_tradable = sum(1 for x in stocks if x.get("tradable"))
+        return {"name": name, "stocks": stocks,
+                "tradable_count": n_tradable,
+                "observation_only": n_tradable == 0,   # 整组不可交易 → 看板标"仅观察"
+                }
+    out = [_group(t, groups[t]) for t in order]
     if ungrouped:
-        out.append({"name": "未分组", "stocks": ungrouped})
-    return {"total": len(wl), "concepts": out}
+        out.append(_group("未分组", ungrouped))
+    return {"total": len(wl),
+            "core_total": len(core) if core else len(wl),
+            "concepts": out}
 
 
 # ---------------------------------------------------------------- 动态池（异动/热门）

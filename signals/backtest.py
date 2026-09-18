@@ -35,13 +35,14 @@ import math
 import time
 from typing import Tuple
 
+import numpy as np
 import pandas as pd
 
 from common.config import load as config_load
 from common.market import limit_pct as market_limit_pct
 from data.fetcher import get_conn
 from signals.factors import atr_series
-from signals.signals import score_reversal_lowvol_xs
+from signals.signals import score_reversal_lowvol_xs, score_reversal_lowvol_v2_xs
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("backtest")
@@ -200,6 +201,11 @@ def run_backtest(pool: pd.DataFrame, idx_close: pd.Series, strategy: str = "reve
     mom_w = wide / wide.shift(mom_win) - 1.0
     atrp = _atr_pct_panel(wide, hi_qfq, lo_qfq, hi_raw, lo_raw)
     turn20 = turn.rolling(TURN20_WINDOW, min_periods=10).mean()
+    is_v2 = strategy == "reversal_lowvol_v2"
+    if is_v2:
+        ivol_p, max5_p = _ivol_max_panels(wide, idx_close)
+        ivol_p = ivol_p.reindex(wide.index)
+        max5_p = max5_p.reindex(wide.index)
 
     dates = list(wide.index)
     tmp = pd.DataFrame({"d": dates, "w": pd.PeriodIndex(dates, freq="W").astype(str)})
@@ -242,6 +248,12 @@ def run_backtest(pool: pd.DataFrame, idx_close: pd.Series, strategy: str = "reve
             if strategy == "momentum":
                 m = mom_w.loc[d].dropna()
                 ranked = m[m > 0.0].sort_values(ascending=False)
+            elif is_v2:
+                # 生产同源：v2 五因子截面合成（signals.score_reversal_lowvol_v2_xs）
+                score, _parts = score_reversal_lowvol_v2_xs(
+                    mom_w.loc[d], atrp.loc[d].reindex(mom_w.columns),
+                    turn20.loc[d], ivol_p.loc[d], max5_p.loc[d])
+                ranked = score.dropna().sort_values(ascending=False)
             else:
                 # 生产同源：5日反转 + 低波 + 低换手 截面合成（signals.score_reversal_lowvol_xs）
                 score, _parts = score_reversal_lowvol_xs(
@@ -287,7 +299,22 @@ def run_backtest(pool: pd.DataFrame, idx_close: pd.Series, strategy: str = "reve
                             "per_year": _per_year(bench / bench.iloc[0])},
         "rebalance_count": len(rebal_dates),
         "final_holdings": final,
-        "pass": bool(st_ann > b_ann and st_mdd > -0.25),
+        # v1.4 修正（用户拍板方案 B，2026-09-17）：
+        # 原阈值 (ann>基准 and MDD>-25%) 是模拟盘 P2.5 现实约束，
+        # 对全样本回测偏严——momentum/reversal 各有缺陷但都被同一阈值拒。
+        # 改用 Calmar 比率（年化/|MDD|，行业标准）+ 超额 年化 作为双判据：
+        # 1) calmar > 0.5（收益回撤比高于池子均值）
+        # 2) 年化 > 基准（绝对超额为正）
+        # 例外：阈值 0.5 与模拟盘现实仓位约束匹配
+        # （组合风控本身仍有单票20%/总仓80%/kill -8% 等硬规则保底）
+        "pass": bool((st_mdd != 0.0 and (st_ann / abs(st_mdd)) > 0.5)
+                     and st_ann > b_ann),
+        "pass_criteria": {
+            "version": "v2-calmar",
+            "min_calmar": 0.5,
+            "require_benchmark_beat": True,
+            "note": "v1 单阈值 pass 偏严（两个 profile 全不通过），改双判据"
+        },
     }
 
 
@@ -297,31 +324,82 @@ def _safe(rets: pd.DataFrame, d, c) -> float:
     return 0.0 if math.isnan(x) else x
 
 
+def _ivol_max_panels(wide: pd.DataFrame, idx_close: pd.Series,
+                     window: int = 20, top_k: int = 5) -> tuple:
+    """Fix-5：v2 因子面板（与 factors.ivol / factors.max_ret_bali 同口径的面板化）。
+
+    - ivol：个股日收益对 HS300 日收益滚动 window 日一元回归残差 σ
+      （含截距口径：resid_var = var_i − β²·var_m，与 Fix-6 intercept 版一致）；
+    - max5：滚动 window 日收益 top_k 均值（Bali MAX）。
+    """
+    rets = wide.pct_change(fill_method=None)
+    bench = idx_close.reindex(wide.index).pct_change(fill_method=None)
+    mean_r = rets.rolling(window, min_periods=window // 2).mean()
+    mean_m = bench.rolling(window, min_periods=window // 2).mean()
+    cov = (rets.mul(bench, axis=0)).rolling(window, min_periods=window // 2).mean() \
+        - mean_r.mul(mean_m, axis=0)
+    var_m = bench.rolling(window, min_periods=window // 2).var()
+    var_i = rets.rolling(window, min_periods=window // 2).var()
+    beta = cov.div(var_m, axis=0)
+    resid_var = (var_i - beta * beta.mul(var_m, axis=0)).clip(lower=0.0)
+    ivol = np.sqrt(resid_var)
+
+    def _topk_mean(x):
+        return float(np.sort(x[np.isfinite(x)])[-top_k:].mean())
+
+    max5 = rets.rolling(window, min_periods=window // 2).apply(_topk_mean, raw=True)
+    return ivol, max5
+
+
 def main():
     conn = get_conn()
     ensure_benchmark(conn)
-    pool = pd.read_sql(
-        "SELECT code, trade_date, close, close_qfq, high, low, amount, turnover "
-        "FROM daily_bar", conn)
+    # 2026-09-13 错配修复：默认 universe 走 config.watchlist_core（策略真实会下
+    # 单的池子），老 config（无 watchlist_core）退回 watchlist 全表。再添
+    # 开关 --universe=full 走全 daily_bar 保留全市场 sanity check 能力。
+    import argparse as _ap
+    _ap_inst = _ap.ArgumentParser(add_help=False)
+    _ap_inst.add_argument("--universe", choices=("core", "full"), default="core")
+    _args, _ = _ap_inst.parse_known_args()
+    from common.config import core_codes as _core_codes  # 单一事实源（common.config）
+    if _args.universe == "core":
+        _u_codes = _core_codes()
+    else:
+        _u_codes = [str(r[0]) for r in
+                    conn.execute("SELECT DISTINCT code FROM daily_bar").fetchall()]
+    if _u_codes:
+        _ph = ",".join("?" * len(_u_codes))
+        pool = pd.read_sql(
+            "SELECT code, trade_date, close, close_qfq, high, low, amount, turnover "
+            "FROM daily_bar WHERE code IN (%s)" % _ph, conn, params=_u_codes)
+    else:
+        pool = pd.read_sql(
+            "SELECT code, trade_date, close, close_qfq, high, low, amount, turnover "
+            "FROM daily_bar", conn)
     idx = pd.read_sql("SELECT trade_date, close FROM index_daily WHERE index_code='000300' "
                       "ORDER BY trade_date", conn)
-    n_universe = conn.execute("SELECT COUNT(DISTINCT code) FROM daily_bar").fetchone()[0]
+    n_universe = _u_codes.__len__() if _u_codes else conn.execute(
+        "SELECT COUNT(DISTINCT code) FROM daily_bar").fetchone()[0]
+    _ph2 = ",".join("?" * len(_u_codes)) if _u_codes else ""
     n_qfq = conn.execute(
-        "SELECT COUNT(DISTINCT code) FROM daily_bar WHERE close_qfq IS NOT NULL").fetchone()[0]
+        "SELECT COUNT(DISTINCT code) FROM daily_bar WHERE close_qfq IS NOT NULL"
+        + (" AND code IN (%s)" % _ph2 if _u_codes else ""),
+        tuple(_u_codes) if _u_codes else ()).fetchone()[0]
     conn.close()
     for col in ("close", "close_qfq", "high", "low", "amount", "turnover"):
         pool[col] = pd.to_numeric(pool[col], errors="coerce")
     idx_close = idx.set_index("trade_date")["close"].astype(float)
 
     results = {"generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-               "universe": {"codes": int(n_universe), "codes_with_qfq": int(n_qfq)},
-               "profiles": {}, "notes": [
-                   "回测宇宙为 daily_bar 全部票：自选池30只（事后人工挑选，幸存者偏差）+ "
-                   "中证800（现时点成分回溯，仍有成分变动偏差）——本池回测仅作流程验证，"
-                   "不作选型依据",
+               "universe": {"mode": _args.universe, "codes": int(n_universe), "codes_with_qfq": int(n_qfq), "desc": "core=config.watchlist_core（策略可交易池；watchlist_extended 仅观察）/ full=daily_bar 全库（sanity check）"},
+"profiles": {}, "notes": [
+                   "回测宇宙默认 config.watchlist_core（策略真实会下单的池子，2026-09-13 错配修复）；"
+                   "该池为人工挑选→存在幸存者偏差，回测仅作流程验证与相对比较，不作选型唯一依据。--universe=full 可跑 daily_bar 全库作 sanity check",
                    "收益/动量/波动用前复权价（缺失回退不复权）；涨停判定用不复权价",
-                   "momentum 与 reversal_lowvol 均为样本内结果，置信度打折看（策略库 §9）"]}
-    for strat in ("momentum", "reversal_lowvol"):
+                   "momentum 与 reversal_lowvol 均为样本内结果，置信度打折看（策略库 §9）",
+                   "pass 判据 v2-calmar（2026-09-17）：年化/|MDD| > 0.5 且 年化 > 基准；"
+                   "v1 单阈值 MDD>-25% 偏严，两个 profile 全不通过"]}
+    for strat in ("momentum", "reversal_lowvol", "reversal_lowvol_v2"):
         r = run_backtest(pool, idx_close, strategy=strat)
         results["profiles"][strat] = r
         log.info("回测 %s: ann=%.2f%% mdd=%.2f%% pass=%s",

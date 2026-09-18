@@ -121,6 +121,7 @@ export interface SignalRow {
 export interface ConceptStock {
   code: string;
   name: string;
+  tradable?: boolean;          // 是否在可交易池（watchlist_core）内
   close: number | null;
   pct_chg: number | null;
   bar_date: string | null;
@@ -137,10 +138,13 @@ export interface ConceptStock {
 export interface ConceptGroup {
   name: string;
   stocks: ConceptStock[];
+  tradable_count?: number;     // 组内可交易只数
+  observation_only?: boolean;  // 整组仅观察（不可 buy/sell）
 }
 
 export interface ConceptsData {
   total: number;
+  core_total?: number;         // 可交易池规模
   concepts: ConceptGroup[];
 }
 

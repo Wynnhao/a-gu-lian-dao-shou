@@ -97,3 +97,31 @@ def snapshot(path: Optional[Path] = None) -> dict:
         raise ConfigError("config 校验失败（硬键缺失/类型错误）:\n  - "
                           + "\n  - ".join(errors))
     return copy.deepcopy(cfg)
+
+
+def core_watchlist(cfg: Optional[dict] = None) -> List[dict]:
+    """策略可交易池（单一事实源）：config.watchlist_core，缺省退回 watchlist。
+
+    2026-09-13「profile 与自选池错配」修复的锚点：策略会下单的池子 = watchlist_core
+    （五组概念共 51 只）；watchlist_extended（35 只）仅供看板观察，不可交易。
+    信号计算 / 回测 universe / 决策白名单 / 输入包渲染统一走本函数，避免各处各读一份。
+    """
+    c = cfg if cfg is not None else load()
+    return list(c.get("watchlist_core") or c.get("watchlist", []))
+
+
+def core_codes(cfg: Optional[dict] = None) -> List[str]:
+    """策略可交易池的 6 位码清单。"""
+    return [str(w["code"]) for w in core_watchlist(cfg)]
+
+
+def active_profile() -> str:
+    """当前生效的 score profile（config.signals.profile，缺省 reversal_lowvol）。
+
+    signal 表主键为 (code, as_of, profile)，多 profile 行并存；所有生产读取方
+    （bundle / 看板 API / regime / 计数）必须按本函数过滤，否则会读到混口径行
+    ——2026-09-13「profile 与自选池错配」修复的第二个锚点。
+    """
+    c = load()
+    p = (c.get("signals") or {}).get("profile", "reversal_lowvol")
+    return p if p in ("reversal_lowvol", "reversal_lowvol_v2", "momentum") else "reversal_lowvol"

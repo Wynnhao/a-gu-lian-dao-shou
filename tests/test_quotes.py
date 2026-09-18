@@ -29,18 +29,48 @@ def test(fn):
     return fn
 
 
-def _tencent_payload() -> str:
-    """构造符合真实结构的腾讯报文：f3现价 f4昨收 f5今开 f30时间 f33最高 f34最低。"""
-    def line(market, name, code, price, prev, open_, ts, high, low):
-        f = ["100" if market == "sh" else "51", name, code, price, prev, open_, "80000"]
-        f += [""] * 23                      # f7..f29
-        f += [ts, "-9.97", "-0.78", high, low, "", "80000", "102013",
-              "0.48", "25.1", "", high, low, "1.55", "16000", "16000", "8.86"]
-        return 'v_%s%s="%s";' % (market, code, "~".join(f))
-    return (line("sh", "贵州茅台", "600519", "1275.16", "1285.13", "1280.00",
-                 "20260911161451", "1290.00", "1270.00") + "\n"
-            + line("sz", "平安银行", "000001", "11.74", "11.85", "11.80",
-                   "20260911161454", "11.90", "11.60"))
+test.__test__ = False  # pytest 不要把装饰器本身当测试收集
+
+
+def _tencent_payload(market="sh", name="贵州茅台", code="600519",
+                     price="1275.16", prev="1285.13", open_="1280.00",
+                     ts="20260911161451", high="1290.00", low="1270.00",
+                     ask1_price="", ask1_vol="", float_mv="",
+                     limit_up="", limit_down="") -> str:
+    """构造 47 字段腾讯报文（按 _fetch_tencent 内部偏移约定：f[0]=市场类型，官方字段 f[1]..f[46]）。
+
+    关键索引：f3=price f4=prev f5=open f21=ask1_price f22=ask1_vol f30=ts
+    f33=high f34=low f42=float_mv f45=limit_up f46=limit_down。
+    """
+    # 显式按索引填 47 字段（0..46），避免加减长度带来的索引偏移错误
+    f = [""] * 47
+    f[0] = "100" if market == "sh" else "51"
+    f[1] = name
+    f[2] = code
+    f[3] = price
+    f[4] = prev
+    f[5] = open_
+    f[21] = ask1_price
+    f[22] = ask1_vol
+    f[30] = ts
+    f[33] = high
+    f[34] = low
+    f[42] = float_mv
+    f[45] = limit_up
+    f[46] = limit_down
+    return 'v_%s%s="%s";' % (market, code, "~".join(f))
+
+
+def _legacy_tencent_payload() -> str:
+    """旧版双行 fixture（保留 test_tencent_parse 回归测试）。"""
+    return (
+        _tencent_payload("sh", "贵州茅台", "600519",
+                         "1275.16", "1285.13", "1280.00",
+                         "20260911161451", "1290.00", "1270.00") + "\n"
+        + _tencent_payload("sz", "平安银行", "000001",
+                           "11.74", "11.85", "11.80",
+                           "20260911161454", "11.90", "11.60")
+    )
 
 
 @test
@@ -59,7 +89,7 @@ def test_is_trading_time_boundaries():
 @test
 def test_tencent_parse():
     class FakeResp:
-        text = _tencent_payload()
+        text = _legacy_tencent_payload()
         encoding = ""
     orig = quotes.requests.get
     quotes.requests.get = lambda url, timeout: FakeResp()
@@ -73,6 +103,53 @@ def test_tencent_parse():
     assert q["high"] == 1290.00 and q["low"] == 1270.00
     assert q["name"] == "贵州茅台" and q["source"] == "tencent"
     assert q["time"] == "20260911161451"
+    # Sprint 1 任务3：新增 5 个字段在旧 fixture（缺数据）时必须为 None，不得抛异常
+    for k in ("ask1_price", "ask1_vol", "float_mv", "limit_up", "limit_down"):
+        assert q[k] is None, "%s 应为 None（旧 fixture 不含），实得 %r" % (k, q[k])
+
+
+@test
+def test_tencent_parse_new_fields():
+    """Sprint 1 任务3：验证 _fetch_tencent 解析新增 5 字段（规则21 三条件）。"""
+    class FakeResp:
+        text = _tencent_payload(
+            ask1_price="1270.00", ask1_vol="15000",
+            float_mv="1640123456789",     # 茅台流通市值 ~1.64 万亿（×100）
+            limit_up="1413.65", limit_down="1156.61")
+        encoding = ""
+    orig = quotes.requests.get
+    quotes.requests.get = lambda url, timeout: FakeResp()
+    try:
+        out = quotes._fetch_tencent(["600519"])
+    finally:
+        quotes.requests.get = orig
+    q = out["600519"]
+    assert q["ask1_price"] == 1270.00
+    assert q["ask1_vol"] == 15000.0     # 15000 手 → 15000.0 股（含 .0）
+    assert q["float_mv"] == 1640123456789.0
+    assert q["limit_up"] == 1413.65
+    assert q["limit_down"] == 1156.61
+    # 旧字段未被破坏
+    assert q["price"] == 1275.16 and q["prev_close"] == 1285.13
+    assert q["high"] == 1290.00 and q["low"] == 1270.00
+
+
+@test
+def test_tencent_parse_empty_seal_volume_is_none():
+    """边界：f22 卖一量为空字符串（跌停开板 / 未形成封单）时落 None，不抛异常。"""
+    class FakeResp:
+        # ask1_price 有但 ask1_vol 空，模拟"无封单"情形
+        text = _tencent_payload(ask1_price="1270.00", ask1_vol="")
+        encoding = ""
+    orig = quotes.requests.get
+    quotes.requests.get = lambda url, timeout: FakeResp()
+    try:
+        out = quotes._fetch_tencent(["600519"])
+    finally:
+        quotes.requests.get = orig
+    q = out["600519"]
+    assert q["ask1_price"] == 1270.00
+    assert q["ask1_vol"] is None
 
 
 @test

@@ -390,5 +390,270 @@ def _main() -> int:
     return 1 if failed else 0
 
 
+# ============================================================
+# Sprint 1 任务 1 + 任务 2：signal_eval 落盘 + profile 投票
+# ============================================================
+
+def _write_bt(tmp_path, cur_ann=-0.0801, alt_ann=0.3554,
+              cur_mdd=-0.3615, alt_mdd=-0.3224):
+    """写一份临时 backtest_result.json 供 profile_verdict 读取。
+
+    与 verdict 逻辑对齐：当前 profile = momentum（config 当前值），备选 = reversal_lowvol/v2。
+    测试场景的 cur_ann/cur_mdd 视为当前 profile 的数字，alt_* 视为备选（verdict 取最优 alt）。
+    """
+    p = tmp_path / "backtest_result.json"
+    p.write_text(_Path(
+        BASE / "logs" / "backtest_result.json"
+    ).read_text(encoding="utf-8") if (BASE / "logs" / "backtest_result.json").exists()
+        else '{"profiles":{}}', encoding="utf-8")
+    import json as _json
+    payload = {
+        "profiles": {
+            # 当前 profile（verdict 取这里做 B/C_cur）
+            "momentum": {
+                "strategy_perf": {"annual_return": cur_ann, "max_drawdown": cur_mdd},
+                "benchmark_hs300": {"annual_return": 0.1169, "max_drawdown": -0.1566},
+            },
+            # 备选（verdict 取年化超额最高者做 B_alt，取 MDD 最接近 0 者做 C_alt）
+            "reversal_lowvol": {
+                "strategy_perf": {"annual_return": alt_ann, "max_drawdown": alt_mdd},
+                "benchmark_hs300": {"annual_return": 0.1169, "max_drawdown": -0.1566},
+            },
+            "reversal_lowvol_v2": {
+                # v2 给一个介于 cur/alt 之间的备份，让 B/C 各取极值时仍能挑出 alt
+                "strategy_perf": {"annual_return": (cur_ann + alt_ann) / 2,
+                                   "max_drawdown": (cur_mdd + alt_mdd) / 2},
+                "benchmark_hs300": {"annual_return": 0.1169, "max_drawdown": -0.1566},
+            },
+        },
+    }
+    p.write_text(_json.dumps(payload), encoding="utf-8")
+    return p
+
+
+def test_signal_eval_persists_latest(tmp_path=None):
+    """任务 1：evaluate() 落盘到 AGSICKLE_SIGNAL_EVAL_DIR 隔离目录（K3：不得碰生产
+    logs/signal_eval/）。"""
+    import os
+    import json as _json
+    from review import signal_eval
+    sandbox = tempfile.mkdtemp(prefix="agsickle_signal_eval_test_")
+    old_env = os.environ.get("AGSICKLE_SIGNAL_EVAL_DIR")
+    os.environ["AGSICKLE_SIGNAL_EVAL_DIR"] = sandbox
+    conn = make_conn()
+    try:
+        payload = signal_eval.evaluate(conn)
+        persist = signal_eval._persist_latest(payload)
+        assert persist.get("error") is None, persist
+        p = _Path(persist["path"])
+        latest = _Path(persist["latest_path"])
+        assert p.exists() and latest.exists()
+        # 落盘目录确为沙箱，生产目录未被触碰
+        assert str(p).startswith(sandbox)
+        assert not (BASE / "logs" / "signal_eval" / latest.name).exists() or \
+            _json.loads((BASE / "logs" / "signal_eval" / latest.name)
+                        .read_text(encoding="utf-8")) != payload
+        # latest.json 可被解析回 dict
+        loaded = _json.loads(latest.read_text(encoding="utf-8"))
+        assert "profile_verdict" in loaded
+        assert "factor_ic" in loaded
+    finally:
+        conn.close()
+        if old_env is None:
+            os.environ.pop("AGSICKLE_SIGNAL_EVAL_DIR", None)
+        else:
+            os.environ["AGSICKLE_SIGNAL_EVAL_DIR"] = old_env
+
+
+def test_profile_verdict_both_lost_switch(tmp_path=None):
+    """投票 case1：B+C 双劣 → switch（v1.7 verdict 顶层结构：votes/b_switch/c_switch/red_line_triggered）。"""
+    from review import signal_eval
+    bt = _write_bt(_Path(tempfile.mkdtemp()),
+                   cur_ann=-0.10, alt_ann=0.30,    # B_cur − B_alt = -0.40 → 投切换
+                   cur_mdd=-0.10, alt_mdd=-0.03)   # C_cur − C_alt = -0.07 → 投切换
+    import json as _json
+    _json.loads(bt.read_text(encoding="utf-8"))
+    target = BASE / "logs" / "backtest_result.json"
+    backup = None
+    if target.exists():
+        backup = target.read_bytes()
+    target.write_bytes(bt.read_bytes())
+    try:
+        conn = make_conn()
+        try:
+            v = signal_eval.profile_verdict(conn)
+            assert v["B"]["gap"] is not None and v["B"]["gap"] < -0.10, v["B"]
+            assert v["C"]["gap"] is not None and v["C"]["gap"] < -0.05, v["C"]
+            assert v["red_line_triggered"] is False  # MDD -10% > -30%
+            assert v["verdict"] == "switch", v
+            assert v["confidence"] == "high"  # 2/2 → high
+            # v1.7：suggest_profile 切换到 B 维较优者（"alt"按 Fix-5 取年化超额最高）
+            assert v["suggest_profile"] != v["profile"]
+        finally:
+            conn.close()
+    finally:
+        if backup is not None:
+            target.write_bytes(backup)
+
+
+def test_profile_verdict_only_c_vote_switch_low_confidence(tmp_path=None):
+    """Fix-6 投票 case2（v1.5）：仅 C 投切换（B 不够差）→ switch + confidence=low。"""
+    from review import signal_eval
+    bt = _write_bt(_Path(tempfile.mkdtemp()),
+                   cur_ann=0.10, alt_ann=0.15,    # B gap=-5pp > -10pp → 不投
+                   cur_mdd=-0.20, alt_mdd=-0.10)  # C gap=-10pp < -5pp → 投
+    target = BASE / "logs" / "backtest_result.json"
+    backup = None
+    if target.exists():
+        backup = target.read_bytes()
+    target.write_bytes(bt.read_bytes())
+    try:
+        conn = make_conn()
+        try:
+            v = signal_eval.profile_verdict(conn)
+            assert v["votes"]["b_switch"] is False, v["votes"]
+            assert v["votes"]["c_switch"] is True, v["votes"]
+            assert v["red_line_triggered"] is False  # -20% > -30%
+            assert v["verdict"] == "switch", v
+            assert v["confidence"] == "low", v
+            # suggest_profile 切到 B 维较优备选（Fix-5 取最高年化超额）
+            assert v["suggest_profile"] != v["profile"], v
+        finally:
+            conn.close()
+    finally:
+        if backup is not None:
+            target.write_bytes(backup)
+
+
+def test_profile_verdict_red_line_overrides(tmp_path=None):
+    """投票 case3：MDD 破 -30% → 无条件 hold，suggest_profile 保持现状（v1.7 不再自动建议切换）。"""
+    from review import signal_eval
+    bt = _write_bt(_Path(tempfile.mkdtemp()),
+                   cur_ann=-0.10, alt_ann=0.30,    # B 投切换
+                   cur_mdd=-0.40, alt_mdd=-0.10)  # C 也投切换 + 触发红线
+    target = BASE / "logs" / "backtest_result.json"
+    backup = None
+    if target.exists():
+        backup = target.read_bytes()
+    target.write_bytes(bt.read_bytes())
+    conn0 = make_conn()
+    try:
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+        conn0.execute(
+            "DELETE FROM risk_event WHERE rule='profile_verdict_red_line'"
+            " AND ts LIKE ?", (today + "%",))
+        conn0.commit()
+    finally:
+        conn0.close()
+    try:
+        conn = make_conn()
+        try:
+            v = signal_eval.profile_verdict(conn)
+            assert v["red_line_triggered"] is True, v
+            assert v["verdict"] == "hold", v
+            # v1.7 红线只 hold，不切：suggest_profile = 当前 profile
+            assert v["suggest_profile"] == v["profile"], v
+            n = conn.execute(
+                "SELECT COUNT(*) FROM risk_event WHERE rule='profile_verdict_red_line'"
+                " AND ts LIKE ?", (today + "%",)).fetchone()[0]
+            assert n >= 1, "红线 override 必须写 risk_event"
+        finally:
+            conn.close()
+    finally:
+        if backup is not None:
+            target.write_bytes(backup)
+
+
+def test_profile_verdict_three_profile_alts_pick_best():
+    """Fix-5：三 profile 备选显式枚举——v1 当前时备选 = momentum + v2，
+    B/C 各取备选较优者对比（B 从 momentum 取、C 从 v2 取）。"""
+    import json as _json
+    from review import signal_eval
+    import signals.signals as sig_mod
+    orig_profile = sig_mod.profile
+    sig_mod.profile = lambda: "reversal_lowvol"
+    target = BASE / "logs" / "backtest_result.json"
+    backup = None
+    if target.exists():
+        backup = target.read_bytes()
+    payload = {
+        "profiles": {
+            "reversal_lowvol": {
+                "strategy_perf": {"annual_return": 0.60, "max_drawdown": -0.15},
+                "benchmark_hs300": {"annual_return": 0.10, "max_drawdown": -0.15},
+            },
+            "momentum": {  # B 较优（超额 +20pp）
+                "strategy_perf": {"annual_return": 0.30, "max_drawdown": -0.20},
+                "benchmark_hs300": {"annual_return": 0.10, "max_drawdown": -0.15},
+            },
+            "reversal_lowvol_v2": {  # C 较优（MDD 最浅）
+                "strategy_perf": {"annual_return": 0.12, "max_drawdown": -0.08},
+                "benchmark_hs300": {"annual_return": 0.10, "max_drawdown": -0.15},
+            },
+        },
+    }
+    target.write_text(_json.dumps(payload), encoding="utf-8")
+    try:
+        conn = make_conn()
+        try:
+            v = signal_eval.profile_verdict(conn)
+            assert v["other_profiles"] == ["momentum", "reversal_lowvol_v2"]
+            assert v["alt_best"]["b_from"] == "momentum"
+            assert v["alt_best"]["c_from"] == "reversal_lowvol_v2"
+            # B_alt=+0.20（momentum 超额）；C_alt=-0.08（v2 的 MDD）
+            assert abs(v["B"]["alt"] - 0.20) < 1e-9
+            assert abs(v["C"]["alt"] - (-0.08)) < 1e-9
+            # B gap=+0.30 远优于备选 → 不投；C gap=-0.07 投 → 1 票（Fix-6 ≥1 票即建议）
+            assert v["votes"]["votes_switch"] == 1
+            assert v["verdict"] == "switch"
+            assert v["confidence"] == "low"
+            # switch 目标 = B 维较优备选 momentum
+            assert v["suggest_profile"] == "momentum"
+        finally:
+            conn.close()
+    finally:
+        sig_mod.profile = orig_profile
+        if backup is not None:
+            target.write_bytes(backup)
+
+
+def test_profile_verdict_abstain_when_bt_missing(tmp_path=None):
+    """任务 2 投票 case4：backtest_result.json 缺失 → B/C 全弃权 → hold。"""
+    from review import signal_eval
+    target = BASE / "logs" / "backtest_result.json"
+    backup = None
+    if target.exists():
+        backup = target.read_bytes()
+        target.unlink()
+    try:
+        conn = make_conn()
+        try:
+            v = signal_eval.profile_verdict(conn)
+            assert "B (年化超额 vs HS300)" in v["abstains"]
+            assert "C (MDD)" in v["abstains"]
+            assert v["verdict"] == "hold"
+            assert v["backtest_missing"] is not None
+        finally:
+            conn.close()
+    finally:
+        if backup is not None:
+            target.write_bytes(backup)
+
+
+def test_profile_verdict_compat_with_weekly():
+    """v1.4 verdict dict 兼容 v1.3 周报消费方（保留旧字段 score_ic_h5）。"""
+    from review import signal_eval
+    conn = make_conn()
+    try:
+        v = signal_eval.profile_verdict(conn)
+        # v1.3 周报要读的旧字段必须仍在
+        assert "score_ic_h5" in v
+        assert "ic_thresholds_v13" in v
+        assert v["ic_thresholds_v13"]["keep_ge"] == 0.02
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())

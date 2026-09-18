@@ -18,6 +18,9 @@ from typing import Dict, List, Optional, Tuple
 from common.market import (SESSION_AM, SESSION_PM, in_trading_session,  # noqa: F401
                            is_trading_time, limit_pct, limit_price)
 
+# P0-5：sell 单豁免"仅业绩预告负面"黑名单拦截的判定口径（单一权威在 risk.blacklist）
+from risk.blacklist import is_earnings_only
+
 # ---------------- 数据结构 ----------------
 
 
@@ -44,6 +47,8 @@ class RiskContext:
     # ---- 2026-09-14 市场环境总闸（risk/regime.py，策略库 Top2/Top3） ----
     position_cap: Optional[float] = None            # 动态总仓位上限（绝对值）；None=无附加约束
     atr_pct: Dict[str, float] = field(default_factory=dict)  # {code: ATR占比}（ATR 自适应止损）
+    # ---- Sprint 1 任务 4：实时行情扩展（规则 21 条件② 死封判定） ----
+    live_quotes: Dict[str, dict] = field(default_factory=dict)  # {code: quote_dict 含 ask1_vol/float_mv}
 
 
 @dataclass
@@ -58,6 +63,12 @@ class Verdict:
     kill_orders: List[dict] = field(default_factory=list)  # 触发清仓时的 sell 指令
     kill_pending: List[str] = field(default_factory=list)  # T+1 不可卖、需次日补清算的代码
     kill_until: Optional[datetime] = None
+    # Sprint 1 任务 4：跌停应急事件（规则 21），由 check() 调用方写 risk_event
+    emergency_pending: Optional[dict] = None
+    # P0-4：check() 期间产生的待落库 risk_event（{"rule","detail","once_today_prefix"}）。
+    # check() 自身不再 get_conn() 直写生产库（测试会污染 risk_event），统一由
+    # 调用方（runner.propose/confirm，持有 conn）经 flush_events 落库。
+    events: List[dict] = field(default_factory=list)
 
     def brief(self) -> str:
         parts = ["approved=%s" % self.approved,
@@ -69,6 +80,8 @@ class Verdict:
             parts.append("kill_until=%s" % self.kill_until.strftime("%Y-%m-%d %H:%M"))
         if self.kill_pending:
             parts.append("kill_pending=%s" % ",".join(self.kill_pending))
+        if self.emergency_pending:
+            parts.append("emergency_pending=%s" % self.emergency_pending.get("code"))
         return " ".join(parts)
 
 
@@ -126,11 +139,24 @@ def _build_kill_orders(ctx: RiskContext) -> Tuple[List[dict], List[str]]:
 
 
 def rule_blacklist(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
-    """规则1：黑名单中 ok=False 的标的拒绝。"""
+    """规则1：黑名单中 ok=False 的标的拒绝。
+
+    P0-5：sell 单豁免"仅业绩预告负面"拦截——止损卖出（含规则21 应急单）不应被
+    业绩预告焊死出口（连续跌停+负面预告正是规则21 的典型场景）；含 ST/次新/
+    上市天数等其他拦截理由时不豁免，buy 单一律不豁免。与规则20"sell 不挡"同理。
+    """
     code = str(decision.get("code") or "")
     item = (ctx.blacklist or {}).get(code)
     if item and not item[0]:
-        v.violations.append("黑名单：%s 被拦截（%s）" % (code, item[1]))
+        reason = item[1]
+        # 归一化比较（与 check() 主流程同口径）："SELL"/" Sell " 等非常规输入
+        # 不豁免 → fail-closed 走拦截分支
+        if str(decision.get("action") or "").strip().lower() == "sell" \
+                and is_earnings_only(reason):
+            v.warnings.append(
+                "黑名单豁免（sell）：%s 仅因业绩预告负面拦截，止损卖单放行" % code)
+            return
+        v.violations.append("黑名单：%s 被拦截（%s）" % (code, reason))
 
 
 def rule_confidence(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
@@ -154,8 +180,17 @@ def rule_health(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None
 
 
 def rule_trading_session(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
-    """规则4：非交易时段拒绝买卖（仅对 buy/sell 调用；hold/watch 永远放行）。"""
+    """规则4：非交易时段拒绝买卖（仅对 buy/sell 调用；hold/watch 永远放行）。
+
+    豁免：Fix-4 跌停应急扫描单（emergency_scan=True）——盘后 propose 只是入库
+    挂 pending、盘前 09:14 兜底 confirm 才真正执行，两次动作都不在连续竞价时段，
+    若按普通单拒掉 D1 链路即失效；执行价仍受 confirm 内置价格类风控约束。
+    """
     if not in_trading_session(ctx.now):
+        if decision.get("emergency_scan"):
+            v.warnings.append(
+                "规则4豁免：跌停应急扫描单允许非交易时段入库/兜底确认（执行价二次校验保留）")
+            return
         v.violations.append(
             "非交易时段：%s 不在 周一~周五 09:30-11:30/13:00-15:00，拒绝买卖"
             % ctx.now.strftime("%Y-%m-%d %H:%M:%S"))
@@ -358,7 +393,11 @@ def rule_lot_size(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> No
 
 
 def rule_price_limit(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
-    """规则14：涨跌停保护——买价达到涨停拒买，卖价达到跌停拒卖。"""
+    """规则14：涨跌停保护——买价达到涨停拒买，卖价达到跌停拒卖。
+
+    豁免：decision['emergency_pending_skip']=True 且 risk_event 已有
+    'limit_halt_emergency' 记录 → 仅记 warning 放行（让应急单穿透规则 14）。
+    """
     order = decision.get("order") or {}
     code = str(decision.get("code") or "")
     action = decision.get("action")
@@ -377,9 +416,119 @@ def rule_price_limit(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) ->
     elif action == "sell":
         down = limit_price(float(pc), pct, up=False)
         if price <= down:
+            # Sprint 1 任务 4：规则 21 跌停应急路径豁免
+            if decision.get("emergency_pending_skip"):
+                v.warnings.append(
+                    "跌停保护豁免：limit_halt_emergency 应急单放行"
+                    "（卖价 %.2f = 跌停价 %.2f）" % (price, down))
+                return
             v.violations.append(
                 "跌停保护：委托卖价 %.2f ≤ 跌停价 %.2f（昨收 %.2f，±%.0f%%），拒卖"
                 % (price, down, float(pc), pct * 100))
+
+
+def _limit_halt_condition(code: str, ctx: RiskContext, cfg: dict) -> Tuple[bool, dict]:
+    """规则 21 三条件判定核心（Fix-4：engine 与 signals/limit_halt 扫描器共用）。
+
+    ① 死封候选：跌停价（由调用方比对 order.price == down，此处只算出 down）
+    ② 死封（可选）：quote.ask1_vol × 100 / (quote.float_mv / quote.price) > 3%
+       —— 任一字段缺失视为 True（不阻断）
+    ③ 浮亏 ≥ stop_loss_line（复用规则 16 现成实现 stop_loss_breaches）
+
+    返回 (hit, info)：hit=False 时 info["reason"] 说明；hit=True 时 info 含
+    down/loss/stop_line/seal_ratio（可能 None）。
+    """
+    pc = (ctx.prev_close or {}).get(code)
+    if not pc or pc <= 0:
+        return False, {"reason": "缺昨收价"}
+    pct = limit_pct(code)
+    down = limit_price(float(pc), pct, up=False)
+    breach = {c: loss for c, loss in stop_loss_breaches(ctx, cfg)}
+    loss = breach.get(code)
+    if loss is None or loss < stop_loss_line(ctx, cfg, code) - 1e-12:
+        return False, {"reason": "浮亏未破止损线", "down": down}
+    quote = (ctx.live_quotes or {}).get(code) or {}
+    ask1_vol = quote.get("ask1_vol")
+    float_mv = quote.get("float_mv")
+    cur_price = quote.get("price")
+    seal_ratio = None
+    if ask1_vol is not None and float_mv is not None and cur_price and cur_price > 0:
+        float_shares = float(float_mv) / float(cur_price)
+        if float_shares > 0:
+            seal_ratio = (float(ask1_vol) * 100) / float_shares
+            if seal_ratio < 0.03:
+                return False, {"reason": "封单比不足 3%", "down": down,
+                               "seal_ratio": seal_ratio}
+    return True, {"down": down, "loss": loss,
+                  "stop_line": stop_loss_line(ctx, cfg, code),
+                  "seal_ratio": seal_ratio}
+
+
+def rule_limit_halt_emergency(decision: dict, ctx: RiskContext, cfg: dict,
+                              v: Verdict) -> None:
+    """规则21：跌停封单应急——A股 T+1 + 涨跌停 + 隔夜跳空三重制度下，规则14
+    '卖价=跌停价拒卖'会让连续跌停持仓票卡死。三条件 AND（条件② 缺数据静默跳过）：
+
+    ① 卖单：action=='sell' 且 order.price == limit_price(prev_close, limit_pct, up=False)
+    ② 死封（可选）：quote.ask1_vol × 100 / (quote.float_mv / quote.price) > 3%
+       —— 任一字段缺失视为 True（不阻断，让条件③ 单独也能触发应急路径）
+    ③ 浮亏 ≥ stop_loss_line（复用规则 16 现成实现 stop_loss_breaches）
+
+    触发动作：写 risk_event(rule='limit_halt_emergency') 一条；不直接下单，
+    走 confirm 闸门由用户放行（plan 4.3 默认 A 路径）。规则 14 通过
+    decision['emergency_pending_skip']=True 同步豁免。
+
+    Fix-4：emergency_scan=True（主动扫描器生成的待确认单）不再设置
+    skip_gate 直写——D1 决策是 confirm 优先 + 09:14 超时兜底，扫描单必须
+    停在 pending 等人工/兜底确认。
+    """
+    if decision.get("action") != "sell":
+        return
+    code = str(decision.get("code") or "")
+    order = decision.get("order") or {}
+    hit, info = _limit_halt_condition(code, ctx, cfg)
+    if not hit:
+        return
+    down = info["down"]
+    loss = info["loss"]
+    seal_ratio = info.get("seal_ratio")
+    price = float(order.get("price", 0) or 0)
+    # 条件①：卖价 = 跌停价（与规则 14 同口径）
+    if price > down:
+        return  # 不是跌停价，不触发
+    # 三条件全满足（② 缺数据时按"通过"处理）→ 写事件 + 豁免规则 14
+    seal_note = (f"封单比 {seal_ratio:.2%}" if seal_ratio is not None
+                 else "条件②缺数据，按'不阻断'处理")
+    detail = (f"{code} 跌停应急: 卖价={price:.2f}={down:.2f}（跌停价）；"
+              f"浮亏={loss:.2%}（止损线 {info['stop_line']:.2%}）；"
+              f"{seal_note}；建议次日 09:15 集合竞价挂跌停价")
+    try:
+        # ctx 不一定带 conn，从决策层无法直接写库 → 挂到 v 上由 check() 调用方
+        # 经 flush_events 写库（P0-4：不再 get_conn() 直写生产库）
+        v.emergency_pending = {
+            "rule": "limit_halt_emergency",
+            "code": code,
+            "detail": detail,
+        }
+        v.events.append({"rule": "limit_halt_emergency", "detail": detail,
+                         "once_today_prefix": code + " "})
+        # 同步给 decision 加豁免 flag，规则 14 检查这个 flag 决定放行
+        decision["emergency_pending_skip"] = True
+        if decision.get("emergency_scan"):
+            # Fix-4：扫描单走 confirm 闸门；09:14 超时兜底是否自动执行由
+            # execution.emergency_direct_exec 决定（Fix F，默认 false 只提醒）
+            v.warnings.append("跌停应急扫描单：%s（confirm 优先；09:14 超时兜底"
+                              "视 emergency_direct_exec 开关）" % detail)
+            return
+        # P1-6：skip_gate 仅标记"这是规则21 应急单"；是否直写成交由
+        # execution.emergency_direct_exec 开关决定（默认 false → runner 仍走
+        # confirm 人工闸门，恪守"绝不自动成交"总原则）。
+        decision["skip_gate"] = True
+        decision["confirmed_by"] = "emergency_rule21"
+        v.warnings.append("跌停应急路径激活：%s（直写需 execution.emergency_direct_exec=true，"
+                          "否则走 confirm 人工闸门）" % detail)
+    except Exception:
+        pass
 
 
 def rule_target_weight(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
@@ -439,7 +588,12 @@ def rule_concept_concentration(decision: dict, ctx: RiskContext, cfg: dict, v: V
 
 def rule_liquidity(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
     """规则18：本次下单金额 ≤ 最新日线成交额 × max_amount_share（paper 资金对
-    小成交额票会吃掉大量盘口，成交价假设失真）。无成交额数据时跳过。"""
+    小成交额票会吃掉大量盘口，成交价假设失真）。无成交额数据时跳过。
+
+    豁免：Fix-4 跌停应急扫描单（emergency_scan=True）——连续跌停日成交额萎缩
+    是常态，全仓逃命单几乎必然超 1% 参与率，若照拒则 D1 应急链路形同虚设；
+    应急单以跌停价集合竞价排队、不构成盘中砸盘冲击，且经人工 confirm/超时闸门。
+    """
     order = decision.get("order") or {}
     if not (order and decision.get("action") in ("buy", "sell")):
         return
@@ -452,6 +606,12 @@ def rule_liquidity(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> N
         return
     gross = float(order.get("price", 0) or 0) * _effective_shares(order, v)
     if gross > amt * cap + 1e-6:
+        if decision.get("emergency_scan"):
+            v.warnings.append(
+                "流动性豁免：跌停应急扫描单不受 %.1f%% 参与率约束"
+                "（跌停价排队逃命单，%.0f 元 > 成交额 %.0f × %.1f%%）"
+                % (cap * 100, gross, amt, cap * 100))
+            return
         v.violations.append(
             "流动性约束：下单 %.0f 元 > 最新成交额 %.0f × %.1f%%（=%.0f），拒绝"
             % (gross, amt, cap * 100, amt * cap))
@@ -464,6 +624,63 @@ def rule_round_trip(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> 
     code = str(decision.get("code") or "")
     if code in (ctx.today_sold_codes or set()):
         v.violations.append("同票往返：%s 当日已卖出，禁止再买回" % code)
+
+
+def rule_factor_crowding(decision: dict, ctx: RiskContext, cfg: dict,
+                         v: Verdict) -> None:
+    """规则20：因子拥挤度熔断（Sprint 1 任务 5）—— read_factor_crowding() 返回
+    crowded=True 时，buy 单 target_weight > 5% 自动压回 5%（按当前 equity 重算股数）。
+    sell 单不挡（拥挤熔断不该堵止损）。
+    """
+    if decision.get("action") != "buy":
+        return
+    try:
+        from signals.signals import read_factor_crowding
+        fc = read_factor_crowding()
+    except Exception:
+        return  # 读取失败视为未触发（fail-open）
+    if not fc.get("crowded"):
+        return
+    tw = decision.get("target_weight")
+    if tw is None:
+        return
+    try:
+        tw = float(tw)
+    except (TypeError, ValueError):
+        return
+    cap = float(fc.get("crowded_max_weight", 0.05))
+    if tw <= cap + 1e-12:
+        return  # 本来就在 5% 以下，放行
+    # 按 5% 等价股数压回（需要知道当前实时价与现金）
+    code = str(decision.get("code") or "")
+    order = decision.get("order") or {}
+    price = float(order.get("price", 0) or 0)
+    if price <= 0:
+        return
+    equity = float(ctx.total_equity or 0)
+    if equity <= 0:
+        return
+    target_amount = equity * cap
+    new_shares = int((target_amount // price) // 100 * 100)  # 整手规整
+    if new_shares <= 0:
+        v.violations.append(
+            "因子拥挤熔断：%s target_weight %.1f%% > 5%% 上限，"
+            "5%% 等价股数不足一手（%d 元/股），拒绝"
+            % (code, tw * 100, int(price)))
+        return
+    adj = dict(order)
+    adj["shares"] = new_shares
+    v.adjusted_order = adj
+    v.warnings.append(
+        "因子拥挤熔断：%s target_weight %.1f%% → 5%% 上限，"
+        "股数 %s → %d" % (code, tw * 100, order.get("shares"), new_shares))
+    # 写 risk_event（同日去重）——P0-4：挂到 v.events 由调用方落库，不再
+    # get_conn() 直写生产库（该路径在测试里污染了 risk_event 表）
+    v.events.append({
+        "rule": "factor_crowding_active",
+        "detail": f"因子拥挤熔断生效: μ={fc.get('mu60')}, σ={fc.get('sigma60')}; "
+                  f"target_weight {tw:.1%} → {cap:.0%} 上限",
+        "once_today_prefix": "因子拥挤熔断生效"})
 
 
 # ---------------- 结构校验与主入口 ----------------
@@ -528,7 +745,8 @@ def check(decision: dict, ctx: RiskContext, cfg: dict) -> Verdict:
     rule_trading_session(decision, ctx, cfg, v)  # 规则4
     rule_blacklist(decision, ctx, cfg, v)        # 规则1
     rule_price_guard(decision, ctx, cfg, v)      # 规则9
-    rule_price_limit(decision, ctx, cfg, v)      # 规则14
+    rule_limit_halt_emergency(decision, ctx, cfg, v)   # 规则21（Sprint 1，必须在规则14之前：先写豁免 flag）
+    rule_price_limit(decision, ctx, cfg, v)      # 规则14（被 21 触发的 emergency_pending_skip 豁免）
     rule_t_plus_1(decision, ctx, cfg, v)         # 规则12
     rule_lot_size(decision, ctx, cfg, v)         # 规则13（先规整，后续金额按规整后数量）
     rule_single_weight(decision, ctx, cfg, v)    # 规则6
@@ -540,6 +758,10 @@ def check(decision: dict, ctx: RiskContext, cfg: dict) -> Verdict:
     rule_concept_concentration(decision, ctx, cfg, v)  # 规则17
     rule_liquidity(decision, ctx, cfg, v)        # 规则18
     rule_round_trip(decision, ctx, cfg, v)       # 规则19
+    rule_factor_crowding(decision, ctx, cfg, v)  # 规则20（Sprint 1 任务 5）
+
+    # 规则 21 等事件已挂 v.events（P0-4）——check() 不再直写生产库，
+    # 由调用方（runner.propose/confirm）经 flush_events(conn, v, decision_id) 落库
 
     v.approved = (not v.violations) and (not v.report_only) and (not v.kill_trigger)
     return v
@@ -556,6 +778,31 @@ def record_event(conn: sqlite3.Connection, rule: str, detail: str,
         (datetime.now().isoformat(timespec="seconds"), rule, detail, decision_id),
     )
     conn.commit()
+
+
+def flush_events(conn: sqlite3.Connection, v: Verdict,
+                 decision_id: Optional[int] = None) -> None:
+    """把 check() 挂到 Verdict 上的 risk_event 写库（P0-4：engine 不再 get_conn 直写）。
+
+    once_today_prefix 非空的事件按 rule+当日+detail 前缀去重（同票同日只留一条，
+    规则21 反复 check 不再刷屏——此前无去重直写积累了大量重复行）。
+    """
+    for ev in v.events:
+        try:
+            prefix = ev.get("once_today_prefix")
+            if prefix:
+                today = datetime.now().strftime("%Y-%m-%d")
+                n = conn.execute(
+                    "SELECT COUNT(*) FROM risk_event WHERE rule=? AND ts LIKE ?"
+                    " AND detail LIKE ?",
+                    (ev["rule"], today + "%", prefix + "%")).fetchone()[0]
+                if n:
+                    continue
+            record_event(conn, ev["rule"], ev["detail"], decision_id)
+        except Exception as e:  # noqa: BLE001
+            import logging as _lg
+            _lg.getLogger("risk.engine").warning(
+                "flush_events 落库失败（不阻断）: %s", repr(e))
 
 
 def apply_kill_switch(conn: sqlite3.Connection, kill_until: Optional[datetime],

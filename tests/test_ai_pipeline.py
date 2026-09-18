@@ -113,6 +113,25 @@ def test_validate_blacklist_code():
     assert ok2, errs2
 
 
+def test_validate_sell_exempts_earnings_only_blacklist():
+    """P0-5：sell 单对"仅业绩预告负面"黑名单豁免放行（止损出口不被焊死）；
+    buy 单同样拦截仍拒；sell 单含 ST 等非业绩预告理由仍拒。"""
+    sell_dec = base_decision(action="sell", code="600519",
+                             order={"side": "sell", "price": 1400.0, "shares": 100})
+    # ① sell + 仅业绩预告负面 → 豁免
+    blEarn = {"600519": (False, "业绩预告负面（net=-3）")}
+    ok, _, errs = decide.validate(sell_dec, blacklist=blEarn)
+    assert ok, f"sell 应豁免业绩预告拦截，实得 errs={errs}"
+    assert not any("黑名单" in e for e in errs), errs
+    # ② buy + 仅业绩预告负面 → 仍拦
+    ok2, _, errs2 = decide.validate(base_decision(code="600519"), blacklist=blEarn)
+    assert not ok2 and any("黑名单" in e for e in errs2), errs2
+    # ③ sell + 业绩预告负面 & ST 混合 → 仍拦
+    blMixed = {"600519": (False, "业绩预告负面（net=-3）; ST标的")}
+    ok3, _, errs3 = decide.validate(sell_dec, blacklist=blMixed)
+    assert not ok3 and any("黑名单" in e for e in errs3), errs3
+
+
 def test_validate_weight_out_of_range():
     for bad in (0.35, -0.01, "abc", None):
         ok, _, errs = decide.validate(base_decision(target_weight=bad))
@@ -214,7 +233,7 @@ def test_build_bundle_with_data():
                  " volume, amount, pct_chg, turnover) VALUES "
                  "('600519',?,1,1,1,1,1,1,0,0)", (bar_date,))
     # signal 与日线同日：bundle 按最新 bar 日期取信号截面
-    conn.execute("INSERT INTO signal VALUES ('600519',?, '{\"ma_trend\":\"up\"}',0.7)", (bar_date,))
+    conn.execute("INSERT INTO signal (code, as_of, signals, score, profile) VALUES ('600519',?, '{\"ma_trend\":\"up\"}',0.7,'reversal_lowvol')", (bar_date,))
     conn.execute("INSERT INTO index_valuation VALUES ('000300','2026-09-11',12,0.5,1.3,0.6,4000)")
     conn.execute("INSERT INTO portfolio_state VALUES ('2026-09-11',900000,100000,1000000,0,0,'t')")
     conn.commit()
@@ -227,6 +246,31 @@ def test_build_bundle_with_data():
     assert b["portfolio_state"]["total"] == 1000000.0
     assert b["data_quality"] == {"600519": bar_date}
     conn.close()
+
+
+def test_build_bundle_injects_bond_etf_signals():
+    """Sprint 2 任务 1：build_bundle 注入 bond_etf_signals（缺表时降级为 reason）。"""
+    conn = make_conn()
+    try:
+        b = ai_bundle.build_bundle(run_date="2026-09-11", conn=conn)
+        # 空表 → dict 内 reason 写明降级路径
+        assert "bond_etf_signals" in b
+        assert b["bond_etf_signals"]["bond_yield"] == {}
+        assert b["bond_etf_signals"]["etf_share"] == {}
+        assert "均为空" in b["bond_etf_signals"]["reason"]
+
+        # 填一行国债 + ETF → 应出现在 bundle
+        conn.execute(
+            "INSERT INTO index_bond_yield VALUES ('10Y_CN','2026-09-11',2.55,-20.0,'em')")
+        conn.execute(
+            "INSERT INTO index_etf_share VALUES ('510300','2026-09-11',1000000.0,-3.5,'em')")
+        conn.commit()
+        b = ai_bundle.build_bundle(run_date="2026-09-11", conn=conn)
+        assert b["bond_etf_signals"]["bond_yield"]["yield"] == 2.55
+        assert b["bond_etf_signals"]["bond_yield"]["delta_20d_bp"] == -20.0
+        assert b["bond_etf_signals"]["etf_share"]["510300"]["pct_chg_1d"] == -3.5
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------- 模板自洽
@@ -257,6 +301,35 @@ def test_load_and_save_rejects_bad_file():
                                 good.read_text(encoding="utf-8"), "2026-09-11")
     assert len(ids) == 1
     conn.close()
+
+
+# ---------------------------------------------------------------- Fix-5：earnings confidence 加成
+
+def test_validate_earnings_confidence_boost_capped():
+    """Fix-5：近 3 日净分 ≥ +2 → confidence +0.1（封顶 1.0）；净分不足不加成。"""
+    earn_pos = {"600519": {"positive": 3, "negative": 0, "net": 3}}
+    ok, norm, errs = decide.validate(base_decision(confidence=0.70),
+                                     earnings_events=earn_pos)
+    assert ok, errs
+    assert abs(norm["confidence"] - 0.80) < 1e-9
+
+    # 加成封顶 1.0
+    ok2, norm2, _ = decide.validate(base_decision(confidence=0.95),
+                                    earnings_events=earn_pos)
+    assert ok2 and norm2["confidence"] == 1.0
+
+    # 净分 +1 不达阈值、无数据、净分为负 → 不加成
+    ok3, norm3, _ = decide.validate(
+        base_decision(confidence=0.70),
+        earnings_events={"600519": {"positive": 1, "negative": 0, "net": 1}})
+    assert ok3 and abs(norm3["confidence"] - 0.70) < 1e-9
+    ok4, norm4, _ = decide.validate(base_decision(confidence=0.70),
+                                    earnings_events={})
+    assert ok4 and abs(norm4["confidence"] - 0.70) < 1e-9
+    ok5, norm5, _ = decide.validate(
+        base_decision(confidence=0.70),
+        earnings_events={"600519": {"positive": 0, "negative": 5, "net": -5}})
+    assert ok5 and abs(norm5["confidence"] - 0.70) < 1e-9
 
 
 # ---------------------------------------------------------------- 直接运行入口

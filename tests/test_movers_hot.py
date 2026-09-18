@@ -28,6 +28,9 @@ def test(fn):
     return fn
 
 
+test.__test__ = False  # pytest 不要把装饰器本身当测试收集
+
+
 def _mem():
     conn = sqlite3.connect(":memory:")
     conn.executescript(DDL)

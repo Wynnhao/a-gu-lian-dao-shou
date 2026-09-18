@@ -104,3 +104,48 @@ def turnover_pct(turnover, window: int = 250) -> Optional[float]:
     w = a[-window:]
     cur = float(w[-1])
     return float((w <= cur).mean())
+
+
+# ============================================================
+# Sprint 2 附任务（P1-2）：IVOL + MAX(5) 残差类因子
+# ============================================================
+
+def ivol(stock_close, mkt_close, window: int = 20) -> Optional[float]:
+    """特质波动率（IVOL）：过去 window 日个股日收益对基准日收益 OLS 回归的残差标准差。
+
+    依据：审查报告 P1-2——"低波异象"的更精细分解；CAPM 单因子残差 σ，
+    基准用 HS300（index_daily '000300'，close 列日收益）。
+    Fix-6：回归带截距（alpha, beta = polyfit(mr, sr, 1)，resid = sr − α − β·mr），
+    剔除个股相对基准的系统性日均漂移后再量波动。
+    数据不足（任一序列 < window+1 个点）返回 None。
+
+    注意：两个序列按"尾部对齐"（取各自最后 window+1 个点算收益），
+    调用方须保证两者日期已对齐（compute_signal 侧按 trade_date merge 后传入）。
+    """
+    s = _arr(stock_close)
+    m = _arr(mkt_close)
+    if len(s) < window + 1 or len(m) < window + 1:
+        return None
+    sr = np.diff(s[-(window + 1):]) / s[-(window + 1):-1]
+    mr = np.diff(m[-(window + 1):]) / m[-(window + 1):-1]
+    # 防基准收益恒为 0（数据异常）：退化为个股收益 std
+    if np.std(mr) == 0.0:
+        return float(np.std(sr))
+    beta, alpha = np.polyfit(mr, sr, 1)  # polyfit 返回 [斜率, 截距]：β 在前 α 在后
+    resid = sr - alpha - beta * mr
+    return float(np.std(resid, ddof=1))
+
+
+def max_ret_bali(close, window: int = 20, top_k: int = 5) -> Optional[float]:
+    """MAX(window, top_k)（Bali et al. 定义）：过去 window 日日收益中最大的 top_k 个的均值。
+
+    依据：审查报告 P1-2——"最大日收益率异象"，MAX 与未来收益负相关（彩票偏好溢价）。
+    数据不足（< window+1 个点）返回 None。
+    """
+    a = _arr(close)
+    if len(a) < window + 1:
+        return None
+    rets = np.diff(a[-(window + 1):]) / a[-(window + 1):-1]
+    k = min(top_k, len(rets))
+    top = np.sort(rets)[-k:]
+    return float(top.mean())

@@ -55,7 +55,17 @@ export function GateCard({
         </span>
         <Badge variant="outline">{actionLabel(String(d.action ?? ""))}</Badge>
         <span className="text-table text-muted-foreground">
-          目标权重 <span className="num text-foreground">{fmtPct(Number(d.target_weight ?? 0) * 100)}</span>
+          目标权重{" "}
+          {d.action === "buy" ? (
+            <span className="num text-foreground">{fmtPct(Number(d.target_weight ?? 0) * 100)}</span>
+          ) : (
+            <span
+              className="text-muted-foreground"
+              title="卖出/观察/持有不设目标权重（仅建仓有仓位比例）"
+            >
+              —
+            </span>
+          )}
           {" · "}置信度 <span className="num text-foreground">{Number(d.confidence ?? 0).toFixed(2)}</span>
         </span>
         <span className="num ml-auto text-tiny text-muted-foreground" title={item.created_at}>

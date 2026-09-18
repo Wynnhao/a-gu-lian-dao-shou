@@ -39,7 +39,9 @@ def _cfg() -> dict:
 
 
 def _wl_codes() -> List[str]:
-    return [str(w["code"]) for w in load().get("watchlist", [])]
+    """可交易池（watchlist_core）代码——异动池"自选池口径"的判定基准。"""
+    from common.config import core_codes
+    return core_codes()
 
 
 def _limit_band(code: str) -> float:

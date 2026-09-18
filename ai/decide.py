@@ -14,14 +14,14 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from common.config import snapshot
+from common.config import core_codes, snapshot
 from data import repo
 from data.fetcher import get_conn
-from risk.blacklist import check_blacklist
+from risk.blacklist import check_blacklist, is_earnings_only
 
 CFG = snapshot()  # 统一配置层（批1迁移：消除 import 冻结的裸 json.loads 坏味道）
 RISK_CFG = CFG.get("risk", {})
-WATCHLIST_CODES = [str(x["code"]) for x in CFG.get("watchlist", [])]
+WATCHLIST_CODES = core_codes(CFG)   # 策略可交易池（watchlist_core，51 只）；扩展观察池不可交易
 MAX_SINGLE_WEIGHT = float(RISK_CFG.get("max_single_weight", 0.20))
 MIN_CONFIDENCE = float(RISK_CFG.get("min_confidence", 0.60))
 
@@ -47,11 +47,14 @@ log.propagate = False
 
 # ---------------------------------------------------------------- 校验
 
-def validate(obj, blacklist: Optional[dict] = None) -> Tuple[bool, Optional[dict], List[str]]:
+def validate(obj, blacklist: Optional[dict] = None,
+             earnings_events: Optional[dict] = None) -> Tuple[bool, Optional[dict], List[str]]:
     """校验单条决策 -> (ok, normalized, errors)。
 
     - obj 须为 dict；action/code/target_weight/confidence/reasons 必填，risk_notes 默认 []。
     - blacklist 为 {code: (ok, reason)}（可选）：传入时拦截 ok=False 的黑名单票。
+    - earnings_events 为 {code: {positive, negative, net, ...}}（可选，Fix-5）：
+      该票近 3 日净分 ≥ +2 → confidence = min(1.0, confidence + 0.1)（normalize 阶段）。
     - normalized 只保留白名单键（多余键剔除）；buy/sell 保留规整后的 order，hold/watch 不带 order。
     """
     errors: List[str] = []
@@ -73,10 +76,14 @@ def validate(obj, blacklist: Optional[dict] = None) -> Tuple[bool, Optional[dict
         errors.append("code %s 不在 watchlist 内 %s" % (code, WATCHLIST_CODES))
 
     # 黑名单（传入 blacklist 时才校验；执行层风控引擎还会再拦一次）
+    # P0-5：sell 单豁免"仅业绩预告负面"拦截（止损卖出不应被焊死，与 engine 同口径）
     if blacklist:
         item = blacklist.get(code)
         if item is not None and not item[0]:
-            errors.append("code %s 在黑名单中: %s" % (code, item[1]))
+            if action == "sell" and is_earnings_only(item[1]):
+                pass  # 豁免：业绩预告负面不阻止止损卖出
+            else:
+                errors.append("code %s 在黑名单中: %s" % (code, item[1]))
 
     # target_weight ∈ [0, max_single_weight]
     tw_raw = obj.get("target_weight")
@@ -164,6 +171,15 @@ def validate(obj, blacklist: Optional[dict] = None) -> Tuple[bool, Optional[dict
         "reasons": reasons_clean,
         "risk_notes": rn_clean,
     }
+    # Fix-5：业绩预告正面硬加成——近 3 日净分 ≥ +2 → confidence +0.1（封顶 1.0）
+    if earnings_events and conf is not None:
+        ev = earnings_events.get(code) or {}
+        net = ev.get("net")
+        try:
+            if net is not None and float(net) >= 2.0:
+                normalized["confidence"] = min(1.0, conf + 0.1)
+        except (TypeError, ValueError):
+            pass
     if action in ("hold", "watch"):
         normalized["target_weight"] = 0.0  # 无交易动作不允许挂目标权重（此前 watch 可带 0.1）
     if order_norm is not None:
@@ -212,7 +228,8 @@ def _dump_raw(run_date: str, data, failed: List[Tuple[int, List[str]]]) -> Optio
 def save_decisions(conn: sqlite3.Connection, decisions, input_snapshot: str,
                    run_date: str, trade_date: Optional[str] = None,
                    model: str = "", prompt_version: str = PROMPT_VERSION,
-                   bundle_text: str = "") -> List[int]:
+                   bundle_text: str = "",
+                   earnings_events: Optional[dict] = None) -> List[int]:
     """逐条校验，全部通过才入库；任一失败整体放弃（返回 []），原始输出与原因留盘。
 
     - trade_date = 预期执行日（默认今天）——run_date/trade_date 口径修复；
@@ -237,7 +254,7 @@ def save_decisions(conn: sqlite3.Connection, decisions, input_snapshot: str,
     normalized_all: List[dict] = []
     failed: List[Tuple[int, List[str]]] = []
     for i, d in enumerate(decisions):
-        ok, norm, errs = validate(d, blacklist=bl)
+        ok, norm, errs = validate(d, blacklist=bl, earnings_events=earnings_events)
         if ok:
             normalized_all.append(norm)
         else:
@@ -335,10 +352,13 @@ def load_and_save(json_path, run_date: Optional[str] = None,
         # 引用核验锚定 bundle 内容（此前误传决策文件原文，理由必然命中，核验形同虚设）
         anchor_text = json.dumps(bundle_obj, ensure_ascii=False) \
             if bundle_obj is not None else ""
+        # Fix-5：业绩预告正面 confidence 加成的数据源（bundle 读取失败 → None 不加成）
+        earnings_events = (bundle_obj or {}).get("earnings_events_latest")
         ids = save_decisions(conn, data, snapshot, run_date,
                              trade_date=run_date, model=model,
                              prompt_version=PROMPT_VERSION,
-                             bundle_text=anchor_text)
+                             bundle_text=anchor_text,
+                             earnings_events=earnings_events)
         statuses = dict(conn.execute(
             "SELECT status, COUNT(*) FROM decision WHERE id IN (%s) GROUP BY status"
             % ",".join("?" * len(ids)), ids).fetchall()) if ids else {}

@@ -203,14 +203,15 @@ def insert_decision(conn: sqlite3.Connection, decision: dict, run_date: str,
     cur = conn.execute(
         "INSERT INTO decision (run_date, code, action, target_weight, confidence,"
         " reasons, risk_notes, input_snapshot, status, created_at,"
-        " trade_date, model, prompt_version)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " trade_date, model, prompt_version, emergency_scan)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (run_date, decision.get("code"), decision.get("action"),
          decision.get("target_weight"), decision.get("confidence"),
          _dumps(decision.get("reasons", [])), _dumps(decision.get("risk_notes", [])),
          input_snapshot if input_snapshot is not None else _dumps(decision),
          status, created_at or datetime.now().isoformat(timespec="seconds"),
-         trade_date, model, prompt_version))
+         trade_date, model, prompt_version,
+         1 if decision.get("emergency_scan") else 0))
     return int(cur.lastrowid)
 
 

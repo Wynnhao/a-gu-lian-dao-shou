@@ -35,6 +35,9 @@ def test(fn):
     return fn
 
 
+test.__test__ = False  # pytest 不要把装饰器本身当测试收集
+
+
 class Server:
     """测试专用服务器实例：临时库 + 随机端口。"""
 
@@ -162,6 +165,12 @@ def _setup():
 def _teardown():
     if SRV:
         SRV.stop()
+
+
+# 本文件为直跑专用设计（Server 初始化在 main() 内，pytest 直接收集会 NoneType）：
+# 对已注册的测试函数关闭 pytest 收集，直跑（python3 tests/test_webapp.py）不受影响
+for _fn in _TESTS:
+    _fn.__test__ = False
 
 
 def main() -> int:

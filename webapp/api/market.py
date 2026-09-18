@@ -158,10 +158,15 @@ def api_candles(conn: sqlite3.Connection, qs: dict) -> dict:
 
 
 def api_signals(conn: sqlite3.Connection, qs: dict) -> List[dict]:
+    # 错配修复：signal 主键含 profile，必须按当前 profile 过滤，否则同票多口径重复行
+    from common.config import active_profile
+    prof = active_profile()
     rows = q_all(conn,
                  "SELECT s.code, s.as_of, s.signals, s.score FROM signal s "
-                 "JOIN (SELECT code, MAX(as_of) AS m FROM signal GROUP BY code) t "
-                 "ON s.code=t.code AND s.as_of=t.m ORDER BY s.score DESC")
+                 "JOIN (SELECT code, MAX(as_of) AS m FROM signal"
+                 "      WHERE profile=? GROUP BY code) t "
+                 "ON s.code=t.code AND s.as_of=t.m "
+                 "WHERE s.profile=? ORDER BY s.score DESC", (prof, prof))
     names = {r["code"]: r["name"] for r in
              q_all(conn, "SELECT code, name FROM stock_info")}
     out: List[dict] = []

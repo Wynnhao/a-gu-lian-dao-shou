@@ -30,7 +30,8 @@ from common.config import snapshot
 from data import repo
 from data.fetcher import get_conn
 from risk.blacklist import check_blacklist, health_check
-from risk.engine import (RiskContext, Verdict, check, record_event, apply_kill_switch)
+from risk.engine import (RiskContext, Verdict, check, record_event, apply_kill_switch,
+                         flush_events)
 from risk.notify import notify
 from execution.paper import PaperBroker, compute_fees
 
@@ -304,6 +305,18 @@ def _decision_from_row(row: tuple) -> dict:
             if str(c.get("code")) == str(code) and str(c.get("action")) == str(action) \
                     and isinstance(c.get("order"), dict):
                 order = c["order"]
+                # Fix-4：带回应急单标志——规则 4/14/18 的 emergency_scan 豁免判定
+                # 依赖这些键，丢失会让 09:14 兜底 confirm 在非交易时段被拒
+                for _flag in ("emergency_scan", "emergency_pending_skip"):
+                    if c.get(_flag) is not None:
+                        d[_flag] = c[_flag]
+                # 审查补丁批 Fix A：skip_gate/confirmed_by 一律不从输入恢复——
+                # snapshot 存的是 LLM 原始 JSON，恢复它们等于允许决策输入自带
+                # "免闸门直写"标志（含 buy 也能直写、审计字段可伪造）。合法应急单
+                # 的 skip_gate 由规则 21 在 propose 的 check() 内重新置位。
+                if c.get("skip_gate") is not None or c.get("confirmed_by") is not None:
+                    log.warning("决策#%s 输入携带 skip_gate/confirmed_by，已剥离"
+                                "（仅规则21 可设置，防注入）", did)
                 break
     if order is not None:
         d["order"] = order
@@ -549,6 +562,12 @@ def propose(conn: sqlite3.Connection, decision: dict, decision_id: Optional[int]
     now = now or datetime.now()
     _assert_paper_mode()
     exec_cfg = CFG.get("execution", {})
+    # 审查补丁批 Fix A：skip_gate/confirmed_by 只能由规则 21 在下方 check() 内设置；
+    # 任何调用方传入的这两个键一律剥离（防决策输入注入"免闸门直写"标志——
+    # 否则 emergency_direct_exec=true 时自带 skip_gate 的 buy 也能直写成交）。
+    for _k in ("skip_gate", "confirmed_by"):
+        if decision.pop(_k, None) is not None:
+            log.warning("propose 收到的决策携带 %s，已剥离（仅规则21 可设置）", _k)
     if decision_id is None:
         run_date = run_date or now.strftime("%Y-%m-%d")
         if _dedupe_check(conn, decision, run_date):
@@ -564,6 +583,7 @@ def propose(conn: sqlite3.Connection, decision: dict, decision_id: Optional[int]
     _print_verdict(v)
     for x in v.violations:
         record_event(conn, "risk_check", x, decision_id)
+    flush_events(conn, v, decision_id)   # P0-4：规则21/因子拥挤事件由调用方落库
 
     if v.kill_trigger:
         _do_kill(conn, v, decision_id, now)
@@ -573,11 +593,19 @@ def propose(conn: sqlite3.Connection, decision: dict, decision_id: Optional[int]
         return v
 
     if v.approved:
+        # P1-6：skip_gate（规则21 应急单）是否允许直写成交，由
+        # execution.emergency_direct_exec 开关控制（默认 false → 仍走人工闸门，
+        # 恪守"绝不自动成交"总原则）。manual_gate=false 的闸门全关模式保持原直写语义。
+        gate_off = not exec_cfg.get("manual_gate", True)
+        emergency_direct = bool(decision.get("skip_gate")) and \
+            decision.get("action") == "sell" and \
+            exec_cfg.get("emergency_direct_exec", False)
+        direct_exec = gate_off or emergency_direct
         if decision.get("action") in ("hold", "watch"):
             _set_status(conn, decision_id, "approved")
             print("[propose] decision#%d 状态 -> approved（%s 无交易动作，无需确认）"
                   % (decision_id, decision.get("action")))
-        elif exec_cfg.get("manual_gate", True):
+        elif not direct_exec:
             path = _write_pending(conn, decision_id, decision, v, now, orders_dir)
             _set_status(conn, decision_id, "approved")
             print("[gate] 人工闸门开启：待确认单 %s" % path)
@@ -585,9 +613,18 @@ def propose(conn: sqlite3.Connection, decision: dict, decision_id: Optional[int]
                   " --decision-id %d" % decision_id)
         else:
             order = v.adjusted_order if v.adjusted_order is not None else decision["order"]
-            print("[gate] 人工闸门关闭：直接执行")
-            # gate-off 自动模式按实时价成交（此前直接用决策价，决策价与市价的
-            # 偏差完全不被记录）
+            if decision.get("skip_gate"):
+                # P1-6：仅 emergency_direct_exec=true 时才走到这里（直写成交）
+                print("[gate] 直写执行（emergency_direct_exec=true，skip_gate，rule=%s）：%s %s x%s"
+                      % (decision.get("confirmed_by") or "emergency_rule21",
+                         decision.get("code"), decision.get("action"),
+                         (order or {}).get("shares")))
+                confirmed_by = decision.get("confirmed_by") or "emergency_rule21"
+            else:
+                print("[gate] 人工闸门关闭：直接执行")
+                confirmed_by = "auto"
+            # gate-off / skip_gate 自动模式按实时价成交（此前直接用决策价，决策价与
+            # 市价的偏差完全不被记录）
             price = PaperBroker().latest_price(conn, str(decision.get("code")))
             if price is None:
                 price = float(order["price"])
@@ -599,7 +636,7 @@ def propose(conn: sqlite3.Connection, decision: dict, decision_id: Optional[int]
                                  % (decision_id, ref, price, abs(price - ref) / ref * 100),
                                  decision_id)
             _execute(conn, decision_id, decision, float(price),
-                     int(order["shares"]), confirmed_by="auto", now=now)
+                     int(order["shares"]), confirmed_by=confirmed_by, now=now)
     else:
         status = "report_only" if v.report_only else "rejected"
         _set_status(conn, decision_id, status)
@@ -698,6 +735,7 @@ def confirm(conn: sqlite3.Connection, decision_id: int, confirmed_by: str = "hum
     for x in v.violations:
         print("[risk]   [违规] %s" % x)
         record_event(conn, "risk_check_reconfirm", x, decision_id)
+    flush_events(conn, v, decision_id)   # P0-4：confirm 复跑同样接管事件落库
     if v.kill_trigger:
         _do_kill(conn, v, decision_id, now)
         _set_status(conn, decision_id, "rejected")
@@ -839,15 +877,26 @@ def status(conn: sqlite3.Connection, date_str: Optional[str] = None) -> dict:
 # ---------------------------------------------------------------- 决策文件解析
 
 def load_decision_file(path: str) -> List[dict]:
-    """读取 AI 决策文件：支持 单对象 / 数组 / {"decisions": [...]} 三种形态。"""
+    """读取 AI 决策文件：支持 单对象 / 数组 / {"decisions": [...]} 三种形态。
+
+    Fix A：文件内容属外部输入，skip_gate/confirmed_by 一律剥离（propose 入口
+    也会再剥一次，此处先拦掉防止落库 snapshot 带入）。
+    """
     obj = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(obj, dict) and isinstance(obj.get("decisions"), list):
-        return [x for x in obj["decisions"] if isinstance(x, dict)]
-    if isinstance(obj, list):
-        return [x for x in obj if isinstance(x, dict)]
-    if isinstance(obj, dict):
-        return [obj]
-    raise ValueError("决策文件须为 JSON 对象/数组/{decisions:[...]}，实际: %s" % type(obj).__name__)
+        out = [x for x in obj["decisions"] if isinstance(x, dict)]
+    elif isinstance(obj, list):
+        out = [x for x in obj if isinstance(x, dict)]
+    elif isinstance(obj, dict):
+        out = [obj]
+    else:
+        raise ValueError("决策文件须为 JSON 对象/数组/{decisions:[...]}，实际: %s"
+                         % type(obj).__name__)
+    for d in out:
+        for _k in ("skip_gate", "confirmed_by"):
+            if d.pop(_k, None) is not None:
+                log.warning("决策文件 %s 携带 %s，已剥离（仅规则21 可设置）", path, _k)
+    return out
 
 
 # ---------------------------------------------------------------- CLI

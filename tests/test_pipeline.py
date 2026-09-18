@@ -46,6 +46,9 @@ os.environ.setdefault("AGSICKLE_DISABLE_SPOT", "1")         # 全市场快照/�
 os.environ.setdefault("AGSICKLE_STATE_DIR", str(_TMP_ROOT / "state"))
 os.environ.setdefault("AGSICKLE_ORDERS_DIR", str(_TMP_ROOT / "state"))
 os.environ.setdefault("AGSICKLE_BACKUP_DIR", str(_TMP_ROOT / "backup"))
+# signal_eval 沙箱：compute_all/premarket 会写 factor_crowding.json，缺此隔离时
+# 直跑（run_all 之外）会把合成拥挤状态写进**生产** logs/signal_eval/
+os.environ.setdefault("AGSICKLE_SIGNAL_EVAL_DIR", str(_TMP_ROOT / "signal_eval"))
 
 _MOCK_QUOTES_FILE = _TMP_ROOT / "mock_quotes.json"
 _MOCK_QUOTES_FILE.write_text(json.dumps({

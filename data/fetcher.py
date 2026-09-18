@@ -86,10 +86,12 @@ CREATE TABLE IF NOT EXISTS index_valuation (
     pe REAL, pe_pct REAL, pb REAL, pb_pct REAL, close REAL,
     PRIMARY KEY (index_code, trade_date)
 );
--- P2 信号：signals 为因子 JSON，score 为综合分
+-- P2 信号：signals 为因子 JSON，score 为综合分；profile 标识打分口径
+-- （Fix-5：v1/v2 双 profile 行并存，signal_eval 按 config.signals.profile 过滤）
 CREATE TABLE IF NOT EXISTS signal (
     code TEXT, as_of TEXT, signals TEXT, score REAL,
-    PRIMARY KEY (code, as_of)
+    profile TEXT DEFAULT 'reversal_lowvol',
+    PRIMARY KEY (code, as_of, profile)
 );
 -- P3 决策：input_snapshot 保存完整输入快照用于归因
 -- trade_date=预期执行日（决策口径修复：盘前决策 run_date 曾取 T-1 导致日报查空）；
@@ -101,7 +103,8 @@ CREATE TABLE IF NOT EXISTS decision (
     confidence REAL, reasons TEXT, risk_notes TEXT,
     input_snapshot TEXT, status TEXT, created_at TEXT,
     trade_date TEXT, model TEXT, prompt_version TEXT,
-    t1_ret REAL, direction_hit INT, review TEXT
+    t1_ret REAL, direction_hit INT, review TEXT,
+    emergency_scan INT DEFAULT 0
 );
 -- P4 持仓（本地镜像，T+1 由 avail_shares 体现）与成交
 CREATE TABLE IF NOT EXISTS position (
@@ -125,6 +128,12 @@ CREATE TABLE IF NOT EXISTS risk_event (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT, rule TEXT, detail TEXT, decision_id INT
 );
+-- Fix-4（D1）：规则 21 跌停应急扫描——连续跌停 stuck 计数（code 主键，
+-- 首次命中 insert、后续扫描 +1；不再命中即解除删除）
+CREATE TABLE IF NOT EXISTS limit_halt_stuck (
+    code TEXT PRIMARY KEY, first_stuck_date TEXT,
+    stuck_days INT DEFAULT 1, last_attempt TEXT
+);
 -- 动态池（异动池/热门池）：按刷新日期留痕，当前成员=各票最新 added_date 行
 -- mode 记录刷新口径（market=全市场快照 / watchlist=自选池），跨口径 strength 不可比
 CREATE TABLE IF NOT EXISTS dynamic_pool (
@@ -137,6 +146,33 @@ CREATE TABLE IF NOT EXISTS dynamic_pool (
 CREATE TABLE IF NOT EXISTS universe_member (
     universe TEXT, code TEXT, name TEXT, as_of TEXT,
     PRIMARY KEY (universe, code, as_of)
+);
+
+-- Sprint 2 任务 1（P1-3）：10Y 国债收益率与 ETF 份额旁路
+CREATE TABLE IF NOT EXISTS index_bond_yield (
+    index_code TEXT, trade_date TEXT, yield REAL,
+    delta_20d_bp REAL, source TEXT,
+    PRIMARY KEY (index_code, trade_date)
+);
+CREATE TABLE IF NOT EXISTS index_etf_share (
+    etf_code TEXT, trade_date TEXT, share REAL,
+    pct_chg_1d REAL, source TEXT,
+    PRIMARY KEY (etf_code, trade_date)
+);
+
+-- Sprint 2 任务 2（P1-4）：业绩预告关键词事件
+CREATE TABLE IF NOT EXISTS news_earnings (
+    code TEXT, date TEXT, kind TEXT, count INT, samples TEXT,
+    PRIMARY KEY (code, date, kind)
+);
+
+-- Sprint 2 任务 3（P1-1）：市场宽度/情绪每日指标
+CREATE TABLE IF NOT EXISTS breadth_daily (
+    date TEXT PRIMARY KEY,
+    limit_up_count INT, limit_up_seal_rate REAL,
+    limit_down_count INT, advance_decline_ratio REAL,
+    new_high_minus_new_low INT, breadth_composite REAL,
+    source TEXT
 );
 """
 
@@ -155,7 +191,34 @@ _MIGRATIONS = [
     ("decision", "direction_hit", "ALTER TABLE decision ADD COLUMN direction_hit INT"),
     ("decision", "review", "ALTER TABLE decision ADD COLUMN review TEXT"),
     ("dynamic_pool", "mode", "ALTER TABLE dynamic_pool ADD COLUMN mode TEXT"),
+    # Fix-4：decision 行是否为跌停应急扫描单（超时兜底查询用）
+    ("decision", "emergency_scan",
+     "ALTER TABLE decision ADD COLUMN emergency_scan INT DEFAULT 0"),
+    # Sprint 2 增量迁移（Sprint 1 任务 3 quotes 字段扩放在 quote_snapshot，DDL 由 data/quotes.py 维护）
 ]
+
+
+def _migrate_signal_profile(conn: sqlite3.Connection) -> None:
+    """Fix-5：老库 signal 表主键 (code, as_of) → (code, as_of, profile)。
+
+    ALTER 无法改主键，走重建：旧行全部归入 'reversal_lowvol'（历史均为 v1 口径）。
+    幂等：signal 表已有 profile 列则跳过；残留 signal_mig（上次迁移中断）先清。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(signal)")}
+    if not cols or "profile" in cols:
+        return
+    conn.executescript("""
+        DROP TABLE IF EXISTS signal_mig;
+        CREATE TABLE signal_mig (
+            code TEXT, as_of TEXT, signals TEXT, score REAL,
+            profile TEXT DEFAULT 'reversal_lowvol',
+            PRIMARY KEY (code, as_of, profile)
+        );
+        INSERT INTO signal_mig (code, as_of, signals, score, profile)
+            SELECT code, as_of, signals, score, 'reversal_lowvol' FROM signal;
+        DROP TABLE signal;
+        ALTER TABLE signal_mig RENAME TO signal;
+    """)
 
 
 _MIGRATED_FOR: Optional[str] = None  # 进程级：该库路径已完成 DDL+迁移（换库自动重跑）
@@ -171,7 +234,26 @@ def init_db(conn: sqlite3.Connection) -> None:
                 conn.execute(sql)
             except sqlite3.OperationalError:
                 pass  # 并发下另一进程已加列
+    _migrate_signal_profile(conn)
     conn.commit()
+
+
+def dedup_signal_table(conn: sqlite3.Connection) -> int:
+    """Fix-5 后续清理：signal 表按 (code, as_of, profile) 主键去重，保留 rowid 最大行。
+
+    由于 INSERT OR REPLACE 行为正确（主键含 profile），重复行来自早期迁移中断或
+    旧版未带 profile 的写路径。人工触发、幂等、可重复执行。
+    """
+    cur = conn.execute("""
+        DELETE FROM signal
+        WHERE rowid NOT IN (
+            SELECT MAX(rowid) FROM signal GROUP BY code, as_of, profile
+        )
+    """)
+    n = cur.rowcount
+    conn.commit()
+    log.info("signal 去重：删除 %d 行重复", n)
+    return n
 
 
 def get_conn() -> sqlite3.Connection:
