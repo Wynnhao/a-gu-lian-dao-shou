@@ -31,7 +31,8 @@ from common import market as _market  # noqa: E402
 log = logging.getLogger("audit")
 log.setLevel(logging.INFO)
 if not log.handlers:
-    log.addHandler(logging.handlers.RotatingFileHandler(BASE / "logs" / "audit.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3))
+    from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
+    log.addHandler(rotating_handler("audit.log"))
     log.addHandler(logging.StreamHandler())
 log.propagate = False
 

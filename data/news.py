@@ -26,7 +26,8 @@ CFG = snapshot()  # 统一配置层：import 期冻结 + 硬键校验 fail-fast
 log = logging.getLogger("news")
 log.setLevel(logging.INFO)
 if not log.handlers:  # 避免与 fetcher 的 basicConfig 重复挂 handler
-    log.addHandler(logging.handlers.RotatingFileHandler(BASE / "logs" / "news.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3))
+    from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
+    log.addHandler(rotating_handler("news.log"))
     log.addHandler(logging.StreamHandler())
 log.propagate = False
 

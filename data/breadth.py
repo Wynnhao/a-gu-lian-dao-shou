@@ -29,9 +29,8 @@ from data.fetcher import call_ak  # noqa: E402  (Sprint 2 任务 3：em 源走 c
 
 log = logging.getLogger("breadth")
 if not log.handlers:
-    log.addHandler(logging.handlers.RotatingFileHandler(
-        BASE / "logs" / "breadth.log", encoding="utf-8",
-        maxBytes=5_000_000, backupCount=3))
+    from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
+    log.addHandler(rotating_handler("breadth.log"))
     log.addHandler(logging.StreamHandler())
     log.setLevel(logging.INFO)
 log.propagate = False

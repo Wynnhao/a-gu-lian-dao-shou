@@ -37,13 +37,13 @@ from data import repo  # noqa: E402
 
 CFG = snapshot()  # 统一配置层：import 期冻结 + 硬键校验 fail-fast
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.handlers.RotatingFileHandler(BASE / "logs" / "fetch.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3),
-              logging.StreamHandler()],
-)
 log = logging.getLogger("fetcher")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
+    log.addHandler(rotating_handler("fetch.log"))
+    log.addHandler(logging.StreamHandler())
+log.propagate = False
 
 _DATA_CFG = CFG.get("data", {})
 START_DATE = _DATA_CFG.get("start_date", "20240101")

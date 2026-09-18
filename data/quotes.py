@@ -26,13 +26,13 @@ if str(BASE) not in sys.path:
 # 「from data.quotes import is_trading_time」懒加载路径零改动
 from common.market import is_trading_time  # noqa: F401,E402
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.handlers.RotatingFileHandler(BASE / "logs" / "quotes.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3),
-              logging.StreamHandler()],
-)
 log = logging.getLogger("quotes")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
+    log.addHandler(rotating_handler("quotes.log"))
+    log.addHandler(logging.StreamHandler())
+log.propagate = False
 
 QUOTES_DIR = BASE / "logs" / "quotes"
 TTL_SECONDS = 30

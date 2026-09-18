@@ -20,7 +20,8 @@ from data.fetcher import get_conn, call_ak  # noqa: E402  (Sprint 2 任务1: cal
 log = logging.getLogger("macro")
 log.setLevel(logging.INFO)
 if not log.handlers:  # 避免与 fetcher 的 basicConfig 重复挂 handler
-    log.addHandler(logging.handlers.RotatingFileHandler(BASE / "logs" / "macro.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3))
+    from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
+    log.addHandler(rotating_handler("macro.log"))
     log.addHandler(logging.StreamHandler())
 log.propagate = False
 

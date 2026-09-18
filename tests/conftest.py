@@ -14,9 +14,16 @@ AGSICKLE_SIGNAL_EVAL_DIR）。被清后：
 既防读污染也防写污染。各测试文件内显式 `_sandbox_signal_eval_dir()` 的用例仍然
 有效（它们各自覆盖并恢复）。
 """
+import os
 import tempfile
 
 import pytest
+
+# Sprint4 批次0（W0-1）：各模块的日志文件 handler 在 import 期构造，必须在
+# 被测模块 import 前生效，故置于模块顶层而非 fixture。run_all 子进程直跑不
+# 加载本文件（由 run_all 注入 subprocess env），这里兜 pytest 直跑路径。
+os.environ.setdefault("AGSICKLE_LOG_DIR",
+                      tempfile.mkdtemp(prefix="agsickle_conftest_logs_"))
 
 
 @pytest.fixture(autouse=True)

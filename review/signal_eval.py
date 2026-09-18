@@ -44,15 +44,13 @@ def _signal_eval_dir() -> Path:
         return Path(env)
     return BASE / "logs" / "signal_eval"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.handlers.RotatingFileHandler(BASE / "logs" / "signal_eval.log",
-                                                  encoding="utf-8",
-                                                  maxBytes=5_000_000, backupCount=3),
-              logging.StreamHandler()],
-)
 log = logging.getLogger("signal_eval")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
+    log.addHandler(rotating_handler("signal_eval.log"))
+    log.addHandler(logging.StreamHandler())
+log.propagate = False
 
 
 def _signal_frame(conn: sqlite3.Connection) -> pd.DataFrame:

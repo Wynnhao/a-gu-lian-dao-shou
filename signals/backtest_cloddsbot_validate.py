@@ -29,11 +29,11 @@ import pandas as pd
 from data.fetcher import get_conn
 from signals.backtest import ensure_benchmark, run_backtest
 
-logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("backtest_cloddsbot_validate")
-log.addHandler(logging.handlers.RotatingFileHandler(
-    BASE / "logs" / "signal.log", encoding="utf-8",
-    maxBytes=5_000_000, backupCount=3))
+log.setLevel(logging.INFO)
+if not log.handlers:
+    from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
+    log.addHandler(rotating_handler("signal.log"))
 log.propagate = False
 
 # 占位常量（实施时由 Sprint 3.5 §1-§4 任务默认值定义同步）

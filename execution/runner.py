@@ -46,7 +46,8 @@ log = logging.getLogger("exec.runner")
 log.setLevel(logging.INFO)
 log.propagate = False
 if not log.handlers:
-    _fh = logging.handlers.RotatingFileHandler(BASE / "logs" / "exec.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3)
+    from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
+    _fh = rotating_handler("exec.log")
     _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     log.addHandler(_fh)
 

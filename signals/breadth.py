@@ -17,9 +17,8 @@ if str(BASE) not in sys.path:
 
 log = logging.getLogger("signals.breadth")
 if not log.handlers:
-    log.addHandler(logging.handlers.RotatingFileHandler(
-        BASE / "logs" / "signal.log", encoding="utf-8",
-        maxBytes=5_000_000, backupCount=3))
+    from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
+    log.addHandler(rotating_handler("signal.log"))
     log.addHandler(logging.StreamHandler())
     log.setLevel(logging.INFO)
 log.propagate = False

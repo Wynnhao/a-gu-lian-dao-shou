@@ -21,7 +21,8 @@ log = logging.getLogger("pipeline.postclose")
 log.setLevel(logging.INFO)
 if not log.handlers:
     _fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    _fh = logging.handlers.RotatingFileHandler(BASE / "logs" / "pipeline.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3)
+    from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
+    _fh = rotating_handler("pipeline.log")
     _fh.setFormatter(_fmt)
     _sh = logging.StreamHandler()
     _sh.setFormatter(_fmt)

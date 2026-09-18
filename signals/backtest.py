@@ -44,9 +44,11 @@ from data.fetcher import get_conn
 from signals.factors import atr_series
 from signals.signals import score_reversal_lowvol_xs, score_reversal_lowvol_v2_xs
 
-logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("backtest")
-log.addHandler(logging.handlers.RotatingFileHandler(BASE / "logs" / "signal.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3))
+log.setLevel(logging.INFO)
+if not log.handlers:
+    from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
+    log.addHandler(rotating_handler("signal.log"))
 log.propagate = False
 
 START = "2024-01-02"

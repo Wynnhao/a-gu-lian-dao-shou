@@ -13,9 +13,11 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
 SLOW = {"test_execution.py", "test_ai_pipeline.py"}
 # 逐文件 subprocess 直跑（pytest 的 tests/conftest.py 沙箱在此不生效）：
-# 统一注入 signal_eval 沙箱目录，防止 compute_all/规则20 读写**生产**
-# logs/signal_eval/（合成拥挤状态写回生产会污染真实风控，2026-09-17 实测）。
-SIGNAL_EVAL_SANDBOX = tempfile.mkdtemp(prefix="agsickle_runall_se_")
+# 每个测试文件注入**独立**沙箱（W-D5 前移）：signal_eval 目录防 compute_all/
+# 规则20 读写生产 logs/signal_eval/（合成拥挤状态写回生产，2026-09-17 实测）；
+# AGSICKLE_LOG_DIR 防 import 期文件 handler 写生产 logs/*.log（2026-09-18
+# 审查 P0-7：exec.log/signal.log 均被测试流量污染过）。两 env 必须在子进程
+# import 前生效，故注入 subprocess env 而非依赖被测文件内部逻辑。
 
 FILES = [
     "test_risk_engine.py", "test_regime.py", "test_execution.py", "test_ai_pipeline.py",
@@ -36,10 +38,16 @@ def main() -> int:
         p = BASE / "tests" / f
         if not p.is_file():
             continue
+        sandbox = tempfile.mkdtemp(prefix="agsickle_runall_")
+        se_dir = os.path.join(sandbox, "signal_eval")
+        log_dir = os.path.join(sandbox, "logs")
+        os.makedirs(se_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
         proc = subprocess.run([sys.executable, str(p)], cwd=str(BASE),
                               capture_output=True, text=True,
                               env={**os.environ,
-                                   "AGSICKLE_SIGNAL_EVAL_DIR": SIGNAL_EVAL_SANDBOX})
+                                   "AGSICKLE_SIGNAL_EVAL_DIR": se_dir,
+                                   "AGSICKLE_LOG_DIR": log_dir})
         status = "OK " if proc.returncode == 0 else "FAIL"
         print("%s %s" % (status, f))
         if proc.returncode != 0:

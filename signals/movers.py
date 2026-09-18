@@ -25,13 +25,13 @@ from common.config import load  # noqa: E402
 from data import repo  # noqa: E402
 from signals import dynpool  # noqa: E402
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.handlers.RotatingFileHandler(BASE / "logs" / "signal.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3),
-              logging.StreamHandler()],
-)
 log = logging.getLogger("movers")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
+    log.addHandler(rotating_handler("signal.log"))
+    log.addHandler(logging.StreamHandler())
+log.propagate = False
 
 
 def _cfg() -> dict:

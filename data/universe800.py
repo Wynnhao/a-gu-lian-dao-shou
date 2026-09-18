@@ -38,10 +38,11 @@ import pandas as pd
 from data import repo
 from data.fetcher import (_market_data_window, _norm_volume, call_ak, get_conn)
 
-logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("universe800")
-log.addHandler(logging.handlers.RotatingFileHandler(
-    BASE / "logs" / "fetch.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3))
+log.setLevel(logging.INFO)
+if not log.handlers:
+    from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
+    log.addHandler(rotating_handler("fetch.log"))
 log.propagate = False
 
 UNIVERSE = "csi800"
