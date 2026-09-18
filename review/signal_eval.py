@@ -14,6 +14,7 @@
 import json
 import logging
 import logging.handlers
+import os
 import sqlite3
 import sys
 from datetime import datetime
@@ -193,12 +194,17 @@ OTHER_PROFILES = {
 }
 
 
-def profile_verdict(conn: sqlite3.Connection) -> dict:
+def profile_verdict(conn: sqlite3.Connection, bt_path=None) -> dict:
     """profile 切换判据（v1.5：B+C 两维投票 ≥1 票即建议 + MDD 红线 override；不自动切）。
+
+    bt_path（W-D5/P1-29）：backtest_result.json 路径注入点——缺省读
+    AGSICKLE_BACKTEST_RESULT env，再缺省 BASE/logs/backtest_result.json。
+    测试由此写临时文件传入，不再 backup/restore 生产位（非原子，测试中途被 kill
+    会把合成 verdict 永久留在生产位，premarket/周报会基于假数据出建议）。
 
     维度（用户决策，A/D 因 momentum 无 signal 行弃权，详见 Sprint 1 任务 2）：
       A = score h5 RankIC        —— 仅 current 可算，momentum 弃权
-      B = 年化超额 vs HS300       —— 各 profile 从 logs/backtest_result.json 读
+      B = 年化超额 vs HS300       —— 各 profile 从 backtest_result.json 读
       C = MDD                    —— 同 B
       D = 五分位多空价差 Q4-Q0    —— 同 A，弃权
 
@@ -221,16 +227,21 @@ def profile_verdict(conn: sqlite3.Connection) -> dict:
     prof = _profile()
     others = OTHER_PROFILES.get(prof, ("reversal_lowvol",))
 
-    # ---- 读 backtest_result.json 拿 B/C ----
-    bt_path = BASE / "logs" / "backtest_result.json"
+    # ---- 读 backtest_result.json 拿 B/C（路径注入点见 docstring）----
+    if bt_path is None:
+        env = os.environ.get("AGSICKLE_BACKTEST_RESULT")
+        bt_path = Path(env) if env else (BASE / "logs" / "backtest_result.json")
+    bt_path = Path(bt_path)
     bt_cur, bt_alts, bt_missing = None, {}, None
+    bt_meta: dict = {}
     if not bt_path.exists():
         bt_missing = f"backtest_result.json 不存在 ({bt_path})"
         log.warning("profile_verdict: %s，B/C 维弃权", bt_missing)
     else:
         try:
             bt = json.loads(bt_path.read_text(encoding="utf-8"))
-            profiles = bt.get("profiles") or {}
+            bt_meta = bt if isinstance(bt, dict) else {}
+            profiles = bt_meta.get("profiles") or {}
             bt_cur = profiles.get(prof)
             for o in others:
                 if profiles.get(o):
@@ -306,6 +317,12 @@ def profile_verdict(conn: sqlite3.Connection) -> dict:
     # 置信度标注（v1.5）：2/2 → high；1/2 → low（提示人工复核权重）
     confidence = {2: "high", 1: "low"}.get(votes_switch, None)
 
+    # W-D6 承接 W-C3：红线数字引用必须带数据版本（bundle 读 backtest_generated_at/
+    # data_version；缺失时 bundle 按"数据版本未知"渲染）。兼容两种产物形态：
+    # 顶层平铺键或 W-D6⑦ 的 metadata 块
+    _bt_md = bt_meta.get("metadata") if isinstance(bt_meta.get("metadata"),
+                                                   dict) else {}
+    _bt_uni = bt_meta.get("universe") or _bt_md.get("universe")
     out = {
         "profile": prof,
         "other_profiles": list(others),
@@ -335,6 +352,14 @@ def profile_verdict(conn: sqlite3.Connection) -> dict:
               "gap": (C_cur - C_alt) if (C_cur is not None and C_alt is not None) else None},
         "red_line_triggered": red_line_triggered,
         "backtest_missing": bt_missing,
+        # W-D6 承接 W-C3：红线数字引用必须带数据版本（bundle 读 backtest_generated_at/
+        # data_version；缺失时 bundle 按"数据版本未知"渲染）
+        "backtest_generated_at": (bt_meta.get("generated_at")
+                                  or _bt_md.get("generated_at")),
+        "backtest_universe": (_bt_uni.get("mode") if isinstance(_bt_uni, dict)
+                              else _bt_uni),
+        "data_version": bt_meta.get("data_version") or _bt_md.get("data_version"),
+        "backtest_path": str(bt_path),
         # 兼容 v1.3 周报消费方：保留旧 IC 单维字段
         "score_ic_h5": (factor_ic(conn).get("ic") or {}).get("h5", {}).get("score"),
         "ic_thresholds_v13": {"keep_ge": IC_KEEP, "switch_le": IC_SWITCH},
@@ -377,8 +402,11 @@ def _record_red_line_event(conn, prof, C_cur, bt_path):
         log.warning("红线 override 写 risk_event 失败（不阻断主流程）: %s", repr(e))
 
 
-def evaluate(conn: sqlite3.Connection) -> dict:
-    """完整评估包（供周报与看板引用）。"""
+def evaluate(conn: sqlite3.Connection, bt_path=None) -> dict:
+    """完整评估包（供周报与看板引用）。
+
+    bt_path（W-D5）：透传给 profile_verdict 的回测产物路径注入点（缺省 env→生产位）。
+    """
     return {
         "factor_ic": factor_ic(conn),
         "score_quintiles_h5": score_quintiles(conn, 5),
@@ -386,31 +414,36 @@ def evaluate(conn: sqlite3.Connection) -> dict:
         "pool_hot_stock_h5": pool_eval(conn, "hot_stock", 5),
         "rolling_ic_score_h5": rolling_ic(conn, "score", 5),
         "rolling_ic_mom5d_h5": rolling_ic(conn, "mom_5d", 5),
-        "profile_verdict": profile_verdict(conn),
+        "profile_verdict": profile_verdict(conn, bt_path=bt_path),
     }
 
 
 def _persist_latest(payload: dict) -> dict:
     """把 evaluate() 输出落盘到 logs/signal_eval/YYYY-MM-DD.json + latest.json。
 
-    原子策略：先写日期文件（追加式落盘不可丢历史），再用 Path.replace 覆盖
-    latest.json（同分区原子 rename，软链在 Windows 上跨平台有问题所以用拷贝）。
-    失败仅记 warning，不抛异常（与 _audit_snapshot 风格一致）。
+    原子策略（P2-14 修正）：两个文件都走 tmp 写盘 + os.replace 原子替换——
+    此前 docstring 宣称"原子 replace"实为 write_text 直写，读方（bundle/看板）
+    可能读到半写 JSON。日期文件追加式落盘不可丢历史；失败仅记 warning 不抛
+    （与 _audit_snapshot 风格一致）。
     """
     out = {"date": None, "path": None, "latest_path": None, "error": None}
+
+    def _atomic_write(target: Path, text: str) -> None:
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(str(tmp), str(target))   # 同分区原子 rename
+
     try:
         eval_dir = _signal_eval_dir()
         eval_dir.mkdir(parents=True, exist_ok=True)
         date_str = datetime.now().strftime("%Y-%m-%d")
         dated = eval_dir / (date_str + ".json")
-        dated.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
-                         encoding="utf-8")
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        _atomic_write(dated, text)
         out["date"] = date_str
         out["path"] = str(dated)
-        # latest.json 用 replace 原子覆盖
         latest = eval_dir / "latest.json"
-        latest.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write(latest, text)
         out["latest_path"] = str(latest)
         log.info("signal_eval 落盘: %s + latest.json", dated.name)
     except Exception as e:  # noqa: BLE001

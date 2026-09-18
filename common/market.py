@@ -13,7 +13,12 @@ stdlib-only（datetime/decimal/typing）、Python 3.9 语法、零项目依赖�
 4. 量纲归一的失败回退两侧不同：data/fetcher._norm_volume 返回原值（交 audit 兜底）、
    data/audit._norm_volume 返回 None（体检报问题）；audit 比值带判据
    （0.5<shares/implied<2.0）是审计专用策略，留 audit；
-5. signals/backtest._limit_up_price 保留裸乘法（换 Decimal 会微变 tradable 边界）。
+5. （已废止，2026-09-19 Sprint4 W-D6④）原红线5「backtest._limit_up_price 保留
+   裸乘法（换 Decimal 会微变 tradable 边界）」：新事实（P0-3 证据链3）= 裸乘积
+   使约 38% 真涨停收盘漏判为"可买"（prev_close=10.07 主板票：裸乘积 11.077 <
+   交易所涨停价 11.08，收盘 11.08 的真涨停被当成可买），单独贡献约 +14pp 年化
+   虚高——回测取整边界差异远小于漏判危害，_limit_up_price 已改用本模块
+   limit_price（Decimal HALF_UP 交易所口径）。
 """
 from datetime import datetime, time as dtime
 from decimal import Decimal, ROUND_HALF_UP

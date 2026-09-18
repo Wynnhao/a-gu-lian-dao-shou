@@ -92,8 +92,3 @@ def api_dynamic_pools(conn: sqlite3.Connection, qs: dict) -> dict:
             "updated_at": max(dates[p][0] for p in dynpool.POOLS
                               if dates[p]) if any(dates.values()) else None}
 
-
-# ---------------------------------------------------------------- 数据状态
-
-_AUDIT_CACHE: dict = {"at": 0.0, "summary": None}   # 体检全表扫描有成本，进程内缓存
-

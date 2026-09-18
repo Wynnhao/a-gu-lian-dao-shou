@@ -81,12 +81,13 @@ def compute_watchlist_movers(conn: sqlite3.Connection,
         if code not in wl:
             continue  # W-B5（P1-12）：自选池口径只出池内票（in_watchlist 标记恒 True）
         hist = conn.execute(
-            "SELECT trade_date, close, high, low, volume, pct_chg, close_qfq FROM daily_bar "
+            "SELECT trade_date, close, high, low, volume, pct_chg, close_qfq,"
+            " high_qfq, low_qfq FROM daily_bar "
             "WHERE code=? ORDER BY trade_date DESC LIMIT 61", (code,)).fetchall()
         if len(hist) < 6:
             continue
         today = hist[0]
-        _, close, high, low, volume, pct_chg, cq = today
+        _, close, high, low, volume, pct_chg, cq, hq, lq = today
         prev_close = hist[1][1]
         prev_cq = hist[1][6]
         if not close or not prev_close:
@@ -129,14 +130,24 @@ def compute_watchlist_movers(conn: sqlite3.Connection,
             elif m5 <= c.get("mom5_down", -10.0):
                 reasons.append("5日%+.1f%%（急跌）" % m5)
                 strength += min(abs(m5) / 20.0, 1.5)
-        # ⑤ 60日新高/新低（不含今日）
+        # ⑤ 60日新高/新低（不含今日）——P2-6（W-D7）：改 qfq 口径比较。
+        # 此前 raw 价跨除权比较：除权缺口直接砸破 60 日区间，分红票除权后
+        # 连续多日误报"创60日新低"（污染 LLM 上下文与异动池）。
+        # 当日 close_qfq 可用时整体走复权口径（历史 high_qfq/low_qfq 缺失的行
+        # 跳过），否则回退 raw（与旧行为一致）。
         if not exdiv:
-            past_high = [h[2] for h in hist[1:60] if h[2]]
-            past_low = [h[3] for h in hist[1:60] if h[3]]
-            if past_high and close >= max(past_high):
+            if cq:
+                cur_cmp = float(cq)
+                past_high = [float(h[7]) for h in hist[1:60] if h[7]]
+                past_low = [float(h[8]) for h in hist[1:60] if h[8]]
+            else:
+                cur_cmp = close
+                past_high = [h[2] for h in hist[1:60] if h[2]]
+                past_low = [h[3] for h in hist[1:60] if h[3]]
+            if past_high and cur_cmp >= max(past_high):
                 reasons.append("创60日新高")
                 strength += 1.2
-            elif past_low and close <= min(past_low):
+            elif past_low and cur_cmp <= min(past_low):
                 reasons.append("创60日新低")
                 strength += 1.2
         if reasons:
@@ -276,8 +287,9 @@ def compute_market_movers(spot: List[dict], top_n: int = 20,
         if vr is not None and vr >= c.get("volume_ratio", 2.5):
             reasons.append("量比%.1f" % vr)
             strength += min(vr / 5.0, 1.5)
-        if amount is not None and amount < amount_floor:
-            continue  # 流动性地板
+        if amount is None or float(amount) < amount_floor:
+            continue  # 流动性地板——P2-7（W-D7）：tx 兜底快照缺 turnover（None）
+            # 视为不达标，此前 None 绕过地板让无成交额数据的票入池
         if reasons:
             out.append({"code": code, "name": name, "reason": reasons,
                         "strength": round(strength, 2), "close": price,

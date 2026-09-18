@@ -65,17 +65,38 @@ def _assert_paper_mode() -> None:
             "已硬性拒绝。演练请设 AGSICKLE_ALLOW_UI=1 并按 execution/runbook_ths.md 执行。")
 
 
+# P2-21（W-D7）：进程内持锁深度——flock 对同一进程的不同 fd 会自锁（LOCK_EX
+# 阻塞等待自己），锁下沉到函数内后，CLI 外层锁 + 函数内锁必须可重入。
+_EXEC_LOCK_DEPTH = {"n": 0}
+
+
 @contextlib.contextmanager
 def _exec_lock():
-    """执行入口互斥锁：cron/catchup/人工/看板四方可能同时触发 confirm/propose，
-    SQLite 并发写有 busy_timeout 兜底，但 trade 计数→成交之间的 TOCTOU 只能靠进程锁。"""
+    """执行入口互斥锁（P2-21 改造：**可重入**，并下沉到 propose/confirm/_do_kill
+    函数内——此前锁只在 CLI main() 外层，limit_halt failsafe / intraday_check
+    程序化调用 propose/confirm 完全绕锁，trade 计数→成交之间存在 TOCTOU 窗口）。
+
+    跨进程互斥语义不变：cron/catchup/人工/看板四方并发时阻塞等待（SQLite 写
+    并发另有 busy_timeout 兜底，但计数→成交的原子性只能靠进程锁）。
+    重入语义：同进程已持锁（深度>0，如 CLI 外层已锁、一批决策逐条 propose）
+    时降级为深度计数，不再 flock；非重入实现会让函数内加锁在 CLI 路径自锁。
+    """
+    if _EXEC_LOCK_DEPTH["n"] > 0:
+        _EXEC_LOCK_DEPTH["n"] += 1
+        try:
+            yield
+        finally:
+            _EXEC_LOCK_DEPTH["n"] -= 1
+        return
     ORDERS_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = ORDERS_DIR / ".lock"
     with open(lock_path, "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
+        _EXEC_LOCK_DEPTH["n"] = 1
         try:
             yield
         finally:
+            _EXEC_LOCK_DEPTH["n"] = 0
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
@@ -364,9 +385,17 @@ def build_context(conn: sqlite3.Connection, now: datetime,
 
 # ---------------------------------------------------------------- decision 行工具
 
-def _insert_decision(conn: sqlite3.Connection, decision: dict, run_date: str) -> int:
-    """决策落库（status=proposed），input_snapshot 存决策 JSON 全文，返回新 id。"""
-    decision_id = repo.insert_decision(conn, decision, run_date)
+def _insert_decision(conn: sqlite3.Connection, decision: dict, run_date: str,
+                     trade_date: Optional[str] = None) -> int:
+    """决策落库（status=proposed），input_snapshot 存决策 JSON 全文，返回新 id。
+
+    P2-25（W-D7）：trade_date 缺省取 run_date（预期执行日，与 ai/decide.py
+    "trade_date=预期执行日" 口径一致）——此前 propose --file 路径恒写 NULL 且
+    永不回填，backfill_decision_outcomes 的 `trade_date IS NOT NULL` 过滤把
+    这些决策永久排除在决策→结果闭环统计外。
+    """
+    decision_id = repo.insert_decision(conn, decision, run_date,
+                                       trade_date=trade_date or run_date)
     conn.commit()
     return decision_id
 
@@ -527,6 +556,14 @@ def list_pending(orders_dir: Optional[Path] = None) -> List[Path]:
 
 def _do_kill(conn: sqlite3.Connection, v: Verdict, decision_id: Optional[int],
              now: datetime) -> None:
+    """kill 触发入口（P2-21：函数内持执行锁，可重入——propose/confirm 路径
+    已在锁内时降级为计数）。"""
+    with _exec_lock():
+        _do_kill_locked(conn, v, decision_id, now)
+
+
+def _do_kill_locked(conn: sqlite3.Connection, v: Verdict, decision_id: Optional[int],
+                    now: datetime) -> None:
     """kill 触发：kill_orders 逐条走 PaperBroker.sell + apply_kill_switch，如实打印。
 
     卖出失败的单此前只留痕不重试、T+1 不可卖的票直接被跳过——残仓在停机期被锁死。
@@ -926,10 +963,22 @@ def propose(conn: sqlite3.Connection, decision: dict, decision_id: Optional[int]
             orders_dir: Optional[Path] = None) -> Verdict:
     """跑风控并落库裁决结论；approved 且闸门开启 → 写 pending 等人工确认。
 
+    P2-21（W-D7）：函数内持执行锁（可重入）——此前程序化调用（limit_halt 应急
+    单 / intraday_check kill 安全网）绕过 CLI 外层锁，存在 TOCTOU 窗口。
+
     - decision_id 为 None 时先插入 decision 行（status=proposed，重复文件内容跳过）；
     - kill_trigger=True 时立即执行清仓 + apply_kill_switch（不受人工闸门约束）；
     - report_only / rejected 均不进入闸门。
     """
+    with _exec_lock():
+        return _propose_locked(conn, decision, decision_id=decision_id,
+                               run_date=run_date, now=now, orders_dir=orders_dir)
+
+
+def _propose_locked(conn: sqlite3.Connection, decision: dict,
+                    decision_id: Optional[int] = None,
+                    run_date: Optional[str] = None, now: Optional[datetime] = None,
+                    orders_dir: Optional[Path] = None) -> Verdict:
     now = now or datetime.now()
     _assert_paper_mode()
     exec_cfg = CFG.get("execution", {})
@@ -1083,6 +1132,9 @@ def confirm(conn: sqlite3.Connection, decision_id: int, confirmed_by: str = "hum
             orders_dir: Optional[Path] = None) -> Optional[dict]:
     """人工确认执行单条 approved 决策：重跑风控 → 成交（price_override 或最新价）→ 回读。
 
+    P2-21（W-D7）：函数内持执行锁（可重入）——limit_halt 09:14 failsafe 的
+    程序化 confirm 此前完全绕锁。
+
     - 决策 run_date 与今天不一致 → 置 expired（emergency_scan 单且 run_date≥今日
       豁免——T 晚生成次日执行，W-A5②）；TTL 按 run_date 当日 15:05（非墙钟当日）；
     - 最终成交价（override/实时价）确定后，再对**执行价**重跑价格保护与涨跌停
@@ -1090,6 +1142,17 @@ def confirm(conn: sqlite3.Connection, decision_id: int, confirmed_by: str = "hum
     - 实时价缺失时（W-A9）不得自动以昨收成交：应急/补清算单按其显式设计价执行
       并留痕（stale_price_exec），普通单挂起保留 approved 等 --price 显式确认。
     """
+    with _exec_lock():
+        return _confirm_locked(conn, decision_id, confirmed_by=confirmed_by,
+                               price_override=price_override, now=now,
+                               orders_dir=orders_dir)
+
+
+def _confirm_locked(conn: sqlite3.Connection, decision_id: int,
+                    confirmed_by: str = "human",
+                    price_override: Optional[float] = None,
+                    now: Optional[datetime] = None,
+                    orders_dir: Optional[Path] = None) -> Optional[dict]:
     now = now or datetime.now()
     _assert_paper_mode()
     got = _get_decision(conn, decision_id)

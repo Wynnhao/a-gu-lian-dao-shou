@@ -79,15 +79,15 @@ def _write_pending(trade_date: str, today_iso: str) -> Path:
         "- 今日真实盈亏未入账\n\n"
         "## 处置\n"
         "- **不要**根据本文件做任何下单决策；盯市与止损沿用上一交易日数据。\n"
-        "- 数据源恢复后跑：\n"
+        "- 数据源恢复后跑（catchup 自动检测缺口并补齐，无需参数）：\n"
         "  ```\n"
-        "  .venv/bin/python3 pipeline/catchup.py --date %s\n"
+        "  .venv/bin/python3 pipeline/catchup.py\n"
         "  .venv/bin/python3 pipeline/postclose.py --date %s\n"
         "  ```\n"
         "- 止损自检（步骤2.5）已独立于 daily_bar 完成，详见 logs/risk_event 表。\n"
     ) % (today_iso, datetime.now().isoformat(timespec="seconds"),
          trade_date, today_iso, trade_date, trade_date,
-         today_iso, today_iso)
+         today_iso)
     pending_path.write_text(body, encoding="utf-8")
     log.warning("今日 daily_bar 缺失，写 PENDING 兜底 → %s", pending_path)
     return pending_path
@@ -230,8 +230,39 @@ def main(argv=None) -> int:
 
     # 2. 盯市 + 每日复盘报告
     conn = fetcher.get_conn()
+    stale_note: Optional[str] = None
     try:
         trade_date = args.trade_date or daily.latest_trade_date(conn)
+
+        # W-D3（P1-18）：带 --date 补跑且目标日 daily_bar 缺行 → 不再无痕放行。
+        # 此前守卫 `if trade_date < today_iso and not args.trade_date` 对 --date
+        # 完全短路——09-18 实证：零行 09-18 日线的情况下照样出了"正式"日报。
+        # 现在缺行时：报告头加"价格滞后"标注（stale_note 传入日报生成）+
+        # notify 一次 + risk_event 留痕（降级可有痕，不可无痕）。
+        if args.trade_date:
+            try:
+                n_bars = conn.execute(
+                    "SELECT COUNT(*) FROM daily_bar WHERE trade_date=?",
+                    (trade_date,)).fetchone()[0]
+            except Exception as e:  # noqa: BLE001
+                n_bars = 0
+                log.error("W-D3 守卫查询 daily_bar FAIL（按缺行处理）: %s", repr(e))
+            if not n_bars:
+                stale_note = ("⚠ 价格滞后（目标日 %s 无日线，盯市基于最近可得收盘）"
+                              % trade_date)
+                log.warning("W-D3 --date 守卫：%s", stale_note)
+                try:
+                    from risk.engine import record_event as _record_event
+                    _record_event(conn, "postclose_price_stale",
+                                  "postclose --date %s 目标日 daily_bar 缺行，"
+                                  "盯市/日报基于最近可得收盘（P1-18 守卫）" % trade_date)
+                except Exception as e:  # noqa: BLE001
+                    log.error("W-D3 --date 守卫 risk_event 留痕 FAIL（继续）: %s", repr(e))
+                try:
+                    from risk.notify import notify as _notify
+                    _notify("盘后补跑价格滞后", stale_note)
+                except Exception as e:  # noqa: BLE001
+                    log.error("W-D3 --date 守卫 notify FAIL（继续）: %s", repr(e))
 
         # 2.0 数据体检 + 库备份（此前无任何备份，SQLite 文件级损坏即全损）
         try:
@@ -276,7 +307,7 @@ def main(argv=None) -> int:
         except Exception as e:  # noqa: BLE001
             log.error("PENDING 兜底写盘 FAIL（继续）: %s", repr(e))
         log.warning("==== postclose 提前退出 exit=2（数据缺失） ====")
-        print("[postclose] 今日 daily_bar 缺失，已写 PENDING-YYYY-MM-DD.md 兜底，需 catchup --date %s 补跑" % today_iso)
+        print("[postclose] 今日 daily_bar 缺失，已写 PENDING-YYYY-MM-DD.md 兜底，需 catchup 补跑（无参数，自动检测缺口）")
         return 2
 
     try:
@@ -292,7 +323,7 @@ def main(argv=None) -> int:
         except Exception:
             pass
     try:
-        report_path = daily.generate_daily_report(trade_date)
+        report_path = daily.generate_daily_report(trade_date, stale_note=stale_note)
     except Exception as e:
         log.error("步骤2 generate_daily_report FAIL: %s", repr(e))
         try:
@@ -347,6 +378,19 @@ def main(argv=None) -> int:
     print("[postclose] 每日报告: %s" % report_path)
     if weekly_path:
         print("[postclose] 周度报告: %s" % weekly_path)
+
+    # 5. W-D1 代码部分（P1-17）：postclose 成功路径顺手清当日 PENDING 兜底文件。
+    # 此前清除逻辑只在 catchup 步骤4（launchd 死亡期间从未运行）——PENDING-09-17/18.md
+    # 至今残留。盯市/日报已完成（走到这里即 exit 0），当日 PENDING 已无意义；
+    # 删除失败不阻断（只影响兜底文件残留，下次成功 postclose 再清）。
+    try:
+        pending_today = REPORTS_DIR / ("PENDING-%s.md" % date.today().isoformat())
+        if pending_today.is_file():
+            pending_today.unlink()
+            log.info("当日 PENDING 兜底文件已清除（postclose 成功）: %s", pending_today)
+    except OSError as e:
+        log.warning("当日 PENDING 清除失败（不阻断）: %s", e)
+
     log.info("==== postclose done exit=0 ====")
     return 0
 

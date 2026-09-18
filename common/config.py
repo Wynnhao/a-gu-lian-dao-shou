@@ -32,11 +32,74 @@ class ConfigError(Exception):
     """配置硬键缺失/类型错误（或 JSON 解析失败）。报错带精确路径。"""
 
 
-def validate(cfg: Any) -> List[str]:
-    """最小硬键集校验，返回可读错误清单（空清单 = 通过）。
+# 有效 profile 枚举（与 signals.PROFILES 同清单；config 层不 import signals 防循环）
+_VALID_PROFILES = ("reversal_lowvol", "reversal_lowvol_v2", "momentum")
 
-    硬键：db_path / watchlist（list 且元素含 code）/ blacklist_rules / risk——
-    即迁移前会 KeyError 在业务深处的四处（方案 §1 事实基础）。
+# W-D4（P1-24）：关键段与段内关键硬键清单（2026-09-19 对照 config.json 现有键钉死）。
+# 审查实证：watchlist_core 缺失曾静默回退全表（86 只全变可交易）、risk 内层键缺失
+# 静默落默认——并行会话重写 config 的历史隐患此前没有任何闸。现关键段缺失或
+# 段内关键键缺失一律 ConfigError（snapshot() import 期 fail-fast）。
+# 例外（协同点4）：execution.exec_retry_max / exec_retry_drift_max /
+# exec_breaker_threshold 是 C-ARC 带默认值的可选键，**不得**进本清单。
+# 非关键段（pools/regime/notify/bond_yield/etf_share/breadth/recorder 等）各调用方
+# 自带降级（容错分级保留），不在此列。
+REQUIRED_SECTION_KEYS: Dict[str, tuple] = {
+    "risk": (
+        "max_single_weight", "max_total_weight", "max_positions",
+        "price_guard_pct", "max_daily_trades", "max_weekly_turnover",
+        "max_drawdown_kill", "kill_stop_hours", "min_confidence",
+        "lot_size", "stop_loss_pct", "atr_stop_mult",
+        "max_concept_weight", "max_amount_share",
+    ),
+    "execution": (
+        "mode", "manual_gate", "emergency_direct_exec", "use_live_prices",
+        "paper_start_cash", "commission_rate", "min_commission",
+        "stamp_tax_rate", "slippage_bps", "volume_participation_cap",
+        "sim_limit_halt",
+    ),
+    "signals": ("profile",),
+}
+# 类型约束（缺省不查类型，只查存在；列出的是必须挡住的量纲/类型错误）：
+# 数字键 → int/float（bool 排除）；布尔键 → bool；字符串键 → 非空 str
+_REQUIRED_NUMERIC = frozenset(
+    list(REQUIRED_SECTION_KEYS["risk"]) + [
+        "paper_start_cash", "commission_rate", "min_commission",
+        "stamp_tax_rate", "slippage_bps", "volume_participation_cap"])
+_REQUIRED_BOOL = frozenset(("manual_gate", "emergency_direct_exec",
+                            "use_live_prices", "sim_limit_halt"))
+_REQUIRED_STR = frozenset(("mode", "profile"))
+
+
+def _check_section_keys(errors: List[str], section: str, body: dict) -> None:
+    """段内关键硬键：缺失/类型错 → 追加可读错误（W-D4）。"""
+    for key in REQUIRED_SECTION_KEYS.get(section, ()):
+        if key not in body:
+            errors.append("%s.%s: missing required key" % (section, key))
+            continue
+        v = body[key]
+        if key in _REQUIRED_NUMERIC:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                errors.append("%s.%s: expected number, got %r" % (section, key, v))
+        elif key in _REQUIRED_BOOL:
+            if not isinstance(v, bool):
+                errors.append("%s.%s: expected bool, got %r" % (section, key, v))
+        elif key in _REQUIRED_STR:
+            if not isinstance(v, str) or not v:
+                errors.append("%s.%s: expected non-empty str, got %r" % (section, key, v))
+        if section == "signals" and key == "profile" \
+                and isinstance(v, str) and v \
+                and v not in _VALID_PROFILES:
+            errors.append("signals.profile: unknown profile %r（有效值：%s）"
+                          % (v, "/".join(_VALID_PROFILES)))
+
+
+def validate(cfg: Any) -> List[str]:
+    """硬键集校验，返回可读错误清单（空清单 = 通过）。
+
+    顶层硬键：db_path / watchlist（list 且元素含 code）/ blacklist_rules /
+    watchlist_core（可交易池单一事实源，缺失曾静默回退全表——P1-24 现为硬键）；
+    关键段 risk / execution / signals 必须为 object，且段内关键硬键缺失即报错
+    （清单见 REQUIRED_SECTION_KEYS；C-ARC 三个可选执行键不在其列）。
     """
     errors: List[str] = []
     if not isinstance(cfg, dict):
@@ -44,23 +107,31 @@ def validate(cfg: Any) -> List[str]:
     db = cfg.get("db_path")
     if not isinstance(db, str) or not db:
         errors.append("db_path: expected non-empty str, got %r" % (db,))
-    wl = cfg.get("watchlist")
-    if not isinstance(wl, list) or not wl:
-        errors.append("watchlist: expected non-empty list, got %r"
-                      % (None if wl is None else type(wl).__name__,))
-    else:
-        for i, item in enumerate(wl):
-            if not isinstance(item, dict) or not item.get("code"):
-                errors.append("watchlist[%d].code: missing or empty" % i)
-                break
+
+    def _check_watchlist_field(name: str) -> None:
+        wl = cfg.get(name)
+        if not isinstance(wl, list) or not wl:
+            errors.append("%s: expected non-empty list, got %r"
+                          % (name, None if wl is None else type(wl).__name__,))
+        else:
+            for i, item in enumerate(wl):
+                if not isinstance(item, dict) or not item.get("code"):
+                    errors.append("%s[%d].code: missing or empty" % (name, i))
+                    break
+
+    _check_watchlist_field("watchlist")
+    _check_watchlist_field("watchlist_core")   # W-D4（P1-24）：不再静默回退
     br = cfg.get("blacklist_rules")
     if not isinstance(br, dict):
         errors.append("blacklist_rules: expected object, got %r"
                       % (None if br is None else type(br).__name__,))
-    risk = cfg.get("risk")
-    if not isinstance(risk, dict):
-        errors.append("risk: expected object, got %r"
-                      % (None if risk is None else type(risk).__name__,))
+    for section in ("risk", "execution", "signals"):
+        body = cfg.get(section)
+        if not isinstance(body, dict):
+            errors.append("%s: expected object, got %r"
+                          % (section, None if body is None else type(body).__name__,))
+            continue
+        _check_section_keys(errors, section, body)
     return errors
 
 
@@ -124,4 +195,4 @@ def active_profile() -> str:
     """
     c = load()
     p = (c.get("signals") or {}).get("profile", "reversal_lowvol")
-    return p if p in ("reversal_lowvol", "reversal_lowvol_v2", "momentum") else "reversal_lowvol"
+    return p if p in _VALID_PROFILES else "reversal_lowvol"

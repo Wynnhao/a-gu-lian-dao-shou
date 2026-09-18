@@ -54,7 +54,14 @@ def _say(msg: str) -> None:
 
 
 def _heartbeat() -> None:
-    """写心跳文件（mtime=本次运行时刻），供盘前体检判断看门狗是否实际在跑。"""
+    """写心跳文件（mtime=本次运行时刻）——**单层语义**（Sprint4 W-D1 代码部分）。
+
+    心跳只回答一个问题："catchup 最近有没有实际跑过"，供 premarket.check_watchdog
+    按 mtime 做陈旧告警。它**不证明任何调度层（launchd/cron/ZCode automation）存活**
+    ——调度层死亡检测归调度重建（W-D1 调度侧）负责，此处不做分层互保。
+    写入口收敛：全仓仅本函数写 catchup_heartbeat（recorder_heartbeat 是另一个文件，
+    语义独立）；读方（premarket.check_watchdog）只读 mtime，不写。
+    """
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         HEARTBEAT_FILE.touch()
@@ -102,6 +109,21 @@ def _run_script(rel: str, timeout: int = 900, extra: Optional[List[str]] = None)
 
 def _file_fresh_today(p: Path) -> bool:
     return p.is_file() and datetime.fromtimestamp(p.stat().st_mtime).date() == date.today()
+
+
+def _mm_done(ps) -> bool:
+    """W-D2（P1-16）：盯市已完成判定。
+
+    ps 为 repo.state_on 的 sqlite3.Row（date/cash/market_value/total/drawdown/
+    kill_switch/note）。此前读 ps[0]（date 列）与 note 子串比较 → 恒 False →
+    日线到位后 postclose 每 30 分钟被整套重跑直到午夜。现读 note 列：
+    含「价格日期=」（当日价盯市）或「价格滞后:」（停牌票按最近可得收盘，
+    daily.mark_to_market 写入）均算完成——停牌票的残留滞后不得把已完成
+    盯市的交易日误判为未完成而陷入重跑循环。
+    """
+    note = ps["note"] if ps is not None else None
+    return bool(ps) and ("价格日期=" in (note or "")
+                         or "价格滞后:" in (note or ""))
 
 
 def catch_up(now: Optional[datetime] = None) -> int:
@@ -258,10 +280,11 @@ def catch_up(now: Optional[datetime] = None) -> int:
         # 当天复盘就一直缺（2026-09-15 实测）。这里闭环：日线到位后重跑 postclose。
         after_close = (now.hour, now.minute) >= (15, 10)
         if trading_day and after_close and latest_td == today_str:
-            ps = repo.state_on(conn, today_str)
-            state_ok = bool(ps and ("价格日期=%s" % today_str) in (ps[0] or ""))
+            state_ok = _mm_done(repo.state_on(conn, today_str))
             pending_stale = (REPORTS_DIR / ("PENDING-" + today_str + ".md")).is_file()
-            if pending_stale or not state_ok:
+            # W-D2：补齐判定与重跑解耦——盯市已完成时不再整套重跑 postclose
+            #（已补齐则不再重跑），只清残留的 PENDING 兜底文件。
+            if not state_ok:
                 _say("步骤4 盘后当日补全（日线已到 %s，盯市/日报未完成）→ 重跑 postclose"
                      % today_str)
                 if not _run_script("pipeline/postclose.py", timeout=900):
@@ -272,6 +295,12 @@ def catch_up(now: Optional[datetime] = None) -> int:
                         _say("  ↳ PENDING 兜底文件已清除（数据已补齐）")
                     except OSError:
                         pass
+            elif pending_stale:
+                try:
+                    (REPORTS_DIR / ("PENDING-" + today_str + ".md")).unlink()
+                    _say("步骤4 盯市已完成，仅清除残留 PENDING 兜底文件（不重跑 postclose）")
+                except OSError:
+                    pass
     finally:
         conn.close()
 

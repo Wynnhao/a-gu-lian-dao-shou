@@ -4,16 +4,36 @@
 （注意 get_conn() 固定连真实库，本测试不使用它）。期初资金取自真实 config.json（1000000）。
 """
 
+import os
+import sqlite3
 import sys
+import tempfile
 from pathlib import Path
+from pathlib import Path as _Path
 
 BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
-import sqlite3
-import tempfile
-from pathlib import Path as _Path
+# ---- 测试隔离 env（W-D5 / P1-29/30：对照 test_pipeline_full 的正确模式）----
+# 本文件曾以 backup/restore 直写生产 logs/backtest_result.json（非原子，测试
+# 中途被 kill 会把合成 verdict 永久留在生产位）。现 profile_verdict 走 bt_path
+# 注入，不再碰生产位；本 env 快照兜底防 AGSICKLE_* 泄漏到后续测试文件。
+_ORIG_ENV = dict(os.environ)
+
+
+def _restore_env():
+    # 只动 AGSICKLE_ 前缀——碰其它键（如 PYTEST_CURRENT_TEST）会破坏 pytest 自身
+    for k in list(os.environ):
+        if k.startswith("AGSICKLE_") and k not in _ORIG_ENV:
+            os.environ.pop(k, None)
+    os.environ.update({k: v for k, v in _ORIG_ENV.items()
+                       if k.startswith("AGSICKLE_")})
+
+
+def teardown_module(module=None):
+    _restore_env()
+
 
 from data.fetcher import DDL
 from review import daily, weekly
@@ -415,18 +435,22 @@ def _main() -> int:
 
 def _write_bt(tmp_path, cur_ann=-0.0801, alt_ann=0.3554,
               cur_mdd=-0.3615, alt_mdd=-0.3224):
-    """写一份临时 backtest_result.json 供 profile_verdict 读取。
+    """写一份临时 backtest_result.json，返回路径供 profile_verdict(bt_path=...) 注入。
+
+    W-D5（P1-29）：测试不再 backup/restore 生产 logs/backtest_result.json——
+    那条路非原子，测试中途被 kill 会把合成 verdict 永久留在生产位，premarket
+    与周报会基于假数据出 switch 建议甚至写红线 risk_event。
 
     与 verdict 逻辑对齐：当前 profile = momentum（config 当前值），备选 = reversal_lowvol/v2。
     测试场景的 cur_ann/cur_mdd 视为当前 profile 的数字，alt_* 视为备选（verdict 取最优 alt）。
     """
-    p = tmp_path / "backtest_result.json"
-    p.write_text(_Path(
-        BASE / "logs" / "backtest_result.json"
-    ).read_text(encoding="utf-8") if (BASE / "logs" / "backtest_result.json").exists()
-        else '{"profiles":{}}', encoding="utf-8")
     import json as _json
+    p = tmp_path / "backtest_result.json"
     payload = {
+        # W-D6 元数据契约的最小形态（verdict 应把版本信息透出给 bundle）
+        "generated_at": "2026-09-19 12:00:00",
+        "universe": {"mode": "full", "codes": 816},
+        "data_version": "test-fixture",
         "profiles": {
             # 当前 profile（verdict 取这里做 B/C_cur）
             "momentum": {
@@ -453,7 +477,6 @@ def _write_bt(tmp_path, cur_ann=-0.0801, alt_ann=0.3554,
 def test_signal_eval_persists_latest(tmp_path=None):
     """任务 1：evaluate() 落盘到 AGSICKLE_SIGNAL_EVAL_DIR 隔离目录（K3：不得碰生产
     logs/signal_eval/）。"""
-    import os
     import json as _json
     from review import signal_eval
     sandbox = tempfile.mkdtemp(prefix="agsickle_signal_eval_test_")
@@ -476,48 +499,37 @@ def test_signal_eval_persists_latest(tmp_path=None):
         loaded = _json.loads(latest.read_text(encoding="utf-8"))
         assert "profile_verdict" in loaded
         assert "factor_ic" in loaded
+        # P2-14：落盘后不留 tmp 半写文件（原子写 tmp+os.replace）
+        assert not (_Path(sandbox) / "latest.json.tmp").exists()
     finally:
         conn.close()
-        if old_env is None:
-            os.environ.pop("AGSICKLE_SIGNAL_EVAL_DIR", None)
-        else:
-            os.environ["AGSICKLE_SIGNAL_EVAL_DIR"] = old_env
+        _restore_env()
 
 
 def test_profile_verdict_both_lost_switch(tmp_path=None):
-    """投票 case1：B+C 双劣 → switch（v1.7 verdict 顶层结构：votes/b_switch/c_switch/red_line_triggered）。"""
+    """投票 case1：B+C 双劣 → switch（v1.7 verdict 顶层结构：votes/b_switch/c_switch/red_line_triggered）。
+
+    W-D5：合成回测产物经 bt_path 注入，全程不触碰生产 backtest_result.json。"""
     from review import signal_eval
     bt = _write_bt(_Path(tempfile.mkdtemp()),
                    cur_ann=-0.10, alt_ann=0.30,    # B_cur − B_alt = -0.40 → 投切换
                    cur_mdd=-0.10, alt_mdd=-0.03)   # C_cur − C_alt = -0.07 → 投切换
-    import json as _json
-    _json.loads(bt.read_text(encoding="utf-8"))
-    target = BASE / "logs" / "backtest_result.json"
-    backup = None
-    if target.exists():
-        backup = target.read_bytes()
-    target.write_bytes(bt.read_bytes())
+    conn = make_conn()
     try:
-        conn = make_conn()
-        try:
-            v = signal_eval.profile_verdict(conn)
-            assert v["B"]["gap"] is not None and v["B"]["gap"] < -0.10, v["B"]
-            assert v["C"]["gap"] is not None and v["C"]["gap"] < -0.05, v["C"]
-            assert v["red_line_triggered"] is False  # MDD -10% > -30%
-            assert v["verdict"] == "switch", v
-            assert v["confidence"] == "high"  # 2/2 → high
-            # v1.7：suggest_profile 切换到 B 维较优者（"alt"按 Fix-5 取年化超额最高）
-            assert v["suggest_profile"] != v["profile"]
-        finally:
-            conn.close()
+        v = signal_eval.profile_verdict(conn, bt_path=bt)
+        assert v["B"]["gap"] is not None and v["B"]["gap"] < -0.10, v["B"]
+        assert v["C"]["gap"] is not None and v["C"]["gap"] < -0.05, v["C"]
+        assert v["red_line_triggered"] is False  # MDD -10% > -30%
+        assert v["verdict"] == "switch", v
+        assert v["confidence"] == "high"  # 2/2 → high
+        # v1.7：suggest_profile 切换到 B 维较优者（"alt"按 Fix-5 取年化超额最高）
+        assert v["suggest_profile"] != v["profile"]
+        # W-D6 元数据透出（bundle 引用红线数字必须带版本）
+        assert v["backtest_generated_at"] == "2026-09-19 12:00:00", v
+        assert v["backtest_universe"] == "full", v
+        assert str(bt) == v["backtest_path"], v
     finally:
-        if backup is not None:
-            target.write_bytes(backup)
-        elif target.exists():
-            # Sprint4 批次B 末处置加固：原文件不存在（已退役为 .invalid）时
-            # 必须删除合成产物——测试不得把假 backtest_result.json 留在生产
-            # 路径复活已退役文件（2026-09-19 实测复活事故）。
-            target.unlink()
+        conn.close()
 
 
 def test_profile_verdict_only_c_vote_switch_low_confidence(tmp_path=None):
@@ -526,32 +538,40 @@ def test_profile_verdict_only_c_vote_switch_low_confidence(tmp_path=None):
     bt = _write_bt(_Path(tempfile.mkdtemp()),
                    cur_ann=0.10, alt_ann=0.15,    # B gap=-5pp > -10pp → 不投
                    cur_mdd=-0.20, alt_mdd=-0.10)  # C gap=-10pp < -5pp → 投
-    target = BASE / "logs" / "backtest_result.json"
-    backup = None
-    if target.exists():
-        backup = target.read_bytes()
-    target.write_bytes(bt.read_bytes())
+    conn = make_conn()
     try:
-        conn = make_conn()
-        try:
-            v = signal_eval.profile_verdict(conn)
-            assert v["votes"]["b_switch"] is False, v["votes"]
-            assert v["votes"]["c_switch"] is True, v["votes"]
-            assert v["red_line_triggered"] is False  # -20% > -30%
-            assert v["verdict"] == "switch", v
-            assert v["confidence"] == "low", v
-            # suggest_profile 切到 B 维较优备选（Fix-5 取最高年化超额）
-            assert v["suggest_profile"] != v["profile"], v
-        finally:
-            conn.close()
+        v = signal_eval.profile_verdict(conn, bt_path=bt)
+        assert v["votes"]["b_switch"] is False, v["votes"]
+        assert v["votes"]["c_switch"] is True, v["votes"]
+        assert v["red_line_triggered"] is False  # -20% > -30%
+        assert v["verdict"] == "switch", v
+        assert v["confidence"] == "low", v
+        # suggest_profile 切到 B 维较优备选（Fix-5 取最高年化超额）
+        assert v["suggest_profile"] != v["profile"], v
     finally:
-        if backup is not None:
-            target.write_bytes(backup)
-        elif target.exists():
-            # Sprint4 批次B 末处置加固：原文件不存在（已退役为 .invalid）时
-            # 必须删除合成产物——测试不得把假 backtest_result.json 留在生产
-            # 路径复活已退役文件（2026-09-19 实测复活事故）。
-            target.unlink()
+        conn.close()
+
+
+def test_profile_verdict_env_injection(tmp_path=None):
+    """W-D5：bt_path 缺省时读 AGSICKLE_BACKTEST_RESULT env（测试注入点第二落点）。"""
+    from review import signal_eval
+    bt = _write_bt(_Path(tempfile.mkdtemp()),
+                   cur_ann=-0.10, alt_ann=0.30,
+                   cur_mdd=-0.10, alt_mdd=-0.03)
+    old = os.environ.get("AGSICKLE_BACKTEST_RESULT")
+    os.environ["AGSICKLE_BACKTEST_RESULT"] = str(bt)
+    conn = make_conn()
+    try:
+        v = signal_eval.profile_verdict(conn)
+        assert v["backtest_missing"] is None, v
+        assert v["B"]["current"] is not None, v
+        assert v["backtest_path"] == str(bt), v
+    finally:
+        conn.close()
+        if old is None:
+            os.environ.pop("AGSICKLE_BACKTEST_RESULT", None)
+        else:
+            os.environ["AGSICKLE_BACKTEST_RESULT"] = old
 
 
 def test_profile_verdict_red_line_overrides(tmp_path=None):
@@ -560,11 +580,6 @@ def test_profile_verdict_red_line_overrides(tmp_path=None):
     bt = _write_bt(_Path(tempfile.mkdtemp()),
                    cur_ann=-0.10, alt_ann=0.30,    # B 投切换
                    cur_mdd=-0.40, alt_mdd=-0.10)  # C 也投切换 + 触发红线
-    target = BASE / "logs" / "backtest_result.json"
-    backup = None
-    if target.exists():
-        backup = target.read_bytes()
-    target.write_bytes(bt.read_bytes())
     conn0 = make_conn()
     try:
         from datetime import datetime
@@ -575,28 +590,26 @@ def test_profile_verdict_red_line_overrides(tmp_path=None):
         conn0.commit()
     finally:
         conn0.close()
+    conn = make_conn()
     try:
-        conn = make_conn()
-        try:
-            v = signal_eval.profile_verdict(conn)
-            assert v["red_line_triggered"] is True, v
-            assert v["verdict"] == "hold", v
-            # v1.7 红线只 hold，不切：suggest_profile = 当前 profile
-            assert v["suggest_profile"] == v["profile"], v
-            n = conn.execute(
-                "SELECT COUNT(*) FROM risk_event WHERE rule='profile_verdict_red_line'"
-                " AND ts LIKE ?", (today + "%",)).fetchone()[0]
-            assert n >= 1, "红线 override 必须写 risk_event"
-        finally:
-            conn.close()
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+        v = signal_eval.profile_verdict(conn, bt_path=bt)
+        assert v["red_line_triggered"] is True, v
+        assert v["verdict"] == "hold", v
+        # v1.7 红线只 hold，不切：suggest_profile = 当前 profile
+        assert v["suggest_profile"] == v["profile"], v
+        n = conn.execute(
+            "SELECT COUNT(*) FROM risk_event WHERE rule='profile_verdict_red_line'"
+            " AND ts LIKE ?", (today + "%",)).fetchone()[0]
+        assert n >= 1, "红线 override 必须写 risk_event"
+        # 红线事件必须带回测版本号（P1-25/W-D6：引用带版本）
+        row = conn.execute(
+            "SELECT detail FROM risk_event WHERE rule='profile_verdict_red_line'"
+            " AND ts LIKE ? LIMIT 1", (today + "%",)).fetchone()
+        assert "2026-09-19 12:00:00" in (row[0] or ""), row
     finally:
-        if backup is not None:
-            target.write_bytes(backup)
-        elif target.exists():
-            # Sprint4 批次B 末处置加固：原文件不存在（已退役为 .invalid）时
-            # 必须删除合成产物——测试不得把假 backtest_result.json 留在生产
-            # 路径复活已退役文件（2026-09-19 实测复活事故）。
-            target.unlink()
+        conn.close()
 
 
 def test_profile_verdict_three_profile_alts_pick_best():
@@ -607,10 +620,7 @@ def test_profile_verdict_three_profile_alts_pick_best():
     import signals.signals as sig_mod
     orig_profile = sig_mod.profile
     sig_mod.profile = lambda: "reversal_lowvol"
-    target = BASE / "logs" / "backtest_result.json"
-    backup = None
-    if target.exists():
-        backup = target.read_bytes()
+    bt = _Path(tempfile.mkdtemp()) / "backtest_result.json"
     payload = {
         "profiles": {
             "reversal_lowvol": {
@@ -627,62 +637,61 @@ def test_profile_verdict_three_profile_alts_pick_best():
             },
         },
     }
-    target.write_text(_json.dumps(payload), encoding="utf-8")
+    bt.write_text(_json.dumps(payload), encoding="utf-8")
+    conn = make_conn()
     try:
-        conn = make_conn()
-        try:
-            v = signal_eval.profile_verdict(conn)
-            assert v["other_profiles"] == ["momentum", "reversal_lowvol_v2"]
-            assert v["alt_best"]["b_from"] == "momentum"
-            assert v["alt_best"]["c_from"] == "reversal_lowvol_v2"
-            # B_alt=+0.20（momentum 超额）；C_alt=-0.08（v2 的 MDD）
-            assert abs(v["B"]["alt"] - 0.20) < 1e-9
-            assert abs(v["C"]["alt"] - (-0.08)) < 1e-9
-            # B gap=+0.30 远优于备选 → 不投；C gap=-0.07 投 → 1 票（Fix-6 ≥1 票即建议）
-            assert v["votes"]["votes_switch"] == 1
-            assert v["verdict"] == "switch"
-            assert v["confidence"] == "low"
-            # switch 目标 = B 维较优备选 momentum
-            assert v["suggest_profile"] == "momentum"
-        finally:
-            conn.close()
+        v = signal_eval.profile_verdict(conn, bt_path=bt)
+        assert v["other_profiles"] == ["momentum", "reversal_lowvol_v2"]
+        assert v["alt_best"]["b_from"] == "momentum"
+        assert v["alt_best"]["c_from"] == "reversal_lowvol_v2"
+        # B_alt=+0.20（momentum 超额）；C_alt=-0.08（v2 的 MDD）
+        assert abs(v["B"]["alt"] - 0.20) < 1e-9
+        assert abs(v["C"]["alt"] - (-0.08)) < 1e-9
+        # B gap=+0.30 远优于备选 → 不投；C gap=-0.07 投 → 1 票（Fix-6 ≥1 票即建议）
+        assert v["votes"]["votes_switch"] == 1
+        assert v["verdict"] == "switch"
+        assert v["confidence"] == "low"
+        # switch 目标 = B 维较优备选 momentum
+        assert v["suggest_profile"] == "momentum"
     finally:
+        conn.close()
         sig_mod.profile = orig_profile
-        if backup is not None:
-            target.write_bytes(backup)
-        elif target.exists():
-            # Sprint4 批次B 末处置加固：原文件不存在（已退役为 .invalid）时
-            # 必须删除合成产物——测试不得把假 backtest_result.json 留在生产
-            # 路径复活已退役文件（2026-09-19 实测复活事故）。
-            target.unlink()
 
 
 def test_profile_verdict_abstain_when_bt_missing(tmp_path=None):
     """任务 2 投票 case4：backtest_result.json 缺失 → B/C 全弃权 → hold。"""
     from review import signal_eval
-    target = BASE / "logs" / "backtest_result.json"
-    backup = None
-    if target.exists():
-        backup = target.read_bytes()
-        target.unlink()
+    missing = _Path(tempfile.mkdtemp()) / "nope.json"
+    conn = make_conn()
     try:
-        conn = make_conn()
-        try:
-            v = signal_eval.profile_verdict(conn)
-            assert "B (年化超额 vs HS300)" in v["abstains"]
-            assert "C (MDD)" in v["abstains"]
-            assert v["verdict"] == "hold"
-            assert v["backtest_missing"] is not None
-        finally:
-            conn.close()
+        v = signal_eval.profile_verdict(conn, bt_path=missing)
+        assert "B (年化超额 vs HS300)" in v["abstains"]
+        assert "C (MDD)" in v["abstains"]
+        assert v["verdict"] == "hold"
+        assert v["backtest_missing"] is not None
     finally:
-        if backup is not None:
-            target.write_bytes(backup)
-        elif target.exists():
-            # Sprint4 批次B 末处置加固：原文件不存在（已退役为 .invalid）时
-            # 必须删除合成产物——测试不得把假 backtest_result.json 留在生产
-            # 路径复活已退役文件（2026-09-19 实测复活事故）。
-            target.unlink()
+        conn.close()
+
+
+def test_profile_verdict_bt_file_not_touched():
+    """W-D5 回归护栏：verdict 全路径（含红线 override）不得写/删注入的 bt 文件，
+    更不得触碰生产 backtest_result.json 位。"""
+    from review import signal_eval
+    bt = _write_bt(_Path(tempfile.mkdtemp()),
+                   cur_ann=-0.10, alt_ann=0.30,
+                   cur_mdd=-0.40, alt_mdd=-0.10)  # 触发红线 override
+    before = bt.read_bytes()
+    prod = BASE / "logs" / "backtest_result.json"
+    prod_before = prod.read_bytes() if prod.exists() else None
+    conn = make_conn()
+    try:
+        v = signal_eval.profile_verdict(conn, bt_path=bt)
+        assert v["red_line_triggered"] is True
+    finally:
+        conn.close()
+    assert bt.read_bytes() == before, "注入的 bt 文件被改动"
+    assert (prod.read_bytes() if prod.exists() else None) == prod_before, \
+        "生产 backtest_result.json 被测试触碰"
 
 
 def test_profile_verdict_compat_with_weekly():

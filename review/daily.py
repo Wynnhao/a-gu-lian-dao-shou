@@ -462,8 +462,14 @@ def _sec_self_review(conn: sqlite3.Connection, trade_date: str) -> str:
 
 def generate_daily_report(trade_date: Optional[str] = None,
                           conn: Optional[sqlite3.Connection] = None,
-                          out_dir: Optional[Path] = None) -> Path:
-    """生成 logs/reports/YYYY-MM-DD.md 每日复盘报告，返回报告路径。空表优雅降级，不抛异常。"""
+                          out_dir: Optional[Path] = None,
+                          stale_note: Optional[str] = None) -> Path:
+    """生成 logs/reports/YYYY-MM-DD.md 每日复盘报告，返回报告路径。空表优雅降级，不抛异常。
+
+    stale_note（W-D3/P1-18）：非空时写入报告头——postclose 带 --date 补跑且目标日
+    daily_bar 缺行时，盯市基于最近可得收盘，必须在报告头显式标注"价格滞后"，
+    不允许无痕出"正式"日报（09-18 实证：零行日线照样出了正式日报）。
+    """
     conn, own = _connect(conn)
     try:
         if trade_date is None:
@@ -487,8 +493,10 @@ def generate_daily_report(trade_date: Optional[str] = None,
             f"# 每日复盘报告 {trade_date}",
             "",
             f"> 生成时间：{datetime.now().isoformat(timespec='seconds')}｜期初资金：{_fmt_money(START_CASH)}",
-            "",
         ]
+        if stale_note:
+            lines.append(f"> {stale_note}")
+        lines.append("")
         for title, body in sections:
             lines.append(f"## {title}")
             lines.append("")

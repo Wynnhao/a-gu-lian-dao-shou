@@ -225,14 +225,21 @@ def _score_momentum(trend, m, r) -> float:
 
 
 def _factor_from_bars(bars: pd.DataFrame, code: str,
-                      as_of: Optional[str]) -> Optional[dict]:
+                      as_of: Optional[str], prof: Optional[str] = None) -> Optional[dict]:
     """单票因子计算（不含截面 score）。bars 为该票全部日线（升序无所谓，内部排序）。
-    截至 as_of 无任何数据返回 None。"""
+    截至 as_of 无任何数据返回 None。
+
+    prof（P2-4/W-D6 前置）：打分口径所属 profile——缺省取 config 当前 profile。
+    显式传入时**必须**以其判定 momentum/截面分支：此前固定读全局 profile()，
+    backfill_history(prof="momentum") 在 config 为 reversal 时 score 恒 None，
+    落库被 0.5 默认值顶替（"momentum 名下写 0.5"）。
+    """
     if as_of is not None:
         bars = bars[bars["trade_date"] <= as_of]
     bars = bars.sort_values("trade_date")
     if bars.empty:
         return None
+    prof = prof or profile()
 
     close = _factor_close(bars).reset_index(drop=True)
     raw_close = pd.to_numeric(bars["close"], errors="coerce").reset_index(drop=True)
@@ -255,7 +262,12 @@ def _factor_from_bars(bars: pd.DataFrame, code: str,
     # atr_pct 与 atr 同口径（复权 atr 除以复权收盘；混口径会在除权票上失真）
     denom = last_factor_close if (atr_basis == "qfq" and last_factor_close) else last_close
     atr_pct = (a / denom) if (a is not None and denom and denom > 0) else None
-    turn20 = _f(to.iloc[-TURN20_WINDOW:].mean()) if to.notna().any() else None
+    # P2-3（W-D6 前置）：turn20 最小样本与回测统一（rolling(20, min_periods=10)
+    # 语义）——末 20 行内有效换手 < 10 个 → None。此前生产只要有 1 个非缺失值就
+    # 出均值（单观测均值是噪声），与回测 min_periods=10 两口径不一致。
+    _to20 = to.iloc[-TURN20_WINDOW:]
+    turn20 = (_f(_to20.dropna().mean())
+              if int(_to20.notna().sum()) >= TURN20_WINDOW // 2 else None)
 
     # W-B4①（Sprint4，P2-1）：above_ma60 与 ma60 同口径——ma60 由前复权 close
     # 计算，现价也必须用前复权收盘比较（raw 现价 vs qfq 均线在除权票上恒错）
@@ -290,20 +302,27 @@ def _factor_from_bars(bars: pd.DataFrame, code: str,
     # bench_close 分支内，HS300 缺失时被连带置 None；max_ret_bali 对短序列安全返回 None）。
     signals["max_ret_5_20d"] = _f(max_ret_bali(close.values, 20, 5))
     # IVOL：需 HS300 基准（index_daily '000300'）做 CAPM 残差；基准缺失 → None（不阻断）
-    try:
-        bench_close = _hs300_close_series(conn_hint=None)
-    except Exception:
-        bench_close = None
-    if bench_close is not None and len(close) >= 2:
-        # 尾部对齐：按交易日交集对齐（简单取长度对齐——compute 侧全表同源 daily_bar，
-        # 日期基本同步；精确对齐留给 v2 profile 接入时做）
-        n = min(len(close), len(bench_close))
-        signals["ivol_20d"] = _f(ivol(close.iloc[-n:].values,
-                                      bench_close.iloc[-n:].values, 20))
-    else:
-        signals["ivol_20d"] = None
+    # P2-2（W-D6 前置）：口径统一以 factors.ivol 为准（带截距 OLS + 样本 σ ddof=1），
+    # 且**按交易日对齐**——此前"尾部各取 n 个"长度对齐，个股停牌/晚于基准上市时
+    # 两端日期窗错位，不同交易日的收益被配成一对，β/残差全错。
+    signals["ivol_20d"] = None
+    if len(close) >= 2:
+        try:
+            bench_close = _hs300_close_series(conn_hint=None)
+        except Exception:  # noqa: BLE001
+            bench_close = None
+        if bench_close is not None:
+            _stock = pd.Series(
+                close.values,
+                index=pd.Index(bars["trade_date"].astype(str).values))
+            _joined = pd.concat([_stock, bench_close], axis=1,
+                                join="inner").dropna()
+            if len(_joined) >= 2:
+                signals["ivol_20d"] = _f(ivol(_joined.iloc[:, 0].values,
+                                              _joined.iloc[:, 1].values, 20))
 
-    if profile() not in ("reversal_lowvol", "reversal_lowvol_v2"):
+    # P2-4（W-D6 前置）：momentum/截面分支按显式 prof 判定（见 docstring）
+    if prof not in ("reversal_lowvol", "reversal_lowvol_v2"):
         score = _score_momentum(trend if ma5 is not None else None, m, r)
     else:
         score = None  # 截面打分由调用方统一合成（v1/v2）
@@ -385,25 +404,30 @@ def _pool_by_code(pool: pd.DataFrame) -> dict:
 
 
 def compute_signal(code: str, as_of: Optional[str] = None,
-                   conn=None, pool: Optional[pd.DataFrame] = None) -> dict:
+                   conn=None, pool: Optional[pd.DataFrame] = None,
+                   prof: Optional[str] = None) -> dict:
     """计算单票信号。截面打分需要全池上下文：pool 为 daily_bar 全表 DataFrame
-    （缺省现读），对池内全部票算完截面后返回 code 那一份。"""
+    （缺省现读），对池内全部票算完截面后返回 code 那一份。
+
+    prof（P2-4）：打分口径，缺省取 config.signals.profile。
+    """
     own = conn is None and pool is None
     if pool is None:
         c = conn or get_conn()
         pool = pd.read_sql("SELECT * FROM daily_bar", c)
         if own:
             c.close()
+    prof = prof or profile()
     by_code = _pool_by_code(pool)
     if str(code) not in by_code:
         raise ValueError(f"{code} 无行情数据")
     rows = []
     for cd, g in by_code.items():
-        r = _factor_from_bars(g, cd, as_of)
+        r = _factor_from_bars(g, cd, as_of, prof=prof)
         if r is not None:
             rows.append(r)
-    if profile() != "momentum":
-        _score_cross_section(rows)
+    if prof != "momentum":
+        _score_cross_section(rows, prof=prof)
     for r in rows:
         if r["code"] == str(code):
             return {"code": r["code"], "signals": r["signals"],
@@ -413,8 +437,12 @@ def compute_signal(code: str, as_of: Optional[str] = None,
 
 
 def _rows_as_of(by_code: dict, codes: list, as_of: Optional[str],
-                 bl: dict) -> list:
-    """对给定 codes 计算截至 as_of 的因子行（黑名单过滤，与 compute_all 同口径）。"""
+                bl: dict, prof: Optional[str] = None) -> list:
+    """对给定 codes 计算截至 as_of 的因子行（黑名单过滤，与 compute_all 同口径）。
+
+    prof（P2-4）：透传给 _factor_from_bars 的打分口径——momentum 行只有显式
+    prof 链路才能产出时序分。
+    """
     rows = []
     for code in codes:
         ok, reason = bl.get(code, (True, "-"))
@@ -425,7 +453,7 @@ def _rows_as_of(by_code: dict, codes: list, as_of: Optional[str],
         if g is None:
             continue
         try:
-            r = _factor_from_bars(g, code, as_of)
+            r = _factor_from_bars(g, code, as_of, prof=prof)
         except ValueError as e:
             log.warning("skip %s: %s", code, e)
             continue
@@ -445,6 +473,11 @@ def compute_all(as_of: Optional[str] = None, conn=None,
     profile（None 默认）：用 config.signals.profile 当前所选。显式传"reversal_lowvol"
     等可针对特定 profile 入库不丢——2026-09-18 v1.4 跟踪期需要每日刷两个 profile 的当日
     score 供观察期评测可比。
+
+    P2-4（W-D6 前置）：显式 profile 沿 _rows_as_of → _factor_from_bars →
+    _score_cross_section 全链透传——X 名下必须写 X 的分（此前只透传到 INSERT 的
+    profile 列，打分分支仍读全局 config，v2 名可装 v1 分）；打分未产出分的行
+    一律跳过不写（不再以 0.5 默认值顶替入库）。
     """
     own = conn is None
     c = conn or get_conn()
@@ -460,17 +493,25 @@ def compute_all(as_of: Optional[str] = None, conn=None,
         codes = all_c
     by_code = _pool_by_code(pool)
 
-    rows = _rows_as_of(by_code, codes, as_of, bl)
+    rows = _rows_as_of(by_code, codes, as_of, bl, prof=prof_name)
     if prof_name != "momentum":
-        _score_cross_section(rows)
+        _score_cross_section(rows, prof=prof_name)
 
     results = []
+    n_unscored = 0
     for r in rows:
+        if r["score"] is None:
+            # P2-4 护栏：X 名下必须写 X 的分——截面/时序打分都未产出分的行
+            # 不允许以 0.5 默认值入库（"momentum 名下写 0.5/交叉分"复发闸）
+            n_unscored += 1
+            log.warning("compute_all[%s] %s 无打分结果，跳过入库", prof_name,
+                        r["code"])
+            continue
         c.execute("INSERT OR REPLACE INTO signal (code, as_of, signals, score,"
                   " profile) VALUES (?,?,?,?,?)",
                   (r["code"], r["as_of"],
                    json.dumps(r["signals"], ensure_ascii=False),
-                   r["score"] if r["score"] is not None else 0.5,
+                   r["score"],
                    prof_name))
         results.append({"code": r["code"], "signals": r["signals"],
                         "score": r["score"], "as_of": r["as_of"]})
@@ -484,6 +525,9 @@ def compute_all(as_of: Optional[str] = None, conn=None,
         log.warning("因子拥挤熔断落盘失败（不阻断主流程）: %s", repr(e))
     if own:
         c.close()
+    if n_unscored:
+        log.warning("compute_all[%s]：%d 行无打分结果被跳过（P2-4 护栏）",
+                    prof_name, n_unscored)
     log.info("compute_all %d 票（profile=%s），耗时 %.2fs",
              len(results), prof_name, time.time() - t0)
     return results
@@ -720,6 +764,11 @@ def backfill_history(conn=None, start: Optional[str] = None,
       必须全量重跑；
     - prof：回填目标 profile（Fix-5，缺省取 config.signals.profile）——v1/v2
       双 profile 各回填一次即可并存（主键含 profile，互不覆盖）；
+    - P2-4（W-D6 前置）：prof 沿 _rows_as_of → _factor_from_bars 全链透传，
+      momentum 回填按 prof 走时序打分、reversal 按 prof 走截面打分——此前打分
+      分支读全局 config，backfill(prof="momentum") 在 config=reversal 时 score
+      恒 None 落库被 0.5 顶替（"momentum 名下写 0.5/交叉分"）。无打分结果的行
+      跳过不写（P2-4 护栏）；
     - 回填样本仍限于 daily_bar 内票池（事后人工挑选），IC 结论带池偏差，
       signal_eval 输出中显式标注。
     """
@@ -742,17 +791,21 @@ def backfill_history(conn=None, start: Optional[str] = None,
         dates = [d for d in dates if d <= end]
     is_momentum = prof == "momentum"
     n_rows = 0
+    n_unscored = 0
     buf: list = []
     for i, d in enumerate(dates, 1):
-        rows = _rows_as_of(by_code, codes, d, bl)
+        rows = _rows_as_of(by_code, codes, d, bl, prof=prof)
         if not rows:
             continue
         if not is_momentum:
             _score_cross_section(rows, prof=prof)
         for r in rows:
+            if r["score"] is None:
+                n_unscored += 1
+                continue    # P2-4 护栏：不打 0.5 默认分
             buf.append((r["code"], r["as_of"],
                         json.dumps(r["signals"], ensure_ascii=False),
-                        r["score"] if r["score"] is not None else 0.5,
+                        r["score"],
                         prof))
         if len(buf) >= batch_commit * max(len(codes), 1):
             c.executemany("INSERT OR REPLACE INTO signal (code, as_of, signals,"
@@ -770,6 +823,8 @@ def backfill_history(conn=None, start: Optional[str] = None,
         n_rows += len(buf)
     if own:
         c.close()
+    if n_unscored:
+        log.warning("backfill[%s]：%d 行无打分结果被跳过（P2-4 护栏）", prof, n_unscored)
     log.info("backfill[%s] 完成：%d 交易日，%d 行 signal，耗时 %.1fs",
              prof, len(dates), n_rows, time.time() - t0)
     return n_rows

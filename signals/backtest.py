@@ -13,14 +13,28 @@
 2026-09-14 再修（口径统一）：
 5. 收益/动量/波动一律用前复权价（close_qfq 缺失单元格回退不复权）——此前
    用未复权 close，除权除息直接污染动量排名与收益（高分红票每年 2~3% 假跌幅）；
-   涨停价判定仍用不复权 close（停板价按真实价格板）；
+   涨停价判定仍用不复权价（停板价按真实价格板）；
 6. reversal_lowvol 分支直接调用生产 signals.score_reversal_lowvol_xs
    （5日反转+低波+低换手 三因子截面 rank 合成）——此前回测代理只有两因子
    且用 rank pct，与生产 score 不是同一个东西，回测证伪的对象一直是错的。
 
-已知限制：回测宇宙为 daily_bar 全部票（自选池 30 只 + 中证800 回补数据，
-后者用现时点成分回溯，仍有成分变动偏差但较自选池大幅缓解）；momentum 与
-reversal_lowvol 均为样本内结果，置信度打折看（策略库 §9）。
+2026-09-19 W-D6（P0-3 选型重跑前置，全部合入后重出 backtest_result.json）：
+7.  涨停判定改 common.market.limit_price（Decimal HALF_UP 交易所口径）——
+    裸乘积约 38% 真涨停收盘漏判为"可买"（P0-3 证据链第 3 条，单独贡献约
+    +14pp 年化虚高）；market.py 红线5 同步废止；
+8.  momentum 分支改调生产 _score_momentum 同源打分面板（0.35 趋势 + 0.40
+    mom20 + 0.25 RSI14，缺因子重归一化）——此前是纯 mom20 TopN 截面，
+    "回测通过的就不是生产在跑的策略"（P0-3 证据链第 4 条）；
+9.  pass 硬性要求 universe==full（W-D6⑥）：core 宇宙 = 人工挑选池，幸存者
+    偏差全进年化，core 跑可以但 pass 字段必须 null 并注明宇宙不符；
+    main 默认 universe 由 core 改为 full（C-TEST-5：中证800/全宇宙防前视）；
+10. IVOL 面板口径与 factors.ivol 统一（P2-2：带截距 OLS + 样本矩 ddof=1 +
+    全窗 min_periods）；turn20 最小样本与生产统一（P2-3：min_periods=10）。
+
+已知限制：回测宇宙为 daily_bar 全部票（中证800 回补数据用现时点成分回溯，
+仍有成分变动偏差）；momentum 与 reversal 系均为样本内结果，置信度打折看
+（策略库 §9）；qfq 以腾讯加法型前复权为主（W-B4），低股价×大额累计分红票的
+历史段 qfq 收益被放大（源算法固有，见产出元数据 data_version 说明）。
 """
 import sys
 from pathlib import Path
@@ -39,10 +53,11 @@ import numpy as np
 import pandas as pd
 
 from common.config import load as config_load
-from common.market import limit_pct as market_limit_pct
+from common.market import limit_pct as market_limit_pct, limit_price as market_limit_price
 from data.fetcher import get_conn
 from signals.factors import atr_series
-from signals.signals import score_reversal_lowvol_xs, score_reversal_lowvol_v2_xs
+from signals.signals import (MOM_SPAN, W_MOM, W_RSI, W_TREND,
+                             score_reversal_lowvol_xs, score_reversal_lowvol_v2_xs)
 
 log = logging.getLogger("backtest")
 log.setLevel(logging.INFO)
@@ -124,9 +139,12 @@ def _metrics(nav: pd.Series) -> Tuple[float, float, float]:
 
 
 def _limit_up_price(prev_close: float, code: str) -> float:
-    # pct 走 common/market.py 唯一口径（此前内联第五处缺北交所 30% 分支）；
-    # 裸乘法保留——换 Decimal 会微变 tradable 边界（market.py 红线5）
-    return float(prev_close) * (1 + market_limit_pct(code))
+    # W-D6④（P0-3 证据链3）：改 common/market.limit_price——Decimal ROUND_HALF_UP
+    # 到分的交易所口径。裸乘积保留了一个月后实测：约 38% 真涨停收盘被漏判为
+    # "可买"（例如 prev_close=10.07 的主板票，裸乘积 11.077 < 交易所涨停价 11.08，
+    # 收盘 11.08 的真涨停被当成可买），单独贡献约 +14pp 年化虚高——market.py
+    # 红线5（"保留裸乘法"）已据此废止。
+    return market_limit_price(float(prev_close), market_limit_pct(code), up=True)
 
 
 def _per_year(nav: pd.Series) -> dict:
@@ -164,13 +182,94 @@ def _atr_pct_panel(wide: pd.DataFrame, hi_qfq: pd.DataFrame, lo_qfq: pd.DataFram
     return pd.DataFrame(out)
 
 
+def _wilder_rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
+    """factors.rsi（Wilder 平滑 + SMA 种子）的全序列复刻（W-D6⑤ 同源打分用）。
+
+    逐条语义与 factors.rsi 一致：delta=diff；种子=前 period 个 TR 的均值；
+    递推 avg=(avg*(p-1)+x)/p；恒定序列→50、仅跌→100、仅涨→0。
+    输入含 NaN 时按该票实际有行情的连续序列计算再回索引（与生产"按 bars 行
+    逐票计算"同语义——停牌日不产生跨缺口的假 delta）。长度不足 period+1 → 全 NaN。
+    """
+    vals = close.dropna()
+    out = pd.Series(np.nan, index=close.index)
+    n = len(vals)
+    if n < period + 1:
+        return out
+    a = vals.values.astype(float)
+    delta = np.diff(a)
+    gain = np.clip(delta, 0.0, None)
+    loss = -np.clip(delta, None, 0.0)
+
+    def _rsi(ag: float, al: float) -> float:
+        if ag == 0.0 and al == 0.0:
+            return 50.0
+        if al == 0.0:
+            return 100.0
+        if ag == 0.0:
+            return 0.0
+        return 100.0 - 100.0 / (1.0 + ag / al)
+
+    ag = float(gain[:period].mean())
+    al = float(loss[:period].mean())
+    rsi_vals = np.full(n, np.nan)
+    rsi_vals[period] = _rsi(ag, al)
+    for i in range(period, len(delta)):
+        ag = (ag * (period - 1) + float(gain[i])) / period
+        al = (al * (period - 1) + float(loss[i])) / period
+        rsi_vals[i + 1] = _rsi(ag, al)
+    out.loc[vals.index] = rsi_vals
+    return out
+
+
+def _momentum_score_panel(wide: pd.DataFrame) -> pd.DataFrame:
+    """生产 momentum profile 同源打分面板（W-D6⑤ / P0-3 证据链4）。
+
+    生产 _score_momentum = 0.35 趋势（ma5/20/60 三均线向：全多 1.0/全空 0.0/
+    其余 flat 0.5，仅在 ma5 可算时计入）+ 0.40 mom20 正向 clip(0.5+m/0.30)
+    + 0.25 RSI14 健康度 (1-|r-50|/50)；缺因子剔除权重重归一化，全缺 → 0.5。
+    此前回测 momentum 分支 = 纯 mom20 TopN 截面——回测通过的根本不是生产在跑
+    的策略。MA 用 rolling(min_periods=n)（= factors.ma 长度不足返回 None）；
+    mom20 分母为 0 → NaN（= factors.mom 返回 None）；RSI 用 _wilder_rsi_series。
+    """
+    ma5 = wide.rolling(5, min_periods=5).mean()
+    ma20 = wide.rolling(20, min_periods=20).mean()
+    ma60 = wide.rolling(60, min_periods=60).mean()
+    base20 = wide.shift(20)
+    mom20 = (wide / base20 - 1.0).where(base20 != 0)
+    rsi14 = wide.apply(_wilder_rsi_series, axis=0)
+
+    up = (ma5 > ma20) & (ma20 > ma60)
+    down = (ma5 < ma20) & (ma20 < ma60)
+    trend_v = pd.DataFrame(
+        np.where(up, 1.0, np.where(down, 0.0, 0.5)),
+        index=wide.index, columns=wide.columns)
+    trend_v = trend_v.where(ma5.notna())          # ma5 不可算 → 该因子缺席
+
+    w_t = trend_v.notna() * W_TREND
+    m_clip = (0.5 + mom20 / MOM_SPAN).clip(0.0, 1.0)
+    w_m = mom20.notna() * W_MOM
+    r_h = 1.0 - (rsi14 - 50.0).abs() / 50.0
+    w_r = rsi14.notna() * W_RSI
+
+    num = (trend_v.fillna(0.0) * w_t + m_clip.fillna(0.0) * w_m
+           + r_h.fillna(0.0) * w_r)
+    den = w_t + w_m + w_r
+    return (num / den.where(den > 0.0, 1.0)).where(den > 0.0, 0.5).clip(0.0, 1.0)
+
+
 def run_backtest(pool: pd.DataFrame, idx_close: pd.Series, strategy: str = "reversal_lowvol",
-                 top_n: int = TOP_N, slippage: float = SLIPPAGE) -> dict:
+                 top_n: int = TOP_N, slippage: float = SLIPPAGE,
+                 universe: str = "full") -> dict:
     """周调仓 Top-N 等权策略（含可成交口径），空仓持币合法，权重期内随价格漂移。
 
-    strategy: momentum = 20日动量 TopN（正向）；reversal_lowvol = 生产
-    reversal_lowvol score（5日反转+低波+低换手 截面合成）TopN。
-    收益与因子用前复权价（缺失回退不复权）；涨停判定用不复权价。
+    strategy: momentum = 生产 momentum profile 同源打分 TopN（W-D6⑤）；
+    reversal_lowvol = 生产 reversal_lowvol score（5日反转+低波+低换手 截面合成）
+    TopN；reversal_lowvol_v2 = 五因子截面合成 TopN。
+    收益与因子用前复权价（缺失回退不复权）；涨停判定用不复权价 + 交易所取整。
+
+    universe（W-D6⑥）："full" 才允许输出 pass 布尔值；core 等人工挑选宇宙的
+    幸存者偏差全进年化，pass 强制 null 并注明宇宙不符——core 跑可以，但结果
+    只供相对比较，不得作为选型依据。
     """
     for col in ("close_qfq", "high_qfq", "low_qfq"):   # 旧调用方可能不带复权列
         if col not in pool.columns:
@@ -202,17 +301,21 @@ def run_backtest(pool: pd.DataFrame, idx_close: pd.Series, strategy: str = "reve
     mom_win = 20 if strategy == "momentum" else 5
     mom_w = wide / wide.shift(mom_win) - 1.0
     atrp = _atr_pct_panel(wide, hi_qfq, lo_qfq, hi_raw, lo_raw)
-    turn20 = turn.rolling(TURN20_WINDOW, min_periods=10).mean()
+    # P2-3（W-D6 前置）：turn20 最小样本与生产统一——生产现要求末 20 行内
+    # ≥10 个有效换手（低于则 None 不进截面），此处 rolling min_periods=10 同语义
+    turn20 = turn.rolling(TURN20_WINDOW, min_periods=TURN20_WINDOW // 2).mean()
     is_v2 = strategy == "reversal_lowvol_v2"
     if is_v2:
         ivol_p, max5_p = _ivol_max_panels(wide, idx_close)
         ivol_p = ivol_p.reindex(wide.index)
         max5_p = max5_p.reindex(wide.index)
+    mom_score = _momentum_score_panel(wide) if strategy == "momentum" else None
 
     dates = list(wide.index)
     tmp = pd.DataFrame({"d": dates, "w": pd.PeriodIndex(dates, freq="W").astype(str)})
+    _score_probe = mom_score if strategy == "momentum" else mom_w
     rebal_dates = [d for d in tmp.groupby("w")["d"].max()
-                   if bool(mom_w.loc[d].notna().any())]
+                   if bool(_score_probe.loc[d].notna().any())]
 
     def tradable(d, code) -> bool:
         """可成交口径：未停牌超限、成交额达地板、未封死涨停。"""
@@ -248,8 +351,10 @@ def run_backtest(pool: pd.DataFrame, idx_close: pd.Series, strategy: str = "reve
             w = {c: wi * (1.0 + _safe(rets, d, c)) / (1.0 + r) for c, wi in w.items()}
         if d in rebal_dates:
             if strategy == "momentum":
-                m = mom_w.loc[d].dropna()
-                ranked = m[m > 0.0].sort_values(ascending=False)
+                # W-D6⑤（P0-3 证据链4）：生产 momentum 同源打分 TopN——
+                # 此前为纯 mom20 TopN 截面（回测通过的就不是生产在跑的策略）
+                m = mom_score.loc[d].dropna()
+                ranked = m.sort_values(ascending=False)
             elif is_v2:
                 # 生产同源：v2 五因子截面合成（signals.score_reversal_lowvol_v2_xs）
                 score, _parts = score_reversal_lowvol_v2_xs(
@@ -283,12 +388,25 @@ def run_backtest(pool: pd.DataFrame, idx_close: pd.Series, strategy: str = "reve
         final = {"as_of": str(nav.index[-1]), "codes": [], "weights": {},
                  "cash_weight": 1.0}
 
+    # W-D6⑥（P0-3②）：pass 硬性要求 universe==full。core = 人工挑选池，
+    # 51 只 2026 年人工挑的概念票回溯交易 2024-2025，幸存者偏差全进年化——
+    # core 宇宙产物不得再给出 pass 布尔值（强制 null + 注明宇宙不符）。
+    calmar_ok = bool(st_mdd != 0.0 and (st_ann / abs(st_mdd)) > 0.5)
+    beat_ok = bool(st_ann > b_ann)
+    universe_ok = (universe == "full")
+    pass_val: object = bool(calmar_ok and beat_ok) if universe_ok else None
+
     return {
         "strategy": strategy,
-        "params": {"top_n": top_n, "cost_model": "commission 0.025%% + stamp 0.05%%(sell)"
-                                                   " + slippage %.0fbps" % (slippage * 1e4),
+        "universe": universe,
+        "params": {"top_n": top_n,
+                   # P2-8：f-string 直书——% 格式化串里 "0.05%(sell)" 会被解析成
+                   # mapping 键（原代码被迫用 %% 转义，字面歧义即审查所指残留）
+                   "cost_model": f"commission 0.025% + stamp 0.05%(sell)"
+                                 f" + slippage {slippage * 1e4:.0f}bps",
                    "amount_floor": AMOUNT_FLOOR, "max_stale_days": MAX_STALE_DAYS,
-                   "tradable_filter": True, "price_basis": "qfq_pref"},
+                   "tradable_filter": True, "price_basis": "qfq_pref",
+                   "limit_rounding": "exchange"},
         "window": {"start": str(nav.index[0]), "end": str(nav.index[-1]),
                    "trading_days": int(len(nav) - 1)},
         "strategy_perf": {"total_return": round(st_total, 4),
@@ -309,13 +427,19 @@ def run_backtest(pool: pd.DataFrame, idx_close: pd.Series, strategy: str = "reve
         # 2) 年化 > 基准（绝对超额为正）
         # 例外：阈值 0.5 与模拟盘现实仓位约束匹配
         # （组合风控本身仍有单票20%/总仓80%/kill -8% 等硬规则保底）
-        "pass": bool((st_mdd != 0.0 and (st_ann / abs(st_mdd)) > 0.5)
-                     and st_ann > b_ann),
+        "pass": pass_val,
         "pass_criteria": {
             "version": "v2-calmar",
             "min_calmar": 0.5,
             "require_benchmark_beat": True,
-            "note": "v1 单阈值 pass 偏严（两个 profile 全不通过），改双判据"
+            "calmar_ok": calmar_ok,
+            "benchmark_beat": beat_ok,
+            "universe": universe,
+            "universe_ok": universe_ok,
+            "note": ("v1 单阈值 pass 偏严（两个 profile 全不通过），改双判据"
+                     if universe_ok else
+                     "宇宙不符（core=人工挑选池，幸存者偏差）——pass 强制 null，"
+                     "结果仅供相对比较，不得作为选型依据（W-D6⑥/P0-3②）"),
         },
     }
 
@@ -328,20 +452,22 @@ def _safe(rets: pd.DataFrame, d, c) -> float:
 
 def _ivol_max_panels(wide: pd.DataFrame, idx_close: pd.Series,
                      window: int = 20, top_k: int = 5) -> tuple:
-    """Fix-5：v2 因子面板（与 factors.ivol / factors.max_ret_bali 同口径的面板化）。
+    """Fix-5：v2 因子面板——口径以 factors.ivol / factors.max_ret_bali 为唯一基准
+    （P2-2，W-D6 前置）。
 
-    - ivol：个股日收益对 HS300 日收益滚动 window 日一元回归残差 σ
-      （含截距口径：resid_var = var_i − β²·var_m，与 Fix-6 intercept 版一致）；
-    - max5：滚动 window 日收益 top_k 均值（Bali MAX）。
+    - ivol：个股日收益对 HS300 日收益滚动 window 日 OLS 回归（**带截距**）的
+      残差 σ。与 factors.ivol 逐点一致：β=cov/var、resid_var=var_i−β²·var_m
+      的恒等式只在 cov/var 同为**样本矩（ddof=1）**时成立——此前 cov 走滚动均值
+      （÷n 总体矩）、var 走 pandas 默认（÷n−1），混合矩使 β 与残差系统性偏差；
+      且 min_periods=window//2 短于生产全窗要求（factors.ivol 任一序列
+      < window+1 个点返回 None），现统一 min_periods=window；
+    - max5：滚动 window 日收益 top_k 均值（Bali MAX），min_periods 同步收紧到全窗。
     """
     rets = wide.pct_change(fill_method=None)
     bench = idx_close.reindex(wide.index).pct_change(fill_method=None)
-    mean_r = rets.rolling(window, min_periods=window // 2).mean()
-    mean_m = bench.rolling(window, min_periods=window // 2).mean()
-    cov = (rets.mul(bench, axis=0)).rolling(window, min_periods=window // 2).mean() \
-        - mean_r.mul(mean_m, axis=0)
-    var_m = bench.rolling(window, min_periods=window // 2).var()
-    var_i = rets.rolling(window, min_periods=window // 2).var()
+    cov = rets.rolling(window, min_periods=window).cov(bench)      # 样本协方差 ddof=1
+    var_m = bench.rolling(window, min_periods=window).var()        # ddof=1
+    var_i = rets.rolling(window, min_periods=window).var()         # ddof=1
     beta = cov.div(var_m, axis=0)
     resid_var = (var_i - beta * beta.mul(var_m, axis=0)).clip(lower=0.0)
     ivol = np.sqrt(resid_var)
@@ -349,19 +475,19 @@ def _ivol_max_panels(wide: pd.DataFrame, idx_close: pd.Series,
     def _topk_mean(x):
         return float(np.sort(x[np.isfinite(x)])[-top_k:].mean())
 
-    max5 = rets.rolling(window, min_periods=window // 2).apply(_topk_mean, raw=True)
+    max5 = rets.rolling(window, min_periods=window).apply(_topk_mean, raw=True)
     return ivol, max5
 
 
 def main():
     conn = get_conn()
     ensure_benchmark(conn)
-    # 2026-09-13 错配修复：默认 universe 走 config.watchlist_core（策略真实会下
-    # 单的池子），老 config（无 watchlist_core）退回 watchlist 全表。再添
-    # 开关 --universe=full 走全 daily_bar 保留全市场 sanity check 能力。
+    # W-D6⑥（P0-3②/C-TEST-5）：默认 universe 改为 full——中证800 回补/全库宇宙
+    # 防前视；core（config.watchlist_core 人工挑选池）只作相对比较跑，pass 恒
+    # null。--universe=core 保留（选型相对对照用，产物自带宇宙不符标注）。
     import argparse as _ap
     _ap_inst = _ap.ArgumentParser(add_help=False)
-    _ap_inst.add_argument("--universe", choices=("core", "full"), default="core")
+    _ap_inst.add_argument("--universe", choices=("core", "full"), default="full")
     _args, _ = _ap_inst.parse_known_args()
     from common.config import core_codes as _core_codes  # 单一事实源（common.config）
     if _args.universe == "core":
@@ -392,26 +518,53 @@ def main():
         pool[col] = pd.to_numeric(pool[col], errors="coerce")
     idx_close = idx.set_index("trade_date")["close"].astype(float)
 
-    results = {"generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-               "universe": {"mode": _args.universe, "codes": int(n_universe), "codes_with_qfq": int(n_qfq), "desc": "core=config.watchlist_core（策略可交易池；watchlist_extended 仅观察）/ full=daily_bar 全库（sanity check）"},
+    results_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    results = {"generated_at": results_ts,
+               "universe": {"mode": _args.universe, "codes": int(n_universe), "codes_with_qfq": int(n_qfq), "desc": "full=daily_bar 全库（中证800 回补，选型唯一合法宇宙，C-TEST-5）/ core=config.watchlist_core 人工挑选池（幸存者偏差，pass 恒 null 仅供相对比较）"},
+               "metadata": {
+                   # W-D6⑦/W-C3：选型产物的元数据契约——universe/window/
+                   # generated_at/data_version/limit_rounding 齐备；红线事件与
+                   # bundle 引用回测数字必须带这里的版本信息（P1-25）。
+                   "universe": {"mode": _args.universe, "codes": int(n_universe),
+                                "codes_with_qfq": int(n_qfq)},
+                   "generated_at": results_ts,
+                   "data_version": (
+                       "daily_bar 截至运行时最新交易日；close_qfq 以腾讯加法型前复权为主"
+                       "（W-B4 全量重刷时 em 日线端点已宕 3 天，483 票重刷 473 票用 tx_qfq）。"
+                       "源算法固有风险（非管道缺陷）：低股价×大额累计分红票的历史段 qfq 收益"
+                       "被放大，如 600096 2024-01 raw -5.5% vs qfq -7.28%——跨源/跨期读数须知"),
+                   "limit_rounding": "exchange",
+                   "limit_price_impl": "common.market.limit_price（Decimal HALF_UP 到分，交易所口径；W-D6④）",
+                   "momentum_scoring": "生产 signals._score_momentum 同源（0.35 趋势+0.40 mom20+0.25 RSI14，W-D6⑤）",
+                   "ivol_basis": "factors.ivol 同口径（带截距 OLS + 样本矩 ddof=1 + 全窗，P2-2）",
+                   "turn20_min_periods": TURN20_WINDOW // 2,
+               },
 "profiles": {}, "notes": [
-                   "回测宇宙默认 config.watchlist_core（策略真实会下单的池子，2026-09-13 错配修复）；"
-                   "该池为人工挑选→存在幸存者偏差，回测仅作流程验证与相对比较，不作选型唯一依据。--universe=full 可跑 daily_bar 全库作 sanity check",
-                   "收益/动量/波动用前复权价（缺失回退不复权）；涨停判定用不复权价",
-                   "momentum 与 reversal_lowvol 均为样本内结果，置信度打折看（策略库 §9）",
+                   "pass 硬性要求 universe==full（W-D6⑥/P0-3②）：core 宇宙产物 pass=null+宇宙不符标注，仅供相对比较",
+                   "收益/动量/波动用前复权价（缺失回退不复权）；涨停判定用不复权价+交易所 HALF_UP 取整（W-D6④）",
+                   "momentum 与 reversal 系均为样本内结果，置信度打折看（策略库 §9）",
                    "pass 判据 v2-calmar（2026-09-17）：年化/|MDD| > 0.5 且 年化 > 基准；"
                    "v1 单阈值 MDD>-25% 偏严，两个 profile 全不通过"]}
     for strat in ("momentum", "reversal_lowvol", "reversal_lowvol_v2"):
-        r = run_backtest(pool, idx_close, strategy=strat)
+        r = run_backtest(pool, idx_close, strategy=strat, universe=_args.universe)
         results["profiles"][strat] = r
         log.info("回测 %s: ann=%.2f%% mdd=%.2f%% pass=%s",
                  strat, r["strategy_perf"]["annual_return"] * 100,
                  r["strategy_perf"]["max_drawdown"] * 100, r["pass"])
+    # 元数据 window：三 profile 共用同一池窗口，取首个结果的实际区间
+    _first = next(iter(results["profiles"].values()))
+    results["metadata"]["window"] = {"start": _first["window"]["start"],
+                                     "end": _first["window"]["end"],
+                                     "trading_days": _first["window"]["trading_days"]}
+    results["generated_at"] = results_ts
+    # 顶层平铺一份 data_version（profile_verdict/bundle 等消费方兼容两种形态）
+    results["data_version"] = results["metadata"]["data_version"]
     # 滑点敏感性（生产默认 profile ±50%）
     base = results["profiles"]["reversal_lowvol"]
     sens = {}
     for s in (SLIPPAGE * 0.5, SLIPPAGE, SLIPPAGE * 1.5):
-        r = run_backtest(pool, idx_close, strategy="reversal_lowvol", slippage=s)
+        r = run_backtest(pool, idx_close, strategy="reversal_lowvol", slippage=s,
+                         universe=_args.universe)
         sens["%.0fbps" % (s * 1e4)] = r["strategy_perf"]["annual_return"]
     base["slippage_sensitivity_annual"] = sens
 

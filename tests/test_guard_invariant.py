@@ -3,9 +3,10 @@ trade 表唯一成交入口」从约定固化为静态 AST 测试。
 
 不变量（CONSTRAINTS.md §3.1）：所有成交必须经 runner 的风控链——生产代码中
 `.buy(conn, ...)` / `.sell(conn, ...)` 调用点只允许两处：
-- execution/runner.py::_execute  （confirm 闸门之后：buy+sell）
-- execution/runner.py::_do_kill  （规则5 授权的唯一无 confirm 清仓卖出，仅 sell；
-  豁免依据 = CONSTRAINTS §3.3 优先级链「kill（强平）」最高级）
+- execution/runner.py::_execute       （confirm 闸门之后：buy+sell）
+- execution/runner.py::_do_kill_locked（规则5 授权的唯一无 confirm 清仓卖出，仅
+  sell；豁免依据 = CONSTRAINTS §3.3 优先级链「kill（强平）」最高级；W-D7/P2-21
+  锁下沉自 _do_kill 改名，外层 _do_kill 只负责可重入执行锁）
 
 扫描口径：AST 遍历全部 *.py，收集 `Call(func=Attribute(attr in ("buy","sell")))`
 且**第一个位置实参名为 conn** 的节点 → (相对路径, 所在函数名)。
@@ -30,9 +31,11 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
 
 # 生产代码允许的成交调用点（文件为 posix 相对路径，函数为所在 def 名）
+# _do_kill → _do_kill_locked：Sprint4 W-D7/P2-21 锁下沉改名（同一 kill 路径——
+# 外层 _do_kill 只加可重入执行锁，成交调用留在 _locked 实现内）
 ALLOWED_POINTS = {
     ("execution/runner.py", "_execute"),
-    ("execution/runner.py", "_do_kill"),
+    ("execution/runner.py", "_do_kill_locked"),
 }
 
 # 不扫描的目录（运行时产物/第三方/本地工具区）

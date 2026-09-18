@@ -16,14 +16,21 @@ log = logging.getLogger("calendar")
 
 
 def ensure_calendar(conn: sqlite3.Connection, horizon_days: int = 200) -> int:
-    """拉取并缓存交易日历，返回日历总行数；已有覆盖到今年年底的数据则跳过。
+    """拉取并缓存交易日历，返回日历总行数；已覆盖到今年年底则跳过。
+
+    W-D7（P2-12）：跳过判据从"覆盖 today+horizon_days 天"改为"覆盖到今年
+    12-31 即跳过、跨年强制刷新一次"——新浪源固定只提供到当年年底，旧判据
+    （要求覆盖到明年 4 月）永不满足，导致每次调用都全量重拉（8797 行
+    INSERT OR IGNORE 白跑）；且源耗尽后静默退化 weekday 判断（节假日照跑）。
+    跨年后 have（去年 12-31）< 新一年年底 → 自然触发一次刷新。
+    horizon_days 参数保留兼容旧签名，新判据下不再使用。
 
     best-effort：网络失败返回当前行数（可能为 0，调用方退化为 weekday 判断）。
     """
     try:
         have = conn.execute("SELECT MAX(date) FROM trade_calendar").fetchone()[0]
-        need_until = (date.today() + timedelta(days=horizon_days)).strftime("%Y-%m-%d")
-        if have and str(have) >= need_until:
+        year_end = "%d-12-31" % date.today().year
+        if have and str(have) >= year_end:
             return conn.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0]
         df = _fetch()
         if df is None or df.empty:
