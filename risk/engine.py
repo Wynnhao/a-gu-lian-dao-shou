@@ -49,6 +49,9 @@ class RiskContext:
     atr_pct: Dict[str, float] = field(default_factory=dict)  # {code: ATR占比}（ATR 自适应止损）
     # ---- Sprint 1 任务 4：实时行情扩展（规则 21 条件② 死封判定） ----
     live_quotes: Dict[str, dict] = field(default_factory=dict)  # {code: quote_dict 含 ask1_vol/float_mv}
+    # ---- C-ARC-4（T2）：build_context 内 fail-open 的留痕便签 ----
+    # 只追加、不参与裁决；调用方在 flush_events 时转成 failopen_regime_cap 事件落库。
+    ctx_notes: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -637,8 +640,16 @@ def rule_factor_crowding(decision: dict, ctx: RiskContext, cfg: dict,
     try:
         from signals.signals import read_factor_crowding
         fc = read_factor_crowding()
-    except Exception:
-        return  # 读取失败视为未触发（fail-open）
+    except Exception as e:  # noqa: BLE001
+        # C-ARC-4（T2）：fail-open 也要留痕（此前仅静默放行，拥挤熔断失效无迹可查）。
+        # detail 必须以 once_today_prefix 开头（ADR-0 §3），否则去重永不命中会刷表。
+        v.events.append({
+            "rule": "failopen_factor_crowding",
+            "detail": "failopen_factor_crowding: 规则20 拥挤度读取失败，fail-open 放行 %s"
+                      % repr(e)[:120],
+            "once_today_prefix": "failopen_factor_crowding",
+        })
+        return
     if not fc.get("crowded"):
         return
     tw = decision.get("target_weight")
@@ -781,13 +792,24 @@ def record_event(conn: sqlite3.Connection, rule: str, detail: str,
 
 
 def flush_events(conn: sqlite3.Connection, v: Verdict,
-                 decision_id: Optional[int] = None) -> None:
+                 decision_id: Optional[int] = None,
+                 warn_prefix: Optional[str] = None) -> None:
     """把 check() 挂到 Verdict 上的 risk_event 写库（P0-4：engine 不再 get_conn 直写）。
 
     once_today_prefix 非空的事件按 rule+当日+detail 前缀去重（同票同日只留一条，
     规则21 反复 check 不再刷屏——此前无去重直写积累了大量重复行）。
+
+    warn_prefix（C-ARC-4，T2）：非 None 时把 v.warnings 逐条转成 rule='warn' 事件
+    落库，detail='<warn_prefix> <原文>'、once_today_prefix='<warn_prefix> '——
+    复用同一去重三元组，worst case ≤1 行/票/日（调用方传决策 code）。
+    detail 必须以前缀开头，否则 LIKE 永不命中、结构性 warning 会涓流刷表（ADR-0 §3）。
     """
-    for ev in v.events:
+    events = list(v.events)
+    if warn_prefix:
+        events = events + [{"rule": "warn", "detail": "%s %s" % (warn_prefix, w),
+                            "once_today_prefix": "%s " % warn_prefix}
+                           for w in (v.warnings or [])]
+    for ev in events:
         try:
             prefix = ev.get("once_today_prefix")
             if prefix:

@@ -235,6 +235,7 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
     # 两者 fail-open：计算失败不阻断交易，engine 退回静态上限/固定止损线。
     position_cap: Optional[float] = None
     atr_pct: Dict[str, float] = {}
+    ctx_notes: List[str] = []
     try:
         from risk import regime as _regime
         cap_info = _regime.position_cap(conn, CFG)
@@ -242,7 +243,11 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
         if positions:
             atr_pct = _regime.latest_atr_pct(conn, positions.keys())
     except Exception as e:  # noqa: BLE001
-        log.warning("regime/vol cap 计算失败（fail-open，无动态闸）: %s", repr(e)[:120])
+        # C-ARC-4（T2）：fail-open 照旧不阻断，但留痕便签挂 ctx——由 propose/confirm
+        # 在 flush_events 时转成 failopen_regime_cap 事件落库（此前完全无迹可查）
+        note = "regime/vol cap 计算失败，fail-open 无动态闸: %s" % repr(e)[:120]
+        log.warning("%s", note)
+        ctx_notes.append(note)
 
     return RiskContext(
         now=now,
@@ -263,6 +268,7 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
         watchlist_codes=wl_codes,
         position_cap=position_cap,
         atr_pct=atr_pct,
+        ctx_notes=ctx_notes,
     )
 
 
@@ -426,6 +432,7 @@ def _do_kill(conn: sqlite3.Connection, v: Verdict, decision_id: Optional[int],
           % (len(v.kill_orders),
              v.kill_until.strftime("%Y-%m-%d %H:%M") if v.kill_until else "-"))
     deferred = list(v.kill_pending or [])
+    trade_ids: List[int] = []
     for ko in v.kill_orders:
         res = broker.sell(conn, str(ko["code"]), str(ko.get("name") or ko["code"]),
                           float(ko.get("price") or 0), int(ko.get("shares") or 0),
@@ -437,6 +444,7 @@ def _do_kill(conn: sqlite3.Connection, v: Verdict, decision_id: Optional[int],
             print("[KILL] 清仓失败：%s" % msg)
             deferred.append(str(ko["code"]))
             continue
+        trade_ids.append(int(res["trade_id"]))
         rb = broker.readback(conn, res["trade_id"])
         print("[KILL] 已清仓 %s %s x%d @%.2f 金额=%.2f 回读ok=%s"
               % (res["code"], res["name"], res["shares"], res["price"],
@@ -451,6 +459,13 @@ def _do_kill(conn: sqlite3.Connection, v: Verdict, decision_id: Optional[int],
                                 ensure_ascii=False),
                      decision_id)
         print("[KILL] %s T+1/失败递延，已列入次日补清算（%d 股）" % (code, pos[1]))
+    # C-ARC-4（T2）：kill 执行汇总留痕（一条；逐笔与 trade 表 100% 冗余——
+    # trade 行天然带 decision_id + confirmed_by='kill_switch'，ADR-0 §2）
+    record_event(conn, "kill_executed",
+                 json.dumps({"sells": len(trade_ids), "trade_ids": trade_ids,
+                             "deferred": len(dict.fromkeys(deferred))},
+                            ensure_ascii=False),
+                 decision_id)
     apply_kill_switch(conn, v.kill_until, note="decision#%s 触发" % decision_id)
     write_kill_state(v.kill_until, "decision#%s 触发" % decision_id)
     notify("⚠️ KILL SWITCH 触发", "回撤熔断：清仓 %d 笔，停机至 %s%s"
@@ -529,6 +544,15 @@ def _print_verdict(v: Verdict) -> None:
         print("[risk]   [警告] %s" % w)
 
 
+def _ctx_failopen_events(ctx: RiskContext) -> List[dict]:
+    """build_context 的 fail-open 便签 → 待落库事件（C-ARC-4/T2）。
+    detail 必须以 once_today_prefix 开头（ADR-0 §3），once_today 去重才命中。"""
+    return [{"rule": "failopen_regime_cap",
+             "detail": "failopen_regime_cap: %s" % note,
+             "once_today_prefix": "failopen_regime_cap"}
+            for note in (getattr(ctx, "ctx_notes", None) or [])]
+
+
 def _dedupe_check(conn: sqlite3.Connection, decision: dict, run_date: str) -> bool:
     """propose --file 重跑幂等：同 run_date 同 code+action 且订单参数一致、
     状态未被否决的决策已存在 → 跳过（此前 catchup/人工重跑会重复入库并重复 propose）。"""
@@ -583,7 +607,10 @@ def propose(conn: sqlite3.Connection, decision: dict, decision_id: Optional[int]
     _print_verdict(v)
     for x in v.violations:
         record_event(conn, "risk_check", x, decision_id)
-    flush_events(conn, v, decision_id)   # P0-4：规则21/因子拥挤事件由调用方落库
+    v.events.extend(_ctx_failopen_events(ctx))
+    # P0-4：规则21/因子拥挤事件由调用方落库；C-ARC-4：warnings 以 code 前缀同日落库
+    flush_events(conn, v, decision_id,
+                 warn_prefix=str(decision.get("code") or ""))
 
     if v.kill_trigger:
         _do_kill(conn, v, decision_id, now)
@@ -735,7 +762,11 @@ def confirm(conn: sqlite3.Connection, decision_id: int, confirmed_by: str = "hum
     for x in v.violations:
         print("[risk]   [违规] %s" % x)
         record_event(conn, "risk_check_reconfirm", x, decision_id)
-    flush_events(conn, v, decision_id)   # P0-4：confirm 复跑同样接管事件落库
+    for w in v.warnings:                    # C-ARC-4：confirm 此前连 warnings 都不打印
+        print("[risk]   [警告] %s" % w)
+    v.events.extend(_ctx_failopen_events(ctx))
+    flush_events(conn, v, decision_id,      # P0-4 + C-ARC-4（同 propose）
+                 warn_prefix=str(decision.get("code") or ""))
     if v.kill_trigger:
         _do_kill(conn, v, decision_id, now)
         _set_status(conn, decision_id, "rejected")

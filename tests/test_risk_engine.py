@@ -19,7 +19,7 @@ os.environ.setdefault("AGSICKLE_SIGNAL_EVAL_DIR",
                       tempfile.mkdtemp(prefix="agsickle_re_se_"))
 
 from risk.engine import (RiskContext, Verdict, check, record_event, apply_kill_switch,
-                         limit_pct, in_trading_session)
+                         flush_events, limit_pct, in_trading_session)
 
 # 与 config.json risk 段一致的纯内存配置（不读真实文件/数据库）
 CFG = {
@@ -756,6 +756,52 @@ def test_blacklist_earnings_negative_net_blocks():
         assert bl2["600002"][0] is True
     finally:
         conn.close()
+
+
+# ---------------- C-ARC-4（T2）：warn/failopen 留痕 ----------------
+
+def test_flush_events_warn_prefix_dedupe():
+    """warn_prefix：warnings 以 rule='warn'、detail='<code> <原文>' 落库；
+    同票同日去重 ≤1 行；不同票各得一行（ADR-0 §2/§3 契约）。"""
+    conn = _mem_conn()
+    v = Verdict(approved=True, warnings=["手数规整：150 → 100 股（100 的整数倍）"])
+    flush_events(conn, v, decision_id=1, warn_prefix="600519")
+    rows = conn.execute("SELECT detail FROM risk_event WHERE rule='warn'").fetchall()
+    assert len(rows) == 1 and rows[0][0].startswith("600519 "), rows
+    # 同票同日第二次 flush：去重不刷行
+    flush_events(conn, Verdict(approved=True, warnings=["另一条警告"]), 1,
+                 warn_prefix="600519")
+    assert conn.execute("SELECT COUNT(*) FROM risk_event WHERE rule='warn'"
+                        ).fetchone()[0] == 1
+    # 不同票：各得一行（前缀隔离）
+    flush_events(conn, Verdict(approved=True, warnings=["缺昨收价，跳过校验"]), 2,
+                 warn_prefix="000001")
+    codes = {r[0].split(" ", 1)[0] for r in conn.execute(
+        "SELECT detail FROM risk_event WHERE rule='warn'").fetchall()}
+    assert codes == {"600519", "000001"}
+
+
+def test_failopen_factor_crowding_event():
+    """规则20 拥挤度读取失败 → fail-open 放行 + failopen_factor_crowding 事件挂
+    v.events（调用方 flush 落库），detail 以 once_today_prefix 开头（去重可命中）。"""
+    import signals.signals as _ss
+    orig = _ss.read_factor_crowding
+    def _boom():
+        raise RuntimeError("json decode fail")
+    _ss.read_factor_crowding = _boom
+    try:
+        v = check(mk_dec("buy", "600519", 1500.0, 100), mk_ctx(), CFG)
+    finally:
+        _ss.read_factor_crowding = orig
+    assert v.approved, v.violations           # fail-open：读取失败不挡正常买入
+    ev = [e for e in v.events if e["rule"] == "failopen_factor_crowding"]
+    assert len(ev) == 1, v.events
+    assert ev[0]["detail"].startswith(ev[0]["once_today_prefix"])
+    # 落库端到端：flush 后 risk_event 可查
+    conn = _mem_conn()
+    flush_events(conn, v, decision_id=9)
+    assert conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
+                        " rule='failopen_factor_crowding'").fetchone()[0] == 1
 
 
 # ---------------- 直接运行入口 ----------------

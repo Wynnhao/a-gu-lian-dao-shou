@@ -789,6 +789,79 @@ def test_slippage_and_limit_halt_sim():
             os.environ["AGSICKLE_DISABLE_SLIPPAGE"] = old
 
 
+# ---------------- C-ARC-4（T2）：warn/failopen/kill_executed 留痕 ----------------
+
+def test_kill_executed_summary_event():
+    """kill 清仓后落一条 kill_executed 汇总（卖出笔数/trade_ids/递延笔数）。"""
+    conn = fresh_conn()
+    seed_market(conn, prices={"600519": (1290.0, 1280.0), "000001": (11.0, 10.9)})
+    conn.execute("INSERT INTO position VALUES ('600519','贵州茅台',1000,1000,1300.0,?)",
+                 (datetime.now().isoformat(timespec="seconds"),))
+    conn.execute("INSERT INTO portfolio_state VALUES (?,?,?,?,?,?,?)",
+                 (YDAY, 0.0, 0.0, 2500000.0, 0.0, 0, "seed peak"))
+    conn.commit()
+    orders = Path(_tmp_dir())
+    try:
+        hold = {"action": "hold", "code": "600519", "target_weight": 0.0,
+                "confidence": 0.9, "reasons": ["r1", "r2"], "risk_notes": []}
+        v = runner.propose(conn, hold, now=NOW10, orders_dir=orders)
+        assert v.kill_trigger
+        rows = conn.execute("SELECT detail, decision_id FROM risk_event WHERE"
+                            " rule='kill_executed'").fetchall()
+        assert len(rows) == 1, rows
+        info = json.loads(rows[0][0])
+        assert info["sells"] == 1 and info["deferred"] == 0
+        assert len(info["trade_ids"]) == 1
+        assert rows[0][1] == 1                      # 归因到触发 kill 的决策
+    finally:
+        if runner.KILL_STATE_FILE.exists():
+            runner.KILL_STATE_FILE.unlink()
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_regime_failopen_and_warn_events_propose_confirm():
+    """propose/confirm 的 warnings 以 rule='warn'、code 前缀落库且跨阶段去重；
+    build_context regime fail-open 经 ctx_notes 转成 failopen_regime_cap 事件；
+    confirm 打印 warnings（此前只打 violations）。"""
+    import io
+    import contextlib
+    from risk import regime as _regime
+
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    orig_cap = _regime.position_cap
+
+    def _boom(conn_, cfg_):
+        raise RuntimeError("rsrs 数据缺失")
+    _regime.position_cap = _boom
+    try:
+        d = mk_decision("buy", "600519", 1500.0, 150)   # 150 股 → 手数规整 warning
+        v = runner.propose(conn, d, now=NOW10, orders_dir=orders)
+        assert v.approved and v.warnings, (v.brief(), v.warnings)
+        warn_rows = conn.execute("SELECT detail FROM risk_event WHERE rule='warn'"
+                                 ).fetchall()
+        assert len(warn_rows) == 1 and warn_rows[0][0].startswith("600519 "), warn_rows
+        assert conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
+                            " rule='failopen_regime_cap'").fetchone()[0] == 1
+
+        # confirm：重跑风控再次产生同一 warning → 去重不刷行；stdout 必须打印 [警告]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            res = runner.confirm(conn, 1, confirmed_by="测试", now=NOW10,
+                                 orders_dir=orders)
+        assert res is not None and res["ok"]
+        assert "[警告]" in out.getvalue(), out.getvalue()[-500:]
+        assert conn.execute("SELECT COUNT(*) FROM risk_event WHERE rule='warn'"
+                            ).fetchone()[0] == 1
+        # confirm 阶段 failopen 事件去重（同日同名前缀只一条）
+        assert conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
+                            " rule='failopen_regime_cap'").fetchone()[0] == 1
+    finally:
+        _regime.position_cap = orig_cap
+        shutil.rmtree(orders, ignore_errors=True)
+
+
 # ---------------- 直接运行入口 ----------------
 
 if __name__ == "__main__":
