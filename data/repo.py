@@ -314,3 +314,16 @@ def trade_by_decisions(conn: sqlite3.Connection,
             out[did] = {k: r[k] for k in ("id", "side", "price", "shares", "amount",
                                           "status", "confirmed_by")}
     return out
+
+
+# ---------------------------------------------------------------- minute_snapshot 域（C-ARC-3b/T7，只读）
+
+def get_minute_series(conn: sqlite3.Connection, code: str, date_str: str) -> List[tuple]:
+    """单票单日分钟快照序列 [(ts, price, volume, amount, source)]，ts 升序
+    （盘中时点回放读取接口：止损触线时点、尾盘决策、limit_halt 应急的回放/回测消费）。
+
+    空 list = 该票该日无录制数据（录制器未上线前的日期一律如此，调用方自行回退日线）。
+    """
+    return [tuple(r) for r in conn.execute(
+        "SELECT ts, price, volume, amount, source FROM minute_snapshot "
+        "WHERE code=? AND ts LIKE ? ORDER BY ts", (str(code), date_str + "%"))]

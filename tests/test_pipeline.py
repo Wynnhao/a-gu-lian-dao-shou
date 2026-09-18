@@ -510,6 +510,63 @@ def test_recorder_wal_concurrent_writer():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_weekly_cleanup_and_minute_series_roundtrip():
+    """T7：清理边界（minute_snapshot 留 2 年 / jsonl 留 90 天，边界日不删）+
+    repo.get_minute_series 单票单日回放 round-trip。"""
+    from data import repo
+    import pipeline.postclose as postclose
+
+    conn = fresh_conn()
+    seed_market(conn)
+    now = datetime(2026, 9, 18, 16, 0, 0)
+    # cutoff = now-730d = 2024-09-18T16:00:00；三段数据：远于 2 年（删）、
+    # 边界内一天（留）、当日（留）
+    conn.execute("INSERT INTO minute_snapshot VALUES (?,?,?,?,?,?)",
+                 ("600519", "2024-08-01T10:00:00", 1500.0, None, None, "t"))
+    conn.execute("INSERT INTO minute_snapshot VALUES (?,?,?,?,?,?)",
+                 ("600519", "2024-09-19T10:00:00", 1500.0, None, None, "t"))
+    conn.execute("INSERT INTO minute_snapshot VALUES (?,?,?,?,?,?)",
+                 ("600519", "2026-09-18T10:00:00", 1500.0, 100000.0, 1.5e9, "t"))
+    conn.execute("INSERT INTO minute_snapshot VALUES (?,?,?,?,?,?)",
+                 ("000001", "2026-09-18T10:05:00", 11.0, 200000.0, 2.2e9, "t"))
+    conn.commit()
+
+    # jsonl 清理沙箱：一个 100 天前（删）、一个 10 天前（留）
+    qdir = Path(tempfile.mkdtemp(prefix="agsickle_quotes_t7_"))
+    old_q = os.environ.get("AGSICKLE_QUOTES_DIR")
+    os.environ["AGSICKLE_QUOTES_DIR"] = str(qdir)
+    try:
+        old_f, new_f = qdir / "2026-06-10.jsonl", qdir / "2026-09-08.jsonl"
+        old_f.write_text("{}\n", encoding="utf-8")
+        new_f.write_text("{}\n", encoding="utf-8")
+        old_ts = (now - timedelta(days=100)).timestamp()
+        new_ts = (now - timedelta(days=10)).timestamp()
+        os.utime(old_f, (old_ts, old_ts))
+        os.utime(new_f, (new_ts, new_ts))
+
+        r = postclose._weekly_cleanup(conn, now=now)
+        assert r == {"minute_rows": 1, "jsonl_files": 1}, r
+        assert not old_f.is_file() and new_f.is_file()
+        # 2024-08-01（< cutoff 2024-09-18T16:00）已删；2024-09-19（边界内）保留
+        left = {tuple(row) for row in conn.execute(
+            "SELECT code, ts FROM minute_snapshot").fetchall()}
+        assert ("600519", "2024-08-01T10:00:00") not in left
+        assert ("600519", "2024-09-19T10:00:00") in left
+
+        # 回放接口：单票单日、ts 升序、字段完整；他票他日不串
+        series = repo.get_minute_series(conn, "600519", "2026-09-18")
+        assert series == [("2026-09-18T10:00:00", 1500.0, 100000.0, 1.5e9, "t")]
+        assert repo.get_minute_series(conn, "600519", "2026-09-19") == []
+        assert len(repo.get_minute_series(conn, "000001", "2026-09-18")) == 1
+    finally:
+        if old_q is None:
+            os.environ.pop("AGSICKLE_QUOTES_DIR", None)
+        else:
+            os.environ["AGSICKLE_QUOTES_DIR"] = old_q
+        shutil.rmtree(qdir, ignore_errors=True)
+        conn.close()
+
+
 # ----------------------- 直接运行入口 -----------------------
 
 if __name__ == "__main__":

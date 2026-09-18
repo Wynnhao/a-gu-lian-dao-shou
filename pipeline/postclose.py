@@ -10,7 +10,7 @@ import fcntl
 import logging
 import logging.handlers
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from data import fetcher
@@ -36,6 +36,34 @@ REPORTS_DIR = Path(os.environ.get("AGSICKLE_REPORTS_DIR") or (BASE / "logs" / "r
 # 单实例锁：catchup 步骤4 调起 postclose 子进程，与 15:30 cron 同时触发时只允许一份跑。
 # POSIX flock 在进程退出时由内核自动释放（close-on-exec 语义），无需 finally 显式 unlock。
 LOCK_FILE = BASE / "logs" / ".postclose.lock"
+
+
+def _weekly_cleanup(conn, now: Optional[datetime] = None) -> dict:
+    """周度清理（C-ARC-3b/T7，周五或 --weekly 执行）：
+    - minute_snapshot 留 2 年（盘中回放用不了更久，存储 ~100 万行/年量级）；
+    - logs/quotes/*.jsonl 留 90 天（录制器不写 jsonl，但 confirm/盯市路径仍写，
+      审核发现的存量无清理问题一并纳入）。
+
+    jsonl 目录支持 AGSICKLE_QUOTES_DIR 调用时读（测试隔离）。返回清理计数。
+    """
+    now = now or datetime.now()
+    cutoff = (now - timedelta(days=730)).isoformat(timespec="seconds")
+    cur = conn.execute("DELETE FROM minute_snapshot WHERE ts < ?", (cutoff,))
+    n_rows = cur.rowcount
+    conn.commit()
+    quotes_dir = Path(os.environ.get("AGSICKLE_QUOTES_DIR")
+                      or (BASE / "logs" / "quotes"))
+    n_files = 0
+    cutoff_ts = (now - timedelta(days=90)).timestamp()
+    if quotes_dir.is_dir():
+        for f in quotes_dir.glob("*.jsonl"):
+            try:
+                if f.stat().st_mtime < cutoff_ts:
+                    f.unlink()
+                    n_files += 1
+            except OSError:
+                continue
+    return {"minute_rows": max(0, n_rows), "jsonl_files": n_files}
 
 
 def _write_pending(trade_date: str, today_iso: str) -> Path:
@@ -262,6 +290,20 @@ def main(argv=None) -> int:
                  r["scanned"], r["proposed"], r["skipped"])
     except Exception as e:
         log.error("步骤3.5 跌停应急扫描 FAIL（继续）: %s", repr(e))
+
+    # 3.6 周度（周五或 --weekly）清理：minute_snapshot 留 2 年、盘中快照审计
+    # jsonl 留 90 天（C-ARC-3b/T7）
+    if date.today().weekday() == 4 or args.weekly:
+        try:
+            _conn = fetcher.get_conn()
+            try:
+                r = _weekly_cleanup(_conn)
+                log.info("步骤3.6 周度清理：minute_snapshot 删 %d 行、quotes jsonl 删 %d 个",
+                         r["minute_rows"], r["jsonl_files"])
+            finally:
+                _conn.close()
+        except Exception as e:  # noqa: BLE001
+            log.error("步骤3.6 周度清理 FAIL（继续）: %s", repr(e))
 
     # 4. 输出
     print("[postclose] ===== 盘后流程完成 trade_date=%s =====" % trade_date)
