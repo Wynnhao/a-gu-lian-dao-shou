@@ -810,6 +810,8 @@ def test_kill_executed_summary_event():
                             " rule='kill_executed'").fetchall()
         assert len(rows) == 1, rows
         info = json.loads(rows[0][0])
+        # H2：血缘唯一载体——触发决策 id 必须在 detail 里（W-A1 后 trade 侧可能为 NULL）
+        assert info["trigger_decision_id"] == 1
         assert info["sells"] == 1 and info["deferred"] == 0
         assert len(info["trade_ids"]) == 1
         assert rows[0][1] == 1                      # 归因到触发 kill 的决策
@@ -1192,6 +1194,30 @@ def test_exec_breaker_red_alert_payload():
     payload = api_data_status(conn, {})
     assert payload["exec_breaker"]["tripped_today"] is True
     assert payload["exec_breaker"]["since"] == real_today + "T14:00:00"
+
+
+def test_requeue_skips_emergency_scan_singles():
+    """协同点②（sprint4-carc-conflicts）：规则21 应急扫描单（emergency_scan=1）
+    不参与重挂——limit_halt 有自己的 stuck 计数与次日再生成链。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        # 候选满足全部重挂条件（rejected + F1a 事件 + 委托价 11.15 对实时 11.0 漂移 1.35%），
+        # 唯独 emergency_scan=1 → 必须在 SQL 层被排除
+        conn.execute(
+            "INSERT INTO decision (run_date, code, action, target_weight, confidence,"
+            " reasons, risk_notes, input_snapshot, status, created_at, emergency_scan)"
+            " VALUES (?,?,'buy',0.05,0.8,'[]','[]',?,'rejected',?,1)",
+            (NOW_DATE, "000001",
+             json.dumps(mk_decision("buy", "000001", 11.15, 100)),
+             NOW_DATE + "T10:00:00"))
+        _seed_f1a_event(conn, 1, NOW_DATE + "T13:00:00")
+        conn.commit()
+        assert runner.requeue_price_rejects(conn, now=NOW10, orders_dir=orders) == 0
+        assert conn.execute("SELECT COUNT(*) FROM decision").fetchone()[0] == 1
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
 
 
 # ---------------- 直接运行入口 ----------------

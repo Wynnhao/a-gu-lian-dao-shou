@@ -462,9 +462,12 @@ def _do_kill(conn: sqlite3.Connection, v: Verdict, decision_id: Optional[int],
                      decision_id)
         print("[KILL] %s T+1/失败递延，已列入次日补清算（%d 股）" % (code, pos[1]))
     # C-ARC-4（T2）：kill 执行汇总留痕（一条；逐笔与 trade 表 100% 冗余——
-    # trade 行天然带 decision_id + confirmed_by='kill_switch'，ADR-0 §2）
+    # trade 行天然带 decision_id + confirmed_by='kill_switch'，ADR-0 §2）。
+    # H2（sprint4-carc-conflicts）：W-A1 后 trade.decision_id 可能为 NULL，
+    # 本事件升级为 kill 血缘唯一载体——detail 必须显式含触发决策 id + trade_id 列表。
     record_event(conn, "kill_executed",
-                 json.dumps({"sells": len(trade_ids), "trade_ids": trade_ids,
+                 json.dumps({"trigger_decision_id": decision_id,
+                             "sells": len(trade_ids), "trade_ids": trade_ids,
                              "deferred": len(dict.fromkeys(deferred))},
                             ensure_ascii=False),
                  decision_id)
@@ -618,9 +621,11 @@ def requeue_price_rejects(conn: sqlite3.Connection, now: Optional[datetime] = No
         return 0
 
     broker = PaperBroker()
+    # emergency_scan=0：规则21 应急单不参与重挂——limit_halt 有自己的 stuck 计数与
+    # 次日再生成链，重挂掺和会干扰（sprint4-carc-conflicts 排查协同点②）
     rows = conn.execute(
         "SELECT d.id FROM decision d WHERE d.run_date=? AND d.status='rejected' "
-        "AND d.action IN ('buy','sell') AND EXISTS ("
+        "AND d.action IN ('buy','sell') AND COALESCE(d.emergency_scan,0)=0 AND EXISTS ("
         "  SELECT 1 FROM risk_event e WHERE e.rule='risk_check_reconfirm' "
         "  AND e.decision_id=d.id) ORDER BY d.id", (today,)).fetchall()
 
