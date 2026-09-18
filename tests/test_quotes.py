@@ -37,27 +37,32 @@ def _tencent_payload(market="sh", name="贵州茅台", code="600519",
                      ts="20260911161451", high="1290.00", low="1270.00",
                      ask1_price="", ask1_vol="", float_mv="",
                      limit_up="", limit_down="") -> str:
-    """构造 47 字段腾讯报文（按 _fetch_tencent 内部偏移约定：f[0]=市场类型，官方字段 f[1]..f[46]）。
+    """按 **2026-09-19 只读 GET qt.gtimg.cn 实测协议** 构造腾讯报文
+    （Sprint4 W-A4：600519/300750/000001 三票交叉核验）。
 
-    关键索引：f3=price f4=prev f5=open f21=ask1_price f22=ask1_vol f30=ts
-    f33=high f34=low f42=float_mv f45=limit_up f46=limit_down。
+    关键索引（实测锚定）：f3=现价 f4=昨收 f5=开盘 f6=成交量(手) f19/f20=卖一价/量(手)
+    f21/f22=卖二价/量 f30=时间戳 f33/f34=最高/最低 f37=成交额(万) f42=当日最低
+    f43=振幅% f44=流通市值(亿) f45=总市值(亿) f46=PB f47/f48=涨停/跌停价。
+
+    旧 fixture 的 f21/f22=ask1、f42=float_mv、f45/f46=limit 是错位口径
+    （f21 实为卖二、f42 实为当日最低、f45/f46 实为总市值/PB），已按实测重锚。
     """
-    # 显式按索引填 47 字段（0..46），避免加减长度带来的索引偏移错误
-    f = [""] * 47
+    f = [""] * 50   # 实测协议至少 49 字段（f[48]=跌停价），留 1 余量
     f[0] = "100" if market == "sh" else "51"
     f[1] = name
     f[2] = code
     f[3] = price
     f[4] = prev
     f[5] = open_
-    f[21] = ask1_price
-    f[22] = ask1_vol
+    f[19] = ask1_price
+    f[20] = ask1_vol
     f[30] = ts
     f[33] = high
     f[34] = low
-    f[42] = float_mv
-    f[45] = limit_up
-    f[46] = limit_down
+    f[42] = low                       # f42=当日最低（实测与 f34 相同）
+    f[44] = float_mv                  # 流通市值，亿元
+    f[47] = limit_up
+    f[48] = limit_down
     return 'v_%s%s="%s";' % (market, code, "~".join(f))
 
 
@@ -110,12 +115,20 @@ def test_tencent_parse():
 
 @test
 def test_tencent_parse_new_fields():
-    """Sprint 1 任务3：验证 _fetch_tencent 解析新增 5 字段（规则21 三条件）。"""
+    """W-A4：按 2026-09-19 实测协议解析新增 5 字段（规则21 三条件）。
+
+    实测样例（只读 GET qt.gtimg.cn，sh600519 @2026-09-18 收盘后）：
+    price=1257.12 prev=1266.98 f19=1257.13 f20=1 f44=15715.03 f47=1393.68 f48=1140.28。
+    涨跌停价与 common.market.limit_price 的 Decimal 取整口径精确吻合
+    （1266.98×1.10=1393.678→1393.68；×0.90=1140.282→1140.28）。
+    """
     class FakeResp:
         text = _tencent_payload(
-            ask1_price="1270.00", ask1_vol="15000",
-            float_mv="1640123456789",     # 茅台流通市值 ~1.64 万亿（×100）
-            limit_up="1413.65", limit_down="1156.61")
+            price="1257.12", prev="1266.98", open_="1262.99",
+            ts="20260918161436", high="1265.88", low="1256.10",
+            ask1_price="1257.13", ask1_vol="1",
+            float_mv="15715.03",          # 流通市值，亿元（实测值）
+            limit_up="1393.68", limit_down="1140.28")
         encoding = ""
     orig = quotes.requests.get
     quotes.requests.get = lambda url, timeout: FakeResp()
@@ -124,22 +137,53 @@ def test_tencent_parse_new_fields():
     finally:
         quotes.requests.get = orig
     q = out["600519"]
-    assert q["ask1_price"] == 1270.00
-    assert q["ask1_vol"] == 15000.0     # 15000 手 → 15000.0 股（含 .0）
-    assert q["float_mv"] == 1640123456789.0
-    assert q["limit_up"] == 1413.65
-    assert q["limit_down"] == 1156.61
-    # 旧字段未被破坏
-    assert q["price"] == 1275.16 and q["prev_close"] == 1285.13
-    assert q["high"] == 1290.00 and q["low"] == 1270.00
+    assert q["price"] == 1257.12 and q["prev_close"] == 1266.98
+    assert q["ask1_price"] == 1257.13
+    assert q["ask1_vol"] == 1.0                      # 卖一量，手（实测 1 手）
+    assert q["float_mv"] == 15715.03 * 1e8           # 亿元 → 元
+    assert q["limit_up"] == 1393.68
+    assert q["limit_down"] == 1140.28
+    # 涨跌停价与统一口径交叉验证（量纲修后自洽）
+    from common.market import limit_price
+    assert q["limit_up"] == limit_price(1266.98, 0.10, up=True)
+    assert q["limit_down"] == limit_price(1266.98, 0.10, up=False)
+    assert q["high"] == 1265.88 and q["low"] == 1256.10
+
+
+@test
+def test_tencent_parse_sample_300750_units():
+    """W-A4 实测样例 2（sz300750 宁德时代 @2026-09-18）：单位口径交叉验证——
+    f44 流通市值(12864.89 亿) < f45 总市值(13971.93 亿)，×1e8 后为元。"""
+    class FakeResp:
+        text = _tencent_payload(
+            market="sz", name="宁德时代", code="300750",
+            price="301.95", prev="304.30", open_="309.77",
+            ts="20260918161412", high="310.00", low="300.27",
+            ask1_price="301.96", ask1_vol="5",
+            float_mv="12864.89",
+            limit_up="365.16", limit_down="243.44")
+        encoding = ""
+    orig = quotes.requests.get
+    quotes.requests.get = lambda url, timeout: FakeResp()
+    try:
+        out = quotes._fetch_tencent(["300750"])
+    finally:
+        quotes.requests.get = orig
+    q = out["300750"]
+    assert q["ask1_price"] == 301.96 and q["ask1_vol"] == 5.0
+    assert q["float_mv"] == 12864.89 * 1e8           # ≈1.29 万亿（流通，元）
+    # 创业板 20%：304.30×0.80=243.44、×1.20=365.16 精确吻合（Decimal 取整同口径）
+    from common.market import limit_price
+    assert q["limit_down"] == 243.44 == limit_price(304.30, 0.20, up=False)
+    assert q["limit_up"] == 365.16 == limit_price(304.30, 0.20, up=True)
 
 
 @test
 def test_tencent_parse_empty_seal_volume_is_none():
-    """边界：f22 卖一量为空字符串（跌停开板 / 未形成封单）时落 None，不抛异常。"""
+    """边界：f20 卖一量为空字符串（跌停开板 / 未形成封单）时落 None，不抛异常。"""
     class FakeResp:
         # ask1_price 有但 ask1_vol 空，模拟"无封单"情形
-        text = _tencent_payload(ask1_price="1270.00", ask1_vol="")
+        text = _tencent_payload(ask1_price="1257.13", ask1_vol="")
         encoding = ""
     orig = quotes.requests.get
     quotes.requests.get = lambda url, timeout: FakeResp()
@@ -148,7 +192,7 @@ def test_tencent_parse_empty_seal_volume_is_none():
     finally:
         quotes.requests.get = orig
     q = out["600519"]
-    assert q["ask1_price"] == 1270.00
+    assert q["ask1_price"] == 1257.13
     assert q["ask1_vol"] is None
 
 

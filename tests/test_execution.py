@@ -113,6 +113,33 @@ def set_emergency_direct(enabled: bool):
     return _ED()
 
 
+def set_live_quotes(quotes: Dict[str, dict]):
+    """W-A9：临时注入 AGSICKLE_MOCK_QUOTES 实时快照并解除 DISABLE_LIVE_QUOTES——
+    build_context 在交易时段会拉到该快照，price_source 标记 live（比价口径生效）。"""
+    import json as _json
+
+    class _LQ:
+        def __enter__(self):
+            self._tmp = tempfile.mkdtemp(prefix="exec_mock_quotes_")
+            self._f = Path(self._tmp) / "quotes.json"
+            self._f.write_text(_json.dumps(quotes, ensure_ascii=False), encoding="utf-8")
+            self._old_mock = os.environ.get("AGSICKLE_MOCK_QUOTES")
+            self._old_dis = os.environ.pop("AGSICKLE_DISABLE_LIVE_QUOTES", None)
+            os.environ["AGSICKLE_MOCK_QUOTES"] = str(self._f)
+            return self
+
+        def __exit__(self, *exc):
+            if self._old_mock is None:
+                os.environ.pop("AGSICKLE_MOCK_QUOTES", None)
+            else:
+                os.environ["AGSICKLE_MOCK_QUOTES"] = self._old_mock
+            if self._old_dis is not None:
+                os.environ["AGSICKLE_DISABLE_LIVE_QUOTES"] = self._old_dis
+            shutil.rmtree(self._tmp, ignore_errors=True)
+            return False
+    return _LQ()
+
+
 def trade_rows(conn, **cond):
     sql = "SELECT id, trade_date, code, side, price, shares, amount, order_id, status," \
           " shots, confirmed_by FROM trade"
@@ -387,7 +414,8 @@ def test_propose_gate_writes_pending_then_confirm_executes():
         assert payload["verdict"]["approved"] is True
         assert payload["submit_price"] == 11.0 and payload["suggest_shares"] == 100
 
-        res = runner.confirm(conn, 1, confirmed_by="张三", now=NOW10, orders_dir=orders)
+        res = runner.confirm(conn, 1, confirmed_by="张三", now=NOW10, orders_dir=orders,
+                             price_override=11.0)   # W-A9：离线无实时价，显式价确认
         assert res["ok"] and res["amount"] == 1105.0
         row = trade_rows(conn)[0]
         assert row[3] == "buy" and row[8] == "filled" and row[10] == "张三"
@@ -591,10 +619,14 @@ def test_reject_path_and_manual_reject():
     seed_market(conn)
     orders = Path(_tmp_dir())
     try:
-        # 风控拒绝：委托价偏离实时价 6.67% > 2%
-        d = mk_decision("buy", "600519", 1600.0, 100)
-        v = runner.propose(conn, d, now=NOW10, orders_dir=orders)
-        assert not v.approved and any("价格保护" in x for x in v.violations)
+        # 风控拒绝：委托价偏离实时价 6.67% > 2%（W-A9：注入 mock 实时快照，
+        # price_source=live 时规则9 的偏离比对才生效——陈旧昨收基准下自动比价
+        # 已改为留痕警告，硬拒发生在执行定价层）
+        with set_live_quotes({"600519": {"price": 1500.0, "prev_close": 1490.0,
+                                         "source": "mock", "time": "t"}}):
+            d = mk_decision("buy", "600519", 1600.0, 100)
+            v = runner.propose(conn, d, now=NOW10, orders_dir=orders)
+        assert not v.approved and any("价格保护" in x for x in v.violations), v.brief()
         st = conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0]
         assert st == "rejected"
         n = conn.execute("SELECT COUNT(*) FROM risk_event WHERE decision_id=1").fetchone()[0]
@@ -841,9 +873,12 @@ def test_regime_failopen_and_warn_events_propose_confirm():
         d = mk_decision("buy", "600519", 1500.0, 150)   # 150 股 → 手数规整 warning
         v = runner.propose(conn, d, now=NOW10, orders_dir=orders)
         assert v.approved and v.warnings, (v.brief(), v.warnings)
+        # W-A9：离线回退昨收 → rule9 stale 口径 warning 排在首位（warn_prefix 同前缀
+        # 同日去重，仅落第一条）
         warn_rows = conn.execute("SELECT detail FROM risk_event WHERE rule='warn'"
                                  ).fetchall()
         assert len(warn_rows) == 1 and warn_rows[0][0].startswith("600519 "), warn_rows
+        assert "陈旧昨收" in warn_rows[0][0], warn_rows
         assert conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
                             " rule='failopen_regime_cap'").fetchone()[0] == 1
 
@@ -851,7 +886,7 @@ def test_regime_failopen_and_warn_events_propose_confirm():
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             res = runner.confirm(conn, 1, confirmed_by="测试", now=NOW10,
-                                 orders_dir=orders)
+                                 orders_dir=orders, price_override=1500.0)  # W-A9 显式价
         assert res is not None and res["ok"]
         assert "[警告]" in out.getvalue(), out.getvalue()[-500:]
         assert conn.execute("SELECT COUNT(*) FROM risk_event WHERE rule='warn'"
@@ -1260,6 +1295,254 @@ def test_confirm_liquidation_survives_stop_period_and_breaker():
     finally:
         if runner.KILL_STATE_FILE.exists():
             runner.KILL_STATE_FILE.unlink()
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+# ---------------- Sprint4 批次A：W-A1 / W-A3 / W-A5 / W-A6 / W-A9 ----------------
+
+def test_kill_two_positions_decision_id_null_and_dd_base():
+    """W-A1+W-A3：两持仓 kill 全清——两笔 trade decision_id 均 NULL（绕
+    trade(decision_id) 唯一索引，P0-4 不再中途崩）、confirmed_by=kill_switch；
+    kill.json 含 dd_base/dd_base_date/kill_count/lifetime_peak；resume 后
+    build_context 回撤归零（分段 8%），再 check 不触发。"""
+    conn = fresh_conn()
+    seed_market(conn, prices={"600519": (1290.0, 1280.0), "000001": (11.0, 10.9)})
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    conn.execute("INSERT INTO position VALUES ('600519','贵州茅台',1000,1000,1300.0,?)",
+                 (now_iso,))
+    conn.execute("INSERT INTO position VALUES ('000001','平安银行',2000,2000,12.0,?)",
+                 (now_iso,))
+    peak_date = (NOW10 - timedelta(days=1)).strftime("%Y-%m-%d")
+    conn.execute("INSERT INTO portfolio_state VALUES (?,?,?,?,?,?,?)",
+                 (peak_date, 0.0, 0.0, 2600000.0, 0.0, 0, "seed peak"))
+    conn.commit()
+    orders = Path(_tmp_dir())
+    try:
+        hold = {"action": "hold", "code": "600519", "target_weight": 0.0,
+                "confidence": 0.9, "reasons": ["继续持有", "趋势未破"], "risk_notes": []}
+        v = runner.propose(conn, hold, now=NOW10, orders_dir=orders)
+        # 权益≈2.312M vs 峰值 2.6M → 回撤 11.1% ≥ 8% 触发
+        assert v.kill_trigger
+        # W-A1：两笔清仓各自落账，decision_id 均 NULL、确认人 kill_switch
+        rows = trade_rows(conn, side="sell")
+        assert len(rows) == 2, "两持仓必须全部清仓（P0-4：此前第 2 笔被幂等防线拒）"
+        assert conn.execute("SELECT COUNT(*) FROM position").fetchone()[0] == 0
+        # W-A1：唯一索引实测——若仍共用同一非 NULL decision_id，第 2 笔 INSERT 会
+        # 抛 IntegrityError 使 kill 中途崩溃（回归锚：idx_trade_decision_uniq）
+        assert conn.execute(
+            "SELECT COUNT(DISTINCT decision_id) FROM trade WHERE side='sell'"
+            " AND decision_id IS NOT NULL").fetchone()[0] == 0
+        # W-A3：kill.json 含 dd_base（清仓后权益）+ 累计观测键
+        ks = runner.read_kill_state()
+        assert ks and ks.get("active") and ks.get("dd_base") is not None
+        assert ks.get("dd_base_date") == NOW_DATE
+        assert ks.get("kill_count") == 1
+        assert ks.get("lifetime_peak") == 2600000.0
+        ev = conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
+                          " rule='kill_dd_base_reset'").fetchone()[0]
+        assert ev == 1
+        # W-A3：resume 后 dd_base 感知峰值 → 回撤归零，再 check 不触发
+        runner.kill_resume(conn, "测试恢复")
+        ctx = runner.build_context(conn, NOW10)
+        assert ctx.kill_switch_until is None
+        dd = 1 - ctx.total_equity / ctx.peak_equity if ctx.peak_equity else 0.0
+        assert dd < 0.08, "清仓重置后回撤必须脱离 8% 死锁（实得 %.2f%%）" % (dd * 100)
+        from risk.engine import check
+        v2 = check({"action": "hold", "code": "600519", "target_weight": 0.0,
+                    "confidence": 0.9, "reasons": ["r1", "r2"], "risk_notes": []},
+                   ctx, runner.CFG["risk"])
+        assert not v2.kill_trigger
+    finally:
+        if runner.KILL_STATE_FILE.exists():
+            runner.KILL_STATE_FILE.unlink()
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_kill_deferred_clears_dd_base_then_resolve_rewrites():
+    """W-A3③ 递延场景：kill 有 T+1 递延 → kill.json 不含 dd_base（旧基准清除）；
+    resolve_liquidations 补清算全部完成 → 补写 dd_base；重复 resolve 幂等
+    （同日不覆盖）。"""
+    conn = fresh_conn()
+    seed_market(conn, prices={"600519": (1290.0, 1280.0), "000001": (11.0, 10.9)})
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    conn.execute("INSERT INTO position VALUES ('600519','贵州茅台',1000,0,1300.0,?)",
+                 (now_iso,))   # T+1 不可卖 → 递延
+    conn.execute("INSERT INTO portfolio_state VALUES (?,?,?,?,?,?,?)",
+                 (YDAY, 0.0, 0.0, 2500000.0, 0.0, 0, "seed peak"))
+    conn.commit()
+    orders = Path(_tmp_dir())
+    try:
+        hold = {"action": "hold", "code": "600519", "target_weight": 0.0,
+                "confidence": 0.9, "reasons": ["r1", "r2"], "risk_notes": []}
+        with set_gate(False):
+            v = runner.propose(conn, hold, now=NOW10, orders_dir=orders)
+        assert v.kill_trigger and v.kill_pending == ["600519"]
+        ks = runner.read_kill_state()
+        assert ks and "dd_base" not in ks, "递延场景不得写 dd_base"
+        assert "dd_base" not in ks
+        # 次日解锁 → 补清算 → dd_base 补写
+        conn.execute("UPDATE position SET avail_shares=shares WHERE code='600519'")
+        conn.commit()
+        with set_gate(False):
+            assert runner.resolve_liquidations(conn, now=NOW10, orders_dir=orders) == 1
+        ks2 = runner.read_kill_state()
+        assert ks2.get("dd_base") is not None and ks2.get("dd_base_date") == NOW_DATE
+        dd_date = ks2["dd_base_date"]
+        # 幂等：同日再 resolve（无新清算）不覆盖 dd_base
+        with set_gate(False):
+            runner.resolve_liquidations(conn, now=NOW10, orders_dir=orders)
+        ks3 = runner.read_kill_state()
+        assert ks3.get("dd_base_date") == dd_date
+        # W-A3⑤：build_context 走 dd_base 感知窗口
+        ctx = runner.build_context(conn, NOW10)
+        assert ctx.peak_equity <= ctx.total_equity + 1e-6
+    finally:
+        if runner.KILL_STATE_FILE.exists():
+            runner.KILL_STATE_FILE.unlink()
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_confirm_emergency_crossday_gate():
+    """W-A5②：应急单（run_date=次日）T 晚 confirm 放行（跨日闸门豁免 + TTL 按
+    run_date 当日 15:05）；普通单跨日照旧 expired；过期 run_date 的应急单也作废。"""
+    conn = fresh_conn()
+    _seed_rule21_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        d = mk_decision("sell", "000001", 9.81, 200, emergency_scan=True)
+        now_propose = datetime.combine(_BASE, time(15, 40))   # T 晚盘后
+        v = runner.propose(conn, d, run_date=NEXT_DAY, now=now_propose,
+                           orders_dir=orders)
+        assert v.approved, v.violations
+        did = conn.execute("SELECT MAX(id) FROM decision").fetchone()[0]
+        # T 晚 22:00 confirm：跨日 + TTL 两闸均按新语义放行 → 应急设计价成交
+        now_confirm = datetime.combine(_BASE, time(22, 0))
+        res = runner.confirm(conn, did, confirmed_by="睡前人工", now=now_confirm,
+                             orders_dir=orders)
+        assert res is not None and res["ok"], "应急单 T 晚 confirm 必须可成交（P1-4）"
+        assert conn.execute("SELECT status FROM decision WHERE id=?",
+                            (did,)).fetchone()[0] == "executed"
+        n = conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
+                         " rule='pending_crossday_allowed'").fetchone()[0]
+        assert n >= 1
+        # 负例1：普通单（非应急）run_date=次日 → 今日 confirm → expired
+        # （DB 直造 approved 行，隔离规则4 的时段拒绝，单验闸门语义）
+        conn.execute(
+            "INSERT INTO decision (run_date, code, action, target_weight, confidence,"
+            " reasons, risk_notes, input_snapshot, status, created_at, emergency_scan)"
+            " VALUES (?,?,?,?,?,?,?,?,?, ?, 0)",
+            (NEXT_DAY, "600519", "buy", 0.05, 0.8, '["r1","r2"]', "[]",
+             json.dumps(mk_decision("buy", "600519", 1500.0, 100), ensure_ascii=False),
+             "approved", datetime.now().isoformat(timespec="seconds")))
+        did2 = conn.execute("SELECT MAX(id) FROM decision").fetchone()[0]
+        res2 = runner.confirm(conn, did2, confirmed_by="x", now=now_confirm,
+                              orders_dir=orders)
+        assert res2 is None
+        assert conn.execute("SELECT status FROM decision WHERE id=?",
+                            (did2,)).fetchone()[0] == "expired"
+        # 负例2：应急单但 run_date 已过（<今日）→ 作废（可重新扫描生成）
+        past = YDAY
+        conn.execute(
+            "INSERT INTO decision (run_date, code, action, target_weight, confidence,"
+            " reasons, risk_notes, input_snapshot, status, created_at, emergency_scan)"
+            " VALUES (?,?,?,?,?,?,?,?,?, ?, 1)",
+            (past, "000001", "sell", 0.0, 1.0, '["r1","r2"]', "[]",
+             json.dumps(mk_decision("sell", "000001", 9.81, 200, emergency_scan=True),
+                        ensure_ascii=False),
+             "approved", datetime.now().isoformat(timespec="seconds")))
+        did3 = conn.execute("SELECT MAX(id) FROM decision").fetchone()[0]
+        res3 = runner.confirm(conn, did3, confirmed_by="x", now=now_confirm,
+                              orders_dir=orders)
+        assert res3 is None
+        assert conn.execute("SELECT status FROM decision WHERE id=?",
+                            (did3,)).fetchone()[0] == "expired"
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_reject_executed_guard():
+    """W-A6：executed/executed_unverified 拒绝 reject，审计链保住。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        d = mk_decision("buy", "000001", 11.0, 100)
+        runner.propose(conn, d, now=NOW10, orders_dir=orders)
+        res = runner.confirm(conn, 1, confirmed_by="测试", now=NOW10,
+                             orders_dir=orders, price_override=11.0)
+        assert res is not None and res["ok"]
+        assert runner.reject(conn, 1, by="误操作", reason="手滑", orders_dir=orders) is False
+        assert conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0] \
+            == "executed", "已成交决策不得被置回 rejected"
+        ev = conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
+                          " rule='manual_reject_rejected'").fetchone()[0]
+        assert ev == 1
+        # executed_unverified 同样被拒
+        conn.execute("UPDATE decision SET status='executed_unverified' WHERE id=1")
+        conn.commit()
+        assert runner.reject(conn, 1, by="误操作", reason="again", orders_dir=orders) is False
+        assert conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0] \
+            == "executed_unverified"
+        # 对照：approved 单仍可 reject
+        runner.propose(conn, mk_decision("buy", "601318", 54.83, 100),
+                       now=NOW10, orders_dir=orders)
+        assert runner.reject(conn, 2, by="人工", reason="不要", orders_dir=orders) is True
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_confirm_stale_price_halt_and_explicit():
+    """W-A9：实时价缺失时 confirm 不得自动以昨收成交——无 --price 挂起（status
+    保持 approved、pending 保留、stale_price_halt 留痕）；带 --price 放行成交。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        runner.propose(conn, mk_decision("buy", "000001", 11.0, 100),
+                       now=NOW10, orders_dir=orders)
+        # 无 --price：挂起，不成交
+        res = runner.confirm(conn, 1, confirmed_by="测试", now=NOW10, orders_dir=orders)
+        assert res is None
+        assert conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0] \
+            == "approved"
+        assert len(runner.list_pending(orders)) == 1, "挂起必须保留 pending"
+        assert len(trade_rows(conn)) == 0
+        n_halt = conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
+                              " rule='stale_price_halt'").fetchone()[0]
+        assert n_halt == 1
+        # 带 --price：显式确认放行，风控仍跑（成交）
+        res2 = runner.confirm(conn, 1, confirmed_by="显式价", now=NOW10,
+                              orders_dir=orders, price_override=11.0)
+        assert res2 is not None and res2["ok"]
+        assert conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0] \
+            == "executed"
+        # W-A9：broker 口径版定价源标记
+        b = PaperBroker(EXEC_CFG)
+        p, src = b.latest_price_with_source(conn, "000001")
+        assert src == "stale_close" and p == 11.0   # 离线 → 昨收（陈旧）口径
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_confirm_emergency_stale_uses_design_price():
+    """W-A9：应急/补清算单实时价缺失时按**决策显式设计价**执行（不自动以昨收成交），
+    stale_price_exec 留痕；设计价缺失则挂起。"""
+    conn = fresh_conn()
+    _seed_rule21_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        d = mk_decision("sell", "000001", 9.81, 200, emergency_scan=True)
+        v = runner.propose(conn, d, now=NOW10, orders_dir=orders)
+        assert v.approved, v.violations
+        res = runner.confirm(conn, 1, confirmed_by="failsafe", now=NOW10,
+                             orders_dir=orders)   # 无 --price
+        assert res is not None and res["ok"], "应急单必须按设计价（跌停价）成交"
+        row = trade_rows(conn)[0]
+        assert row[4] == 9.81, "成交价必须是显式设计价 9.81（昨收 9.81 恰好相等也不得混淆口径）"
+        ev = conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
+                          " rule='stale_price_exec'").fetchone()[0]
+        assert ev == 1
+    finally:
         shutil.rmtree(orders, ignore_errors=True)
 
 

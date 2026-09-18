@@ -804,6 +804,68 @@ def test_failopen_factor_crowding_event():
                         " rule='failopen_factor_crowding'").fetchone()[0] == 1
 
 
+# ---------------- Sprint4 批次A：W-A2（规则3/4/18 强平豁免）+ W-A9（规则9 陈旧口径） ----------------
+
+def test_rule4_kill_liquidation_exempt_non_session():
+    """W-A2①（P1-2）：09:00 premarket 的 kill 补清算单过规则4（非交易时段豁免，
+    与 emergency_scan 同口径）；普通卖单照拒。"""
+    pos = {"600519": {"name": "贵州茅台", "shares": 1000,
+                      "avail_shares": 1000, "cost": 1400.0}}
+    ctx = mk_ctx(now=SAT, positions=pos)
+    d = mk_dec("sell", "600519", 1500.0, 100, kill_liquidation=True)
+    v = check(d, ctx, CFG)
+    assert v.approved, v.violations
+    assert any("规则4豁免" in w for w in v.warnings)
+    # 普通卖单非时段照拒
+    v2 = check(mk_dec("sell", "600519", 1500.0, 100), ctx, CFG)
+    assert not v2.approved and hit(v2, "非交易时段")
+
+
+def test_rule3_health_kill_liquidation_exempt():
+    """W-A2③：数据健康异常日 kill 补清算单降级为留痕放行（不再 report_only）。"""
+    ctx = mk_ctx(health_issues=["数据滞后 4 天（最新 2026-09-05）"],
+                 positions={"600519": {"name": "贵州茅台", "shares": 1000,
+                                       "avail_shares": 1000, "cost": 1400.0}})
+    d = mk_dec("sell", "600519", 1500.0, 100, kill_liquidation=True)
+    v = check(d, ctx, CFG)
+    assert v.approved and not v.report_only, v.brief()
+    assert any("规则3豁免" in w for w in v.warnings)
+    assert any(e["rule"] == "kill_liquidation_health_exempt" for e in v.events)
+    # 普通单照旧 report_only
+    v2 = check(mk_dec("buy", "600519", 1500.0, 100), ctx, CFG)
+    assert v2.report_only and not v2.approved
+
+
+def test_rule18_kill_liquidation_exempt():
+    """W-A2③：kill 补清算卖单豁免 1% 参与率上限（与 emergency_scan 同款）。"""
+    ctx = mk_ctx(day_amount={"600519": 5000000.0},
+                 positions={"600519": {"name": "贵州茅台", "shares": 1000,
+                                       "avail_shares": 1000, "cost": 1400.0}})
+    d = mk_dec("sell", "600519", 1500.0, 1000, kill_liquidation=True)  # 150 万 > 5 万
+    v = check(d, ctx, CFG)
+    assert v.approved, v.violations
+    assert any("流动性豁免" in w for w in v.warnings)
+
+
+def test_rule9_stale_price_source_warning_not_violation():
+    """W-A9：price_source=stale_close（昨收冒充实价）时规则9 降为留痕警告——
+    既不产生伪违规，也不静默放行（stale_price_guard 事件可查）；live 口径照旧比对。"""
+    stale_ctx = mk_ctx(price_source={"600519": "stale_close", "000001": "stale_close"})
+    # 偏离 6.67%（stale 基准下不再违规，改警告 + 事件）
+    v = check(mk_dec("buy", "600519", 1600.0, 100), stale_ctx, CFG)
+    assert not hit(v, "价格保护：委托价")
+    assert any("陈旧昨收" in w for w in v.warnings)
+    assert any(e["rule"] == "stale_price_guard" for e in v.events)
+    # 未偏离的 stale 基准单同样留痕（不静默）
+    v2 = check(mk_dec("buy", "600519", 1500.0, 100), stale_ctx, CFG)
+    assert v2.approved
+    assert any(e["rule"] == "stale_price_guard" for e in v2.events)
+    # live 口径照旧：偏离 → 违规
+    live_ctx = mk_ctx(price_source={"600519": "live"})
+    v3 = check(mk_dec("buy", "600519", 1600.0, 100), live_ctx, CFG)
+    assert not v3.approved and hit(v3, "价格保护")
+
+
 # ---------------- 直接运行入口 ----------------
 
 if __name__ == "__main__":

@@ -179,6 +179,55 @@ def test_portfolio_state_domain():
 
 # ---------------- decision 域 ----------------
 
+# ---------------- Sprint4 批次A：repo 底层新增能力 ----------------
+
+def test_peak_total_after_and_combos():
+    """W-A3②：after 参数（dd_base 感知窗口）及与 before/window 组合。"""
+    conn = fresh_conn()
+    for d, total in (("2026-09-10", 2000.0), ("2026-09-15", 1000.0),
+                     ("2026-09-16", 1050.0), ("2026-09-17", 1010.0)):
+        conn.execute("INSERT INTO portfolio_state VALUES (?,?,?,?,?,?,?)",
+                     (d, 900.0, 100.0, total, 0.0, 0, d))
+    conn.commit()
+    assert repo.peak_total(conn, after="2026-09-15") == 1050.0     # after（含当日）
+    assert repo.peak_total(conn, after="2026-09-18") is None       # 空窗口
+    assert repo.peak_total(conn, after="2026-09-15", before="2026-09-17") == 1050.0
+    assert repo.peak_total(conn, after="2026-09-15", window=1) == 1010.0  # after+window
+    # dd_base 分段语义：以重置日为界，清仓前旧峰值(2000)不参与
+    assert repo.peak_total(conn, after="2026-09-15") < repo.peak_total(conn)
+
+
+def test_has_effective_trade_code_scoped():
+    """W-A1：has_effective_trade 可选 code——(decision_id, code) 二元判据。"""
+    conn = fresh_conn()
+    _insert_trade(conn, "sell", "600519", 100.0, 100, decision_id=21)
+    assert repo.has_effective_trade(conn, 21, code="600519") is True
+    assert repo.has_effective_trade(conn, 21, code="000001") is False
+    # 不传 code 保持原语义（全局按 decision_id）
+    assert repo.has_effective_trade(conn, 21) is True
+    # pending（无效）成交不计
+    _insert_trade(conn, "sell", "000001", 10.0, 100, decision_id=22)
+    conn.execute("UPDATE trade SET status='pending' WHERE decision_id=22")
+    conn.commit()
+    assert repo.has_effective_trade(conn, 22, code="000001") is False
+
+
+def test_get_decision_row_includes_emergency_scan():
+    """W-A5①：get_decision_row 扩为 11 列，末列 emergency_scan（DB 列为准）。"""
+    conn = fresh_conn()
+    repo.insert_decision(conn, {"code": "600519", "action": "sell",
+                                "emergency_scan": True}, "2026-09-18")
+    repo.insert_decision(conn, {"code": "000001", "action": "buy"}, "2026-09-18")
+    conn.commit()
+    row = repo.get_decision_row(conn, 1)
+    assert row is not None and len(row) == 11
+    assert row[9] == "proposed" and int(row[10]) == 1     # 索引兼容 + 应急标志
+    row2 = repo.get_decision_row(conn, 2)
+    assert int(row2[10]) == 0
+
+
+# ---------------- decision 域 ----------------
+
 def test_insert_decision_column_alignment():
     """runner 10 列 / decide 13 列两来源对齐：缺省列 NULL、created_at 格式一致。"""
     conn = fresh_conn()

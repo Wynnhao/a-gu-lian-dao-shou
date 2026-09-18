@@ -33,6 +33,8 @@ BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
+from data import repo  # noqa: E402  （TRADE_EFFECTIVE_SQL：有效成交唯一定义）
+
 log = logging.getLogger("signals.limit_halt")
 if not log.handlers:
     from common.logsetup import rotating_handler  # AGSICKLE_LOG_DIR 逃生门（Sprint4 W0-1）
@@ -129,6 +131,10 @@ def scan_positions(conn: sqlite3.Connection, ctx_inputs: Optional[dict] = None,
             "reasons": [
                 "规则21主动扫描：跌停封死且浮亏 %.1f%% ≥ 止损线 %.1f%%"
                 % (info["loss"] * 100, info["stop_line"] * 100),
+                ("封单比 %.2f%%（W-A4②：条件②按实时快照判定）"
+                 % (info["seal_ratio"] * 100))
+                if info.get("seal_ratio") is not None
+                else "条件②缺数据（快照无 ask1_vol/float_mv），按'不阻断'处理",
                 "连续跌停应急：次日 09:15 集合竞价挂跌停价卖出",
             ],
             "risk_notes": [
@@ -141,10 +147,17 @@ def scan_positions(conn: sqlite3.Connection, ctx_inputs: Optional[dict] = None,
 
 
 def _dedupe_emergency(conn: sqlite3.Connection, code: str, run_date: str) -> bool:
-    """同票同 run_date 已有 emergency_scan sell 单 → True（幂等，不重复生成）。"""
+    """同票同 run_date 已有 emergency_scan sell 单 → True（幂等，不重复生成）。
+
+    W-A5③（P1-4）：判重范围收紧为 status IN ('proposed','approved') 或已有
+    有效成交——此前 `status != 'rejected'` 把 expired 也算"已存在"，应急单被
+    跨日闸门作废后同 run_date 永不再生（链路死锁的第三环）。
+    """
     n = conn.execute(
         "SELECT COUNT(*) FROM decision WHERE code=? AND action='sell'"
-        " AND emergency_scan=1 AND run_date=? AND status != 'rejected'",
+        " AND emergency_scan=1 AND run_date=? AND (status IN ('proposed','approved')"
+        " OR EXISTS (SELECT 1 FROM trade t WHERE t.decision_id=decision.id AND "
+        + repo.TRADE_EFFECTIVE_SQL + "))",
         (code, run_date)).fetchone()[0]
     return n > 0
 
@@ -170,7 +183,33 @@ def run_postclose_scan(conn: Optional[sqlite3.Connection] = None,
     # 节假日场景由 premarket 兜底的"run_date=今天才执行"语义自然顺延）
     run_date = run_date or (now + timedelta(days=1)).strftime("%Y-%m-%d")
     try:
-        decisions = scan_positions(c, now=now)
+        # W-A4②：盘后自拉实时快照（腾讯/东财盘后仍可取，postclose 无现成快照可复用）
+        # ——live_quotes 供条件②封单比；price/prev_close 供条件①现价校验与跌停价
+        # 基准（当日跌停价的正确基准是快照自带昨收）。拉取失败/被禁用 → 空注入，
+        # scan_positions 回退日线收盘口径（与旧行为一致，缺价票保守跳过）。
+        ctx_inputs: Optional[dict] = None
+        try:
+            import os as _os
+            if _os.environ.get("AGSICKLE_DISABLE_LIVE_QUOTES") != "1":
+                from data.quotes import get_live_prices as _glp
+                _broker = _runner.PaperBroker()
+                _, _positions0, _, _ = _broker.portfolio(c)
+                _codes0 = sorted(_positions0)
+                live0: Dict[str, dict] = _glp(_codes0, force=True) if _codes0 else {}
+                if live0:
+                    ctx_inputs = {"live_quotes": live0}
+                    _lp = {str(k): float(v["price"]) for k, v in live0.items()
+                           if v.get("price") is not None}
+                    _pc = {str(k): float(v["prev_close"]) for k, v in live0.items()
+                           if v.get("prev_close") is not None}
+                    if _lp:
+                        ctx_inputs["latest_prices"] = _lp
+                    if _pc:
+                        ctx_inputs["prev_close"] = _pc
+        except Exception as e:  # noqa: BLE001
+            log.warning("盘后实时快照拉取失败（回退日线收盘口径）: %r", e)
+            ctx_inputs = None
+        decisions = scan_positions(c, ctx_inputs=ctx_inputs, now=now)
         proposed, skipped = [], []
         for d in decisions:
             code = d["code"]
@@ -261,15 +300,19 @@ def enforce_stuck_rules(conn: sqlite3.Connection,
                              "%s 连续跌停 stuck %s 日（自 %s），请人工介入"
                              % (code, days, first))
                 events.append(code)
-    if len(rows) >= STUCK_KILL_COUNT:
+    # W-A4③（P1-7）：首日触板（first_stuck_date==今日）不计入 kill 聚集判定——
+    # "连续跌停死封"要求至少进入第二个 stuck 日；此前 len(rows)>=3 未过滤首日行，
+    # 叠加旧字段错位时"触碰跌停即 stuck"，3 只同日首触即假触发 72h 全账户 kill。
+    kill_rows = [r for r in rows if str(r[1] or "") != real_today]
+    if len(kill_rows) >= STUCK_KILL_COUNT:
         kill_until = now + timedelta(hours=72)
         apply_kill_switch(conn, kill_until,
                           note="跌停应急扫描：同日 %d 只 stuck（%s），触发规则5 kill"
-                               % (len(rows), ",".join(r[0] for r in rows)))
+                               % (len(kill_rows), ",".join(r[0] for r in kill_rows)))
         kill = True
         notify("跌停应急扫描触发 kill",
                "同日 %d 只票 stuck（%s），已停机 72h（人工 resume）"
-               % (len(rows), ",".join(r[0] for r in rows)))
+               % (len(kill_rows), ",".join(r[0] for r in kill_rows)))
     elif events:
         notify("连续跌停预警",
                "；".join("%s 已 stuck 5 日" % c for c in events) + "，请人工介入")
@@ -280,7 +323,8 @@ def enforce_stuck_rules(conn: sqlite3.Connection,
 def run_intraday_scan(conn: sqlite3.Connection,
                       now: Optional[datetime] = None,
                       latest_prices: Optional[Dict[str, float]] = None,
-                      prev_close: Optional[Dict[str, float]] = None) -> dict:
+                      prev_close: Optional[Dict[str, float]] = None,
+                      live_quotes: Optional[Dict[str, dict]] = None) -> dict:
     """盘中入口（intraday_check 14:50）：扫描 → stuck 计数 → 联动规则。
 
     盘中不生成新应急单（当日可卖窗口太小、且 premarket 兜底链路只在盘前），
@@ -292,6 +336,8 @@ def run_intraday_scan(conn: sqlite3.Connection,
     基准错位一天。两图缺省时回退日线收盘口径（= 检测昨日的跌停，仅供回放/测试）；
     快照整体为空（行情失败）时本轮跳过 stuck 更新——既不计数也不清除
     （宁可漏计一日，不可假 kill / 假解除）。
+    W-A4②：live_quotes 由 intraday_check 传入同一实时快照——规则21 条件②
+    封单比（ask1_vol/float_mv）在扫描器路径此前恒缺数据。
     """
     if latest_prices is None or prev_close is None:
         log.warning("run_intraday_scan 未传实时快照，回退日线收盘口径"
@@ -302,10 +348,10 @@ def run_intraday_scan(conn: sqlite3.Connection,
         log.warning("实时快照为空（行情失败？），本轮跳过 stuck 更新（不计数也不清除）")
         st = {"hit": [], "removed": [], "days": {}}
         hit = []
-        hit = []
     else:
         ctx_inputs = {"latest_prices": dict(latest_prices),
-                      "prev_close": dict(prev_close)}
+                      "prev_close": dict(prev_close),
+                      "live_quotes": dict(live_quotes or {})}
         hit = [d["code"] for d in scan_positions(conn, ctx_inputs=ctx_inputs,
                                                  now=now)]
         st = update_stuck(conn, hit, (now or datetime.now()).strftime("%Y-%m-%d"))

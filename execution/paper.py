@@ -119,7 +119,8 @@ class PaperBroker:
         3. 流动性：下单金额 > 最新日线成交额 × volume_participation_cap → 拒绝。
         """
         if decision_id is not None:
-            dup = repo.has_effective_trade(conn, decision_id)
+            # W-A1：传 code——(decision_id, code) 二元判据，防同决策同票重复成交
+            dup = repo.has_effective_trade(conn, decision_id, code=code)
             if dup:
                 record_event(conn, "duplicate_decision",
                              "decision#%s 已有成交，拒绝重复执行（%s %s x%d）"
@@ -201,6 +202,19 @@ class PaperBroker:
             return close
         p = self._live_quote_price(code)
         return p if p is not None else close
+
+    def latest_price_with_source(self, conn: sqlite3.Connection, code: str,
+                                 live: bool = True) -> Tuple[Optional[float], str]:
+        """(price, source) 口径版 latest_price（Sprint4 W-A9，P1-5）：
+        source ∈ "live"（实时快照价）/ "stale_close"（实时缺失回退日线收盘——
+        昨收不得冒充实价自动成交）/ "none"（无任何数据）。"""
+        close = repo.latest_close(conn, code)
+        if not live:
+            return close, ("stale_close" if close is not None else "none")
+        p = self._live_quote_price(code)
+        if p is not None:
+            return p, "live"
+        return close, ("stale_close" if close is not None else "none")
 
     @staticmethod
     def _live_quote_price(code: str) -> Optional[float]:

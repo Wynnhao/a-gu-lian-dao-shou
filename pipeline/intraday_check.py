@@ -121,8 +121,10 @@ def main() -> int:
                     lp_live[str(c)] = float(q["price"])
                 if q.get("prev_close") is not None:
                     pc_live[str(c)] = float(q["prev_close"])
+            # W-A4②：同一实时快照整体传入——规则21 条件②封单比（ask1_vol/float_mv）
+            # 在扫描器路径此前恒缺数据（永远按"缺数据不阻断"放行）
             lh = limit_halt.run_intraday_scan(conn, now=now, latest_prices=lp_live,
-                                              prev_close=pc_live)
+                                              prev_close=pc_live, live_quotes=live)
             if lh["hit"]:
                 print("[sweep] 跌停应急扫描命中：%s（stuck days=%s）"
                       % (lh["hit"], lh["stuck"]["days"]))

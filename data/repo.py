@@ -57,11 +57,20 @@ def cash_flows(conn: sqlite3.Connection, as_of: Optional[str] = None) -> Dict[st
     return {str(side): float(amt) for side, amt in conn.execute(sql, args).fetchall()}
 
 
-def has_effective_trade(conn: sqlite3.Connection, decision_id: int) -> bool:
-    """该决策是否已有有效成交（幂等拒绝判据）。"""
-    row = conn.execute(
-        "SELECT 1 FROM trade WHERE decision_id=? AND " + TRADE_EFFECTIVE_SQL + " LIMIT 1",
-        (decision_id,)).fetchone()
+def has_effective_trade(conn: sqlite3.Connection, decision_id: int,
+                        code: Optional[str] = None) -> bool:
+    """该决策是否已有有效成交（幂等拒绝判据）。
+
+    code 参数（Sprint4 W-A1）：kill 清仓单 decision_id=None（绕 trade(decision_id)
+    唯一索引，多笔清仓单不共用 id），普通单判重仍按 decision_id；传 code 时额外
+    限定行内 code——防同决策同票重复成交的 (decision_id, code) 二元判据。
+    """
+    sql = ("SELECT 1 FROM trade WHERE decision_id=? AND " + TRADE_EFFECTIVE_SQL)
+    args: tuple = (decision_id,)
+    if code is not None:
+        sql += " AND code=?"
+        args = (decision_id, str(code))
+    row = conn.execute(sql + " LIMIT 1", args).fetchone()
     return row is not None
 
 
@@ -168,22 +177,32 @@ def has_state(conn: sqlite3.Connection, date: str) -> bool:
 
 
 def peak_total(conn: sqlite3.Connection, before: Optional[str] = None,
-               window: Optional[int] = None) -> Optional[float]:
-    """历史总资产峰值（回撤口径），三参数化合一：
+               window: Optional[int] = None,
+               after: Optional[str] = None) -> Optional[float]:
+    """历史总资产峰值（回撤口径），参数化合一（可组合）：
     - before=日期：只看该日之前（daily.mark_to_market 的当日回撤基准）；
     - window=N：只看最近 N 行（runner.build_context 的 250 行窗口——一条坏数据
       不再永久抬高峰值）；
-    - 两者都不传：全史峰值（runner 重置杀峰值用）。
+    - after=日期（Sprint4 W-A3②）：只看该日（含）之后——kill.json dd_base_date
+      的"分段 8%"窗口（kill 清仓重置后，清仓前历史峰值不参与回撤判定）；
+    - after 可与 before/window 组合（如 after+before：日报回放某日时只看
+      dd_base 之后、该日之前的窗口）；全不传：全史峰值。
     """
+    conds, args = [], []
+    if after is not None:
+        conds.append("date >= ?")
+        args.append(str(after))
+    if before is not None:
+        conds.append("date < ?")
+        args.append(str(before))
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
     if window is not None:
-        row = conn.execute(
-            "SELECT MAX(total) FROM (SELECT total FROM portfolio_state "
-            "ORDER BY date DESC LIMIT ?)", (int(window),)).fetchone()
-    elif before is not None:
-        row = conn.execute(
-            "SELECT MAX(total) FROM portfolio_state WHERE date < ?", (before,)).fetchone()
+        sql = ("SELECT MAX(total) FROM (SELECT total FROM portfolio_state%s"
+               " ORDER BY date DESC LIMIT ?)" % where)
+        args.append(int(window))
     else:
-        row = conn.execute("SELECT MAX(total) FROM portfolio_state").fetchone()
+        sql = "SELECT MAX(total) FROM portfolio_state%s" % where
+    row = conn.execute(sql, tuple(args)).fetchone()
     return float(row[0]) if row and row[0] is not None else None
 
 
@@ -216,10 +235,11 @@ def insert_decision(conn: sqlite3.Connection, decision: dict, run_date: str,
 
 
 def get_decision_row(conn: sqlite3.Connection, decision_id: int):
-    """decision 行（10 列，与 runner._get_decision 现状一致），无则 None。"""
+    """decision 行（11 列，末列为 emergency_scan——W-A5①：应急单标志以 DB 列
+    为准，input_snapshot 缺 flag 的历史行也能在 confirm 重建时恢复），无则 None。"""
     return conn.execute(
         "SELECT id, run_date, code, action, target_weight, confidence, reasons,"
-        " risk_notes, input_snapshot, status FROM decision WHERE id=?",
+        " risk_notes, input_snapshot, status, emergency_scan FROM decision WHERE id=?",
         (decision_id,)).fetchone()
 
 

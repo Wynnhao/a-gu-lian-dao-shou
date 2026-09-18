@@ -49,6 +49,10 @@ class RiskContext:
     atr_pct: Dict[str, float] = field(default_factory=dict)  # {code: ATR占比}（ATR 自适应止损）
     # ---- Sprint 1 任务 4：实时行情扩展（规则 21 条件② 死封判定） ----
     live_quotes: Dict[str, dict] = field(default_factory=dict)  # {code: quote_dict 含 ask1_vol/float_mv}
+    # ---- Sprint4 W-A9（P1-5）：latest_prices 的口径标记（build_context 填写） ----
+    # "live"=实时快照价；"stale_close"=实时缺失回退的日线收盘（昨收冒充实价）。
+    # 缺省空 dict = 旧调用方未标注 → 规则9 按原行为比对（向后兼容）。
+    price_source: Dict[str, str] = field(default_factory=dict)
     # ---- C-ARC-4（T2）：build_context 内 fail-open 的留痕便签 ----
     # 只追加、不参与裁决；调用方在 flush_events 时转成 failopen_regime_cap 事件落库。
     ctx_notes: List[str] = field(default_factory=list)
@@ -176,8 +180,26 @@ def rule_confidence(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> 
 
 
 def rule_health(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
-    """规则3：数据健康检查异常 → 降级为只出报告（不 approve）。"""
+    """规则3：数据健康检查异常 → 降级为只出报告（不 approve）。
+
+    W-A2③：kill_liquidation 补清算单降级为**留痕放行**——kill 高发恰在坏数据日，
+    report_only 会让补清算在数据异常日永无成交机会（与规则5"强平最高优先级"
+    同一口径）；豁免本身落 risk_event 可查。
+    """
     if ctx.health_issues:
+        if decision.get("kill_liquidation"):
+            v.warnings.append(
+                "规则3豁免：kill 补清算单在数据异常日留痕放行（%s）"
+                % "; ".join(ctx.health_issues))
+            v.events.append({
+                "rule": "kill_liquidation_health_exempt",
+                "detail": "kill_liquidation_health_exempt: 数据异常日（%s）补清算单 %s %s "
+                          "留痕放行（强平优先，不受 report_only 降级）"
+                          % ("; ".join(ctx.health_issues), decision.get("action"),
+                             decision.get("code")),
+                "once_today_prefix": "kill_liquidation_health_exempt: %s "
+                                     % decision.get("code")})
+            return
         v.report_only = True
         v.violations.append("数据健康异常：" + "; ".join(ctx.health_issues) + "，降级为只出报告")
 
@@ -188,11 +210,19 @@ def rule_trading_session(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict
     豁免：Fix-4 跌停应急扫描单（emergency_scan=True）——盘后 propose 只是入库
     挂 pending、盘前 09:14 兜底 confirm 才真正执行，两次动作都不在连续竞价时段，
     若按普通单拒掉 D1 链路即失效；执行价仍受 confirm 内置价格类风控约束。
+    W-A2①：kill_liquidation 补清算单同款豁免——resolve_liquidations 在 09:00
+    premarket 调 propose，非交易时段必被拒 → 递延补清算 dead-on-arrival（P1-2）；
+    强平最高优先级（CONSTRAINTS §3.3），与规则5 的清算单豁免同口径。
     """
     if not in_trading_session(ctx.now):
         if decision.get("emergency_scan"):
             v.warnings.append(
                 "规则4豁免：跌停应急扫描单允许非交易时段入库/兜底确认（执行价二次校验保留）")
+            return
+        if decision.get("kill_liquidation") and decision.get("action") == "sell":
+            v.warnings.append(
+                "规则4豁免：kill 补清算单允许非交易时段 propose/确认（强平最高优先级，"
+                "执行价二次校验保留）")
             return
         v.violations.append(
             "非交易时段：%s 不在 周一~周五 09:30-11:30/13:00-15:00，拒绝买卖"
@@ -321,7 +351,14 @@ def rule_max_positions(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) 
 
 
 def rule_price_guard(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
-    """规则9：委托价偏离实时价超阈值拒绝。"""
+    """规则9：委托价偏离实时价超阈值拒绝。
+
+    W-A9（P1-5）陈旧价口径：ctx.price_source 标记基准为 stale_close（实时缺失
+    回退昨收）时，"昨收比昨收"式的自动比价不可靠——不再产生违规/放行的伪结论，
+    降为 warning + risk_event 留痕（stale_price_guard）；真正的硬闸在执行定价层
+    （confirm 不自动以昨收成交，见 runner.confirm 的 stale_price_halt /
+    stale_price_exec）。缺 price_source 的旧调用方按原行为比对（向后兼容）。
+    """
     order = decision.get("order") or {}
     code = str(decision.get("code") or "")
     ref = (ctx.latest_prices or {}).get(code)
@@ -329,6 +366,16 @@ def rule_price_guard(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) ->
         v.violations.append("价格保护：缺少 %s 的有效实时价，无法校验委托价" % code)
         return
     price = float(order.get("price", 0) or 0)
+    if (ctx.price_source or {}).get(code) == "stale_close":
+        v.warnings.append(
+            "价格保护口径：%s 基准为陈旧昨收 %.2f（实时价缺失），自动比价跳过并留痕"
+            "（执行定价由 confirm 口径闸把关）" % (code, float(ref)))
+        v.events.append({
+            "rule": "stale_price_guard",
+            "detail": "stale_price_guard: %s 委托价 %.2f 的比价基准为陈旧昨收 %.2f"
+                      "（实时价缺失），自动比价不可靠已留痕" % (code, price, float(ref)),
+            "once_today_prefix": "stale_price_guard: %s " % code})
+        return
     dev = abs(price - ref) / float(ref)
     cap = float(cfg.get("price_guard_pct", 0.02))
     if dev > cap + 1e-12:
@@ -596,6 +643,7 @@ def rule_liquidity(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> N
     豁免：Fix-4 跌停应急扫描单（emergency_scan=True）——连续跌停日成交额萎缩
     是常态，全仓逃命单几乎必然超 1% 参与率，若照拒则 D1 应急链路形同虚设；
     应急单以跌停价集合竞价排队、不构成盘中砸盘冲击，且经人工 confirm/超时闸门。
+    W-A2③：kill_liquidation 补清算卖单同款豁免（全仓清仓额几乎必然超 1%）。
     """
     order = decision.get("order") or {}
     if not (order and decision.get("action") in ("buy", "sell")):
@@ -613,6 +661,12 @@ def rule_liquidity(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> N
             v.warnings.append(
                 "流动性豁免：跌停应急扫描单不受 %.1f%% 参与率约束"
                 "（跌停价排队逃命单，%.0f 元 > 成交额 %.0f × %.1f%%）"
+                % (cap * 100, gross, amt, cap * 100))
+            return
+        if decision.get("kill_liquidation"):
+            v.warnings.append(
+                "流动性豁免：kill 补清算卖单不受 %.1f%% 参与率约束"
+                "（强平优先，%.0f 元 > 成交额 %.0f × %.1f%%）"
                 % (cap * 100, gross, amt, cap * 100))
             return
         v.violations.append(

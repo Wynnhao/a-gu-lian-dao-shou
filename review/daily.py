@@ -145,7 +145,11 @@ def mark_to_market(trade_date: Optional[str] = None, conn: Optional[sqlite3.Conn
         total = cash + market_value
 
         # ---- 回撤（历史 peak）----
-        peak = repo.peak_total(conn, before=trade_date)
+        # W-A3⑤：峰值统一走 runner.effective_peak（dd_base 感知 + 250 行窗口 +
+        # clamp），与引擎/midday/intraday 同一定径——避免"报表说破线、引擎不 kill"
+        # 的口径分叉（此前 daily 用全史峰值、引擎用 250 行窗口，两套数字）。
+        from execution.runner import effective_peak as _effective_peak
+        peak = _effective_peak(conn, before=trade_date)
         drawdown = 0.0
         if peak is not None and float(peak) > 0:
             drawdown = max(0.0, 1.0 - total / float(peak))

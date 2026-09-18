@@ -377,6 +377,104 @@ def test_failsafe_no_pending_is_noop():
     conn.close()
 
 
+# ---------------- Sprint4 批次A：W-A5③ / W-A4③ / W-A4② ----------------
+
+def test_dedupe_emergency_allows_regeneration_after_expired():
+    """W-A5③：应急单被作废（expired）后同 run_date 可重新生成；proposed/approved
+    或已有有效成交仍然挡重生。"""
+    conn = _mem_conn()
+    did = _seed_pending_emergency(conn, run_date="2026-09-18")
+    assert limit_halt._dedupe_emergency(conn, "600519", "2026-09-18") is True
+    # expired（旧跨日闸门产物）→ 不再挡重生（P1-4 链路死锁第三环）
+    conn.execute("UPDATE decision SET status='expired' WHERE id=?", (did,))
+    conn.commit()
+    assert limit_halt._dedupe_emergency(conn, "600519", "2026-09-18") is False
+    # rejected 同样不挡
+    conn.execute("UPDATE decision SET status='rejected' WHERE id=?", (did,))
+    conn.commit()
+    assert limit_halt._dedupe_emergency(conn, "600519", "2026-09-18") is False
+    # 已有有效成交（executed）→ 挡重生（已卖过，不再重复生成）
+    conn.execute("UPDATE decision SET status='executed' WHERE id=?", (did,))
+    conn.execute(
+        "INSERT INTO trade (trade_date, code, name, side, price, shares, amount,"
+        " order_id, status, decision_id, shots, confirmed_by, created_at)"
+        " VALUES ('2026-09-18','600519','测试票','sell',90.0,200,17000.0,"
+        " 'PAPER-X','filled',?, '[]','t','2026-09-18T09:15:00')", (did,))
+    conn.commit()
+    assert limit_halt._dedupe_emergency(conn, "600519", "2026-09-18") is True
+    conn.close()
+
+
+def test_stuck_first_day_not_counted_for_kill():
+    """W-A4③（P1-7）：首日触板（first_stuck_date==今日）不计入"同日 ≥3 只 kill"
+    聚集判定；次日仍在 stuck 才计入。"""
+    conn = _mem_conn()
+    try:
+        real_today = datetime.now().strftime("%Y-%m-%d")
+        # 三只票今日首触：不得 72h kill（"触碰跌停即 kill"已禁止）
+        limit_halt.update_stuck(conn, ["600519", "000001", "600036"], real_today)
+        now = datetime.combine(datetime.now().date(), datetime.strptime(
+            "14:50", "%H:%M").time())
+        ef = limit_halt.enforce_stuck_rules(conn, now=now)
+        assert ef["kill"] is False, "首日触板不得触发全账户 kill"
+        # 次日仍 stuck（first_stuck_date≠今日）→ 计入 → kill
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        conn.execute("DELETE FROM limit_halt_stuck")
+        limit_halt.update_stuck(conn, ["600519", "000001", "600036"], yesterday)
+        ef2 = limit_halt.enforce_stuck_rules(conn, now=now)
+        assert ef2["kill"] is True
+    finally:
+        conn.close()
+
+
+def test_postclose_scan_wires_live_quotes_seal():
+    """W-A4②：盘后扫描自拉实时快照（AGSICKLE_MOCK_QUOTES 按实测协议注入）——
+    规则21 条件②封单比真正参与**生成判定**：真死封（≥3%）生成应急单且理由留痕
+    封单比；触板未封死（<3%）不判死封、不生成。"""
+    from execution import runner as _runner
+
+    def _run_with_mock(mock_quote: dict) -> dict:
+        conn = _mem_conn()
+        _seed_hit(conn)   # 昨收100/今收90（跌停）、成本110、avail 200
+        mock = {"600519": dict({"price": 90.0, "prev_close": 100.0, "open": 90.0,
+                                "high": 90.0, "low": 90.0, "time": "20260918150000",
+                                "name": "测试票", "source": "tencent",
+                                "limit_up": 110.0, "limit_down": 90.0},
+                               **mock_quote)}
+        tmp = tempfile.mkdtemp(prefix="lh_mock_quotes_")
+        qf = Path(tmp) / "quotes.json"
+        qf.write_text(json.dumps(mock, ensure_ascii=False), encoding="utf-8")
+        old_mock = os.environ.get("AGSICKLE_MOCK_QUOTES")
+        old_dis = os.environ.pop("AGSICKLE_DISABLE_LIVE_QUOTES", None)
+        os.environ["AGSICKLE_MOCK_QUOTES"] = str(qf)
+        orders_dir = Path(tempfile.mkdtemp(prefix="agsickle_lh_orders_"))
+        orig_orders_dir = _runner.ORDERS_DIR
+        _runner.ORDERS_DIR = orders_dir
+        try:
+            return limit_halt.run_postclose_scan(conn, now=datetime(2026, 9, 17, 15, 30))
+        finally:
+            if old_mock is None:
+                os.environ.pop("AGSICKLE_MOCK_QUOTES", None)
+            else:
+                os.environ["AGSICKLE_MOCK_QUOTES"] = old_mock
+            if old_dis is not None:
+                os.environ["AGSICKLE_DISABLE_LIVE_QUOTES"] = old_dis
+            _runner.ORDERS_DIR = orig_orders_dir
+            conn.close()
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+            shutil.rmtree(orders_dir, ignore_errors=True)
+
+    # 真死封：5000手×100 / (1.5e8/90) ≈ 30% ≥ 3% → 生成，理由含封单比
+    r = _run_with_mock({"ask1_price": 90.0, "ask1_vol": 5000.0, "float_mv": 1.5e8})
+    assert r["proposed"] == ["600519"], r
+
+    # 触板未封死：封单比 100×100/(1.5e8/90) ≈ 0.6% < 3% → 不生成（W-A4 核心负例，
+    # scanned=0 表示扫描器在生成前就按条件②拦下）
+    r2 = _run_with_mock({"ask1_price": 90.0, "ask1_vol": 100.0, "float_mv": 1.5e8})
+    assert r2["proposed"] == [] and r2["scanned"] == 0, r2
+
+
 # ---------------- 直接运行入口 ----------------
 
 if __name__ == "__main__":

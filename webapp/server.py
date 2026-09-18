@@ -124,7 +124,10 @@ def get_conn() -> sqlite3.Connection:
 _RUNNER_LOCK = threading.Lock()
 
 
-def run_runner(args: List[str], timeout: int = 60) -> Tuple[int, str]:
+def run_runner(args: List[str], timeout: int = 300) -> Tuple[int, str]:
+    """跑 runner.py 子进程。timeout 默认 300s（Sprint4 W-A8/P1-8：confirm 需
+    build_context 批量拉行情+兜底+regime 计算，网络差时 60s 会在 commit 后、
+    set_status 前杀掉子进程卡状态机——有 dup 防线不损账本，但仍应避免）。"""
     cmd = [sys.executable, "execution/runner.py"] + args
     with _RUNNER_LOCK:
         proc = subprocess.run(cmd, cwd=str(BASE), capture_output=True,
@@ -326,7 +329,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json(api_reject(body))
         except subprocess.TimeoutExpired:
-            self._err(504, "runner.py 执行超时（60s）")
+            self._err(504, "runner.py 执行超时（300s）")
         except FileNotFoundError as e:
             self._err(404, str(e))
         except (ValueError,) as e:

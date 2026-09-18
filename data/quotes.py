@@ -105,12 +105,19 @@ def _fetch_tencent(codes: List[str]) -> Dict[str, dict]:
                 "name": f[1] if len(f) > 1 else "",
                 "source": "tencent",
                 # Sprint 1 任务3：规则21 跌停封单应急 + 与公式兜底交叉验证
-                # 字段索引沿用本函数"市场类型 + 1"的内部偏移约定（与 f[33]/f[34] 同款）
-                "ask1_price": float(f[21]) if len(f) > 21 and f[21] else None,
-                "ask1_vol": float(f[22]) if len(f) > 22 and f[22] else None,  # 单位：手
-                "float_mv": float(f[42]) if len(f) > 42 and f[42] else None,  # 流通市值，元
-                "limit_up": float(f[45]) if len(f) > 45 and f[45] else None,
-                "limit_down": float(f[46]) if len(f) > 46 and f[46] else None,
+                # W-A4（Sprint4 P0-1，2026-09-19 只读 GET qt.gtimg.cn 实测 600519/
+                # 300750/000001 三票交叉核验后的重映射）：
+                #   f[19]/f[20]=卖一价/卖一量(手)；f[21]/f[22] 实为卖二；
+                #   f[42]=当日最低（与 f[34] 相同）；f[43]=振幅%；
+                #   f[44]=流通市值（亿元）→×1e8 换算为元；f[45]=总市值(亿)；f[46]=PB；
+                #   f[47]/f[48]=涨停/跌停价（实测 1266.98×1.10=1393.68 精确吻合，
+                #   与 common.market.limit_price 的 Decimal 取整口径一致）。
+                "ask1_price": float(f[19]) if len(f) > 19 and f[19] else None,
+                "ask1_vol": float(f[20]) if len(f) > 20 and f[20] else None,  # 单位：手
+                "float_mv": (float(f[44]) * 1e8) if len(f) > 44 and f[44] else None,
+                # ↑ 流通市值，元（f[44] 单位亿元）
+                "limit_up": float(f[47]) if len(f) > 47 and f[47] else None,
+                "limit_down": float(f[48]) if len(f) > 48 and f[48] else None,
             }
         except (ValueError, IndexError):
             continue
@@ -118,7 +125,12 @@ def _fetch_tencent(codes: List[str]) -> Dict[str, dict]:
 
 
 def _fetch_eastmoney_one(code: str) -> Optional[dict]:
-    """东财单票兜底 push2 API；secid：sh=1.xxxx，sz=0.xxxx。"""
+    """东财单票兜底 push2 API；secid：sh=1.xxxx，sz=0.xxxx。
+
+    已知限制（W-A4 记录）：兜底 quote **无 ask1_vol/float_mv**（规则21 条件②
+    封单比输入缺数据，engine 按"缺数据不阻断"放行）也无 limit_up/limit_down，
+    这些票的三条件判定退化为条件①+③；腾讯为主源、兜底票少数，可接受。
+    """
     pfx = _exchange_prefix(code)
     if pfx is None:
         return None

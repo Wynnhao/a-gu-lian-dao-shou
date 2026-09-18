@@ -59,15 +59,21 @@ def main() -> int:
             print("[midday] 资讯刷新失败（降级继续）: %s" % repr(e)[:120])
 
         # 3) 风控上下文（实时价）与持仓盈亏
-        ctx = runner.build_context(conn, now)
+        # W-A7（P0-6）：11:35 不在 is_trading_time 门控内，build_context 默认回退
+        # 昨收——把午评自拉的实时快照整体作为 override 注入，内部连带重算
+        # total_equity 与 peak：持仓表"实时价"名实相符、回撤用实价（此前 09-15
+        # 实证尾盘权益高估 4150 元、暴跌日止损扫描失明）
+        ctx = runner.build_context(conn, now, live_quotes_override=live)
         peak = ctx.peak_equity or 0.0
         dd = (1 - ctx.total_equity / peak) if peak > 0 else 0.0
 
         pos_rows = []
         for code, p in sorted(ctx.positions.items()):
-            lp = ctx.latest_prices.get(code)
-            day_chg = None
+            # W-A9/P0-6 同族口径：持仓表"实时价"列只认 live——缺实时价的票显示
+            # n/a（下方 stale_note 已提示），不再拿昨收冒充实价
             q = live.get(code)
+            lp = float(q["price"]) if (q and q.get("price") is not None) else None
+            day_chg = None
             if q and q.get("prev_close"):
                 day_chg = (q["price"] / q["prev_close"] - 1) * 100
             pnl = (lp - p["cost"]) * p["shares"] if lp else None

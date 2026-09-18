@@ -24,7 +24,7 @@ import os
 import re
 import sqlite3
 from dataclasses import asdict
-from datetime import datetime, timedelta, time as dtime
+from datetime import date, datetime, timedelta, time as dtime
 from typing import Any, Dict, List, Optional, Tuple
 
 from common.config import snapshot
@@ -94,15 +94,79 @@ def read_kill_state() -> Optional[dict]:
         return None
 
 
-def write_kill_state(until: Optional[datetime], note: str = "") -> None:
+def write_kill_state(until: Optional[datetime], note: str = "",
+                     dd_base_equity: Optional[float] = None,
+                     clear_dd_base: bool = False,
+                     extra: Optional[dict] = None,
+                     now: Optional[datetime] = None) -> None:
+    """合并式写 kill.json（Sprint4 W-A3①）：只覆盖本函数拥有的键
+    （active/until/note/updated_at），未知键（dd_base/dd_base_date/lifetime_peak/
+    kill_count 等）原样保留——此前整文件覆写会把 dd_base 抹掉，下一次
+    resume/extend 后回撤基准复位即失效（P1-1 kill 回撤死锁）。
+
+    - dd_base_equity：写入/覆盖 dd_base + dd_base_date（now 当日）——kill 全部
+      清仓完成后按清仓后权益重置回撤基准（"分段 8%" 语义，用户已拍板）；
+    - clear_dd_base：移除 dd_base 键（递延场景下旧基准已失效，
+      待 resolve_liquidations 补写）；
+    - extra：额外合并键（lifetime_peak/kill_count 等累计观测口径）；
+    - now：dd_base_date/updated_at 的时钟基准（回放/测试可注入，缺省墙钟）。
+    原子写：tmp + rename（半写文件不再可能被 read_kill_state 读到）。
+    """
+    now = now or datetime.now()
+    try:
+        existing = json.loads(KILL_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            existing = {}
+    except (OSError, ValueError):
+        existing = {}
+    payload = dict(existing)
+    payload.update({"active": until is not None,
+                    "until": until.isoformat(timespec="seconds") if until else None,
+                    "note": note,
+                    "updated_at": now.isoformat(timespec="seconds")})
+    if dd_base_equity is not None:
+        payload["dd_base"] = round(float(dd_base_equity), 2)
+        payload["dd_base_date"] = now.strftime("%Y-%m-%d")
+    if clear_dd_base:
+        payload.pop("dd_base", None)
+        payload.pop("dd_base_date", None)
+    if extra:
+        payload.update(extra)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.chmod(0o755)
-    payload = {"active": until is not None,
-               "until": until.isoformat(timespec="seconds") if until else None,
-               "note": note,
-               "updated_at": datetime.now().isoformat(timespec="seconds")}
-    KILL_STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
-                               encoding="utf-8")
+    tmp = KILL_STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(KILL_STATE_FILE)
+
+
+def _update_kill_state_extras(extra: dict, clear_dd_base: bool = False,
+                              now: Optional[datetime] = None) -> None:
+    """不改停机语义（active/until/note 沿用现值）地合并 extra 键——
+    resolve_liquidations 递延补写 dd_base 用（W-A3③）。"""
+    ks = read_kill_state() or {}
+    until: Optional[datetime] = None
+    if ks.get("active") and ks.get("until"):
+        try:
+            until = datetime.fromisoformat(str(ks["until"]))
+        except (TypeError, ValueError):
+            until = None
+    write_kill_state(until, str(ks.get("note") or ""), clear_dd_base=clear_dd_base,
+                     extra=extra, now=now)
+
+
+def effective_peak(conn: sqlite3.Connection, before: Optional[str] = None,
+                   window: int = 250) -> Optional[float]:
+    """回撤峰值的唯一定径（W-A3⑤ 统一口径）：
+    - kill.json 带 dd_base_date（分段 8% 语义）：只看 dd_base_date（含）之后的
+      portfolio_state 峰值——清仓重置前的历史峰值不再参与回撤判定；
+    - 否则：最近 window 行窗口峰值（一条坏数据不永久抬高峰值）；
+    - before 供日报回放口径（mark_to_market 只看该日之前）。
+    clamp（max 当前权益）由调用方做——峰值至少不低于当前权益。"""
+    ks = read_kill_state() or {}
+    base = ks.get("dd_base_date")
+    if base:
+        return repo.peak_total(conn, after=str(base), before=before)
+    return repo.peak_total(conn, window=window, before=before)
 
 
 def kill_resume(conn: sqlite3.Connection, reason: str = "") -> dict:
@@ -131,14 +195,21 @@ def kill_extend(conn: sqlite3.Connection, hours: float, reason: str = "") -> dic
 
 # ---------------------------------------------------------------- 上下文组装
 
-def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
+def build_context(conn: sqlite3.Connection, now: datetime,
+                  live_quotes_override: Optional[Dict[str, dict]] = None) -> RiskContext:
     """组装风控上下文。
 
     - today_trades = trade 表当日 filled+submitted 计数；
     - week_turnover = 近5交易日（daily_bar 最近5个交易日）有效成交额合计 / total_equity；
-    - peak_equity = max(portfolio_state 历史 MAX(total), 当前 total_equity)；
-    - kill_switch_until = risk_event 最近一条 rule 含 'kill' 的事件 ts + kill_stop_hours；
-    - blacklist / health_issues 来自 risk.blacklist。
+    - peak_equity = max(回撤窗口峰值, 当前 total_equity)；窗口为 dd_base 感知
+      （W-A3⑤：kill.json 带 dd_base_date 时只看该日之后，否则 250 行窗口）；
+    - kill_switch_until = kill.json（权威）；文件缺失回退 risk_event 推导；
+    - blacklist / health_issues 来自 risk.blacklist；
+    - live_quotes_override（W-A7）：调用方自带实时快照（midday force 拉取）——
+      跳过交易时段门控直接采用，并连带重算 total_equity（只改 latest_prices
+      不改 equity 则回撤照样失真）；
+    - price_source（W-A9）：每票价格口径 "live"/"stale_close"，规则9 与
+      confirm 定价据此识别"昨收冒充实价"。
     """
     broker = PaperBroker()
     cash, positions, total_equity, prev_closes = broker.portfolio(conn)
@@ -149,7 +220,10 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
     # 实时行情：交易时段批量拉一次（闭市/禁用/失败自动回退日线收盘）
     live_quotes: Dict[str, dict] = {}
     import os
-    if (os.environ.get("AGSICKLE_DISABLE_LIVE_QUOTES") != "1"
+    if live_quotes_override is not None:
+        live_quotes = {str(k): v for k, v in live_quotes_override.items()
+                       if isinstance(v, dict)}
+    elif (os.environ.get("AGSICKLE_DISABLE_LIVE_QUOTES") != "1"
             and CFG.get("execution", {}).get("use_live_prices", True)):
         try:
             from data.quotes import get_live_prices, is_trading_time
@@ -160,17 +234,28 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
             log.warning("实时行情获取失败，风控盯市退回昨收价: %s", e)
             live_quotes = {}
     latest_prices: Dict[str, float] = {}
+    price_source: Dict[str, str] = {}   # W-A9：live / stale_close
     for code in sorted(codes):
         q = live_quotes.get(code)
         if q and q.get("price") is not None:
             latest_prices[code] = float(q["price"])
+            price_source[code] = "live"
         else:
             lp = broker.latest_price(conn, code, live=False)
             if lp is not None:
                 latest_prices[code] = lp
+                price_source[code] = "stale_close"
     for code, q in live_quotes.items():  # 实时昨收补齐（新股仅1根bar时日线推不出）
         if code not in prev_closes and q.get("prev_close") is not None:
             prev_closes[code] = float(q["prev_close"])
+    if live_quotes_override is not None:
+        # W-A7：override 连带重算 total_equity——持仓价以 override 为权威，
+        # 缺价票退回成本价（与 paper.portfolio 同款回退）
+        total_equity = cash
+        for code, p in positions.items():
+            lp = latest_prices.get(code)
+            total_equity += p["shares"] * float(lp if lp is not None else p["cost"])
+        total_equity = round(total_equity, 2)
 
     today = now.strftime("%Y-%m-%d")
     today_trades = int(conn.execute(
@@ -195,10 +280,10 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
         week_amount = float(row[0] or 0.0)
     week_turnover = (week_amount / total_equity) if total_equity > 0 else 0.0
 
-    # 峰值只取最近 250 行：一条坏数据/测试 seed 行此前会永久抬高峰值，
-    # 导致误 kill 或回撤永远 ≥8% 而锁死
-    peak_window = repo.peak_total(conn, window=250)
-    peak_equity = max(float(peak_window or 0.0), float(total_equity))
+    # 峰值（W-A3⑤ 统一口径）：dd_base 感知窗口 + clamp——kill 清仓重置后走
+    # "分段 8%"（dd_base 之后窗口），否则最近 250 行；一条坏数据/测试 seed 行
+    # 不再永久抬高峰值导致误 kill 或回撤锁死
+    peak_equity = max(float(effective_peak(conn) or 0.0), float(total_equity))
 
     # kill 停机期：logs/state/kill.json 为权威（支持人工 resume/extend），
     # 文件缺失时回退 risk_event 白名单推导（kill_switch/kill_manual/kill_extend）
@@ -272,6 +357,8 @@ def build_context(conn: sqlite3.Connection, now: datetime) -> RiskContext:
         position_cap=position_cap,
         atr_pct=atr_pct,
         ctx_notes=ctx_notes,
+        live_quotes=live_quotes,   # W-A4②：此前恒为空 dict，规则21 条件②从未算过
+        price_source=price_source,  # W-A9：昨收冒充实价的口径标记
     )
 
 
@@ -290,12 +377,20 @@ def _parse_json_list(raw: Any) -> List[str]:
 
 def _decision_from_row(row: tuple) -> dict:
     """decision 行 → 决策 dict。order 优先取 input_snapshot 中的 JSON（ai.decide 落库时
-    input_snapshot 可能是 bundle 全文，故按 code+action 匹配查找）。"""
-    (did, run_date, code, action, tw, conf, reasons, risk_notes, snapshot, status) = row
+    input_snapshot 可能是 bundle 全文，故按 code+action 匹配查找）。
+
+    W-A5①：行扩为 11 列（末列 emergency_scan），应急单标志以 **DB 列为准**——
+    input_snapshot 缺 flag 的历史行/手工行也能在 confirm 重建 dict 时恢复，
+    规则4/14/18 的豁免判定不再依赖快照 JSON 是否完整。
+    """
+    (did, run_date, code, action, tw, conf, reasons, risk_notes, snapshot, status,
+     emergency_scan) = row
     d: Dict[str, Any] = {
         "action": action, "code": code, "target_weight": tw, "confidence": conf,
         "reasons": _parse_json_list(reasons), "risk_notes": _parse_json_list(risk_notes),
     }
+    if emergency_scan:
+        d["emergency_scan"] = True
     order = None
     if snapshot:
         try:
@@ -316,6 +411,7 @@ def _decision_from_row(row: tuple) -> dict:
                 order = c["order"]
                 # Fix-4：带回应急单标志——规则 4/14/18 的 emergency_scan 豁免判定
                 # 依赖这些键，丢失会让 09:14 兜底 confirm 在非交易时段被拒
+                # （emergency_scan 现以 DB 列为准，快照缺 flag 不影响）
                 for _flag in ("emergency_scan", "emergency_pending_skip"):
                     if c.get(_flag) is not None:
                         d[_flag] = c[_flag]
@@ -377,14 +473,15 @@ def _pending_path(date_str: str, decision_id: int,
 
 
 def _write_pending(conn: sqlite3.Connection, decision_id: int, decision: dict, v: Verdict,
-                   now: datetime, orders_dir: Optional[Path] = None) -> Path:
+                   now: datetime, orders_dir: Optional[Path] = None,
+                   run_date: Optional[str] = None) -> Path:
     """闸门开启时把待确认单写 logs/orders/<date>/pending_<decision_id>.json。
 
-    valid_until=当日 15:05（此前 pending 无 TTL，昨日决策今天仍可按今日价成交，
-    决策依据早已失效）。
+    valid_until=**run_date 当日** 15:05（W-A5②：与 confirm 的 TTL 闸门同一口径——
+    应急单 run_date=次日，文件不再写创建日导致"生成即过期"的字面歧义）。
     """
     order = v.adjusted_order if v.adjusted_order is not None else (decision.get("order") or {})
-    valid_until = now.strftime("%Y-%m-%d") + "T15:05:00"
+    valid_until = (run_date or now.strftime("%Y-%m-%d")) + "T15:05:00"
     payload = {
         "decision_id": decision_id,
         "created_at": now.isoformat(timespec="seconds"),
@@ -444,9 +541,15 @@ def _do_kill(conn: sqlite3.Connection, v: Verdict, decision_id: Optional[int],
     deferred = list(v.kill_pending or [])
     trade_ids: List[int] = []
     for ko in v.kill_orders:
+        # W-A1（P0-4）：每笔清仓单 decision_id=None——多笔共用同一 id 会被
+        # trade(decision_id) 唯一索引（idx_trade_decision_uniq）在第 2 笔 INSERT 时
+        # 抛 IntegrityError（不在 _pre_trade_guards 的 try 内→kill 中途崩溃、
+        # kill.json 未写）；partial unique index 对 NULL 不生效。血缘由
+        # confirmed_by="kill_switch" + 下方 kill_executed 汇总事件（C-ARC H2：
+        # detail 含根 decision_id + trade_id 列表，为血缘唯一载体）保留。
         res = broker.sell(conn, str(ko["code"]), str(ko.get("name") or ko["code"]),
                           float(ko.get("price") or 0), int(ko.get("shares") or 0),
-                          decision_id=decision_id, confirmed_by="kill_switch",
+                          decision_id=None, confirmed_by="kill_switch",
                           trade_date=td)
         if res is None:
             msg = "kill 清仓失败：%s" % json.dumps(ko, ensure_ascii=False)
@@ -469,6 +572,29 @@ def _do_kill(conn: sqlite3.Connection, v: Verdict, decision_id: Optional[int],
                                 ensure_ascii=False),
                      decision_id)
         print("[KILL] %s T+1/失败递延，已列入次日补清算（%d 股）" % (code, pos[1]))
+    # W-A3③④：回撤基准重置 + 累计观测口径。
+    # 全部清仓完成（无失败/递延，position 表已空）→ 按清仓后权益写 dd_base
+    # （分段 8%：resume 后不再被清仓前历史峰值立即重新 kill）；
+    # 有递延 → 清掉旧 dd_base（基准失效），由 resolve_liquidations 补清仓完成后补写。
+    # lifetime_peak/kill_count 持续累计（日报/risk_event 观测全史口径，
+    # 不随分段重置丢失熔断史——用户已拍板接受"分段 8%"语义）。
+    ks_prev = read_kill_state() or {}
+    extra = {
+        "kill_count": int(ks_prev.get("kill_count") or 0) + 1,
+        "lifetime_peak": round(max(float(ks_prev.get("lifetime_peak") or 0.0),
+                                   float(repo.peak_total(conn) or 0.0)),
+                               2),
+    }
+    if deferred:
+        write_kill_state(v.kill_until, "decision#%s 触发" % decision_id,
+                         clear_dd_base=True, extra=extra, now=now)
+    else:
+        post_equity = broker.portfolio(conn)[2]
+        write_kill_state(v.kill_until, "decision#%s 触发" % decision_id,
+                         dd_base_equity=post_equity, extra=extra, now=now)
+        record_event(conn, "kill_dd_base_reset",
+                     "kill 清仓完成，回撤基准重置为清仓后权益 %.2f（dd_base_date=%s，"
+                     "分段 8%% 口径）" % (post_equity, td), decision_id)
     # C-ARC-4（T2）：kill 执行汇总留痕（一条；逐笔与 trade 表 100% 冗余——
     # trade 行天然带 decision_id + confirmed_by='kill_switch'，ADR-0 §2）。
     # H2（sprint4-carc-conflicts）：W-A1 后 trade.decision_id 可能为 NULL，
@@ -480,7 +606,7 @@ def _do_kill(conn: sqlite3.Connection, v: Verdict, decision_id: Optional[int],
                             ensure_ascii=False),
                  decision_id)
     apply_kill_switch(conn, v.kill_until, note="decision#%s 触发" % decision_id)
-    write_kill_state(v.kill_until, "decision#%s 触发" % decision_id)
+    # kill.json 已在上方 dd_base 分支合并式写入（active/until/note + dd_base/累计键）
     notify("⚠️ KILL SWITCH 触发", "回撤熔断：清仓 %d 笔，停机至 %s%s"
            % (len(v.kill_orders),
               v.kill_until.strftime("%m-%d %H:%M") if v.kill_until else "-",
@@ -500,6 +626,7 @@ def resolve_liquidations(conn: sqlite3.Connection, now: Optional[datetime] = Non
         "SELECT id, ts, detail FROM risk_event WHERE rule='kill_liquidation_pending' "
         "ORDER BY id").fetchall()
     n = 0
+    cleared = 0      # 本轮扫描发现"已清偿"的事件数（事件行永存，不删）
     for eid, ts, detail in rows:
         try:
             info = json.loads(detail)
@@ -515,7 +642,12 @@ def resolve_liquidations(conn: sqlite3.Connection, now: Optional[datetime] = Non
         pos = conn.execute(
             "SELECT name, shares, cost FROM position WHERE code=?", (code,)).fetchone()
         if not pos or int(pos[1]) <= 0 or sold >= shares:
+            cleared += 1
             continue  # 已清仓完成
+        # W-A9 定价同规则：盘前实时价不可用 → 显式取日线最新收盘（陈旧口径）
+        # 作为委托价——该价随 decision 落快照为"设计执行价"，confirm 侧按
+        # kill_liquidation 显式价路径执行并留痕，不会出现"自动以昨收成交"的
+        # 静默回退（execution 定价口径见 confirm 内 stale_price_* 事件）。
         price = PaperBroker().latest_price(conn, code, live=False) or 0.0
         if price <= 0:
             price = float(pos[2] or 0)
@@ -525,7 +657,8 @@ def resolve_liquidations(conn: sqlite3.Connection, now: Optional[datetime] = Non
             "action": "sell", "code": code, "name": pos[0],
             "target_weight": 0.0, "confidence": 1.0,
             "reasons": ["kill 递延补清算（T+1 解锁/上次卖出失败）"],
-            "risk_notes": ["kill_switch 自动清算单"],
+            "risk_notes": ["kill_switch 自动清算单",
+                           "定价口径：日线最新收盘（盘前实时价不可用，陈旧基准已留痕）"],
             "kill_liquidation": True,
             "order": {"side": "sell", "price": price, "shares": int(pos[1])},
         }
@@ -533,6 +666,24 @@ def resolve_liquidations(conn: sqlite3.Connection, now: Optional[datetime] = Non
         propose(conn, decision, run_date=now.strftime("%Y-%m-%d"), now=now,
                 orders_dir=orders_dir)
         n += 1
+    # W-A3③：递延场景的 dd_base 补写——kill_liquidation_pending 事件在本轮全部
+    # 清偿（有 cleared 或本轮 propose 的 n）、position 表已空，且 kill.json 处于
+    # "kill 已发生但 dd_base 未重置"的待重置态 → 按当前权益重置回撤基准。
+    # 覆盖两条路径：本轮 gate-off 直接成交（n>0），以及上一轮 pending 清算单此后
+    # 被 confirm 成交（cleared>0、n=0）。gate-on 落 pending 时持仓未空 → 不写。
+    # 幂等：写入后 dd_base_date 存在，后续 resolve 不再触发（仅日期更新才覆盖）。
+    pos_left = conn.execute("SELECT COUNT(*) FROM position WHERE shares>0").fetchone()[0]
+    ks = read_kill_state() or {}
+    pending_reset = bool(ks.get("kill_count")) and not ks.get("dd_base_date")
+    if (n or cleared) and not pos_left and pending_reset:
+        eq = PaperBroker().portfolio(conn)[2]
+        _update_kill_state_extras({"dd_base": round(eq, 2),
+                                   "dd_base_date": now.strftime("%Y-%m-%d")},
+                                  now=now)
+        record_event(conn, "kill_dd_base_reset",
+                     "kill 递延补清算全部完成，回撤基准重置为权益 %.2f"
+                     "（dd_base_date=%s，分段 8%% 口径）"
+                     % (eq, now.strftime("%Y-%m-%d")))
     return n
 
 
@@ -845,7 +996,8 @@ def propose(conn: sqlite3.Connection, decision: dict, decision_id: Optional[int]
             print("[propose] decision#%d 状态 -> approved（%s 无交易动作，无需确认）"
                   % (decision_id, decision.get("action")))
         elif not direct_exec:
-            path = _write_pending(conn, decision_id, decision, v, now, orders_dir)
+            path = _write_pending(conn, decision_id, decision, v, now, orders_dir,
+                                  run_date=run_date)
             _set_status(conn, decision_id, "approved")
             print("[gate] 人工闸门开启：待确认单 %s" % path)
             print("[gate] 等待人工确认 -> python3 execution/runner.py confirm"
@@ -931,9 +1083,12 @@ def confirm(conn: sqlite3.Connection, decision_id: int, confirmed_by: str = "hum
             orders_dir: Optional[Path] = None) -> Optional[dict]:
     """人工确认执行单条 approved 决策：重跑风控 → 成交（price_override 或最新价）→ 回读。
 
-    - 决策 run_date 与今天不一致（或 pending 过期）→ 置 expired，拒绝执行昨天的决策；
+    - 决策 run_date 与今天不一致 → 置 expired（emergency_scan 单且 run_date≥今日
+      豁免——T 晚生成次日执行，W-A5②）；TTL 按 run_date 当日 15:05（非墙钟当日）；
     - 最终成交价（override/实时价）确定后，再对**执行价**重跑价格保护与涨跌停
-      校验——此前重跑风控用的是决策原始价，--price 覆盖价可绕过全部价格类风控。
+      校验——此前重跑风控用的是决策原始价，--price 覆盖价可绕过全部价格类风控；
+    - 实时价缺失时（W-A9）不得自动以昨收成交：应急/补清算单按其显式设计价执行
+      并留痕（stale_price_exec），普通单挂起保留 approved 等 --price 显式确认。
     """
     now = now or datetime.now()
     _assert_paper_mode()
@@ -945,29 +1100,43 @@ def confirm(conn: sqlite3.Connection, decision_id: int, confirmed_by: str = "hum
     if row[9] != "approved":
         print("[confirm] decision#%d 当前状态 %s，仅 approved 可确认" % (decision_id, row[9]))
         return None
-    # 过期闸门：决策是为某个交易日做的，跨日（或超当日 15:05）决策依据已失效
+    # 过期闸门（W-A5②）：决策是为某个交易日做的，跨日决策依据已失效——
+    # 豁免：emergency_scan 单（run_date=预期执行日=次日，T 晚生成后允许跨日
+    # 确认），但 run_date 已过（<今日）的陈旧应急单照常作废（可重新扫描生成）
     run_date = str(row[1] or "")
+    is_emergency = bool(row[10]) or bool(decision.get("emergency_scan"))
     if run_date and run_date != now.strftime("%Y-%m-%d"):
-        _set_status(conn, decision_id, "expired")
-        _remove_pending(decision_id, orders_dir)
-        record_event(conn, "pending_expired",
-                     "decision#%d run_date=%s 跨日确认被拒（今日 %s）"
+        if not (is_emergency and run_date >= now.strftime("%Y-%m-%d")):
+            _set_status(conn, decision_id, "expired")
+            _remove_pending(decision_id, orders_dir)
+            record_event(conn, "pending_expired",
+                         "decision#%d run_date=%s 跨日确认被拒（今日 %s）"
+                         % (decision_id, run_date, now.strftime("%Y-%m-%d")), decision_id)
+            print("[confirm] decision#%d 状态 -> expired（决策日 %s ≠ 今日，需重新决策）"
+                  % (decision_id, run_date))
+            return None
+        record_event(conn, "pending_crossday_allowed",
+                     "decision#%d emergency_scan 单跨日放行（run_date=%s ≥ 今日 %s）"
                      % (decision_id, run_date, now.strftime("%Y-%m-%d")), decision_id)
-        print("[confirm] decision#%d 状态 -> expired（决策日 %s ≠ 今日，需重新决策）"
-              % (decision_id, run_date))
-        return None
-    # 当日 TTL：pending 文件的 valid_until（run_dateT15:05，见 _write_pending）此前
-    # 只写不读，收盘后确认只能靠重跑风控的"非交易时段"规则巧合兜底——这里把 TTL
-    # 落地为显式闸门（边界含 15:05:00，与"有效至 15:05"一致）
-    if run_date and now.time() > dtime(15, 5):
-        _set_status(conn, decision_id, "expired")
-        _remove_pending(decision_id, orders_dir)
-        record_event(conn, "pending_expired",
-                     "decision#%d 超当日 15:05 TTL 确认被拒（now=%s）"
-                     % (decision_id, now.strftime("%H:%M:%S")), decision_id)
-        print("[confirm] decision#%d 状态 -> expired（已过当日 15:05 有效期，需重新决策）"
-              % decision_id)
-        return None
+        print("[confirm] decision#%d 应急单跨日放行（run_date=%s）" % (decision_id, run_date))
+    # TTL 闸门（W-A5②）：有效期按 **run_date 当日 15:05**（而非墙钟当日）——
+    # 应急单 run_date=次日，T 晚 22:00 confirm 仍在次日 15:05 之前 → 放行；
+    # 此前按墙钟当日 15:05 判，T 晚 confirm 必被杀（P1-4 "睡前 confirm 即作废"）
+    if run_date:
+        try:
+            deadline = datetime.combine(date.fromisoformat(run_date), dtime(15, 5))
+        except ValueError:
+            deadline = None
+        if deadline is not None and now > deadline:
+            _set_status(conn, decision_id, "expired")
+            _remove_pending(decision_id, orders_dir)
+            record_event(conn, "pending_expired",
+                         "decision#%d 超 run_date(%s) 当日 15:05 TTL 确认被拒（now=%s）"
+                         % (decision_id, run_date, now.isoformat(timespec="seconds")),
+                         decision_id)
+            print("[confirm] decision#%d 状态 -> expired（已过 %s 15:05 有效期，需重新决策）"
+                  % (decision_id, run_date))
+            return None
     ctx = build_context(conn, now)
     v = check(decision, ctx, CFG.get("risk", {}))
     print("[confirm] decision#%d 重跑风控：%s" % (decision_id, v.brief()))
@@ -993,14 +1162,42 @@ def confirm(conn: sqlite3.Connection, decision_id: int, confirmed_by: str = "hum
 
     broker = PaperBroker()
     code = str(decision.get("code"))
-    if price_override is not None:
+    order = v.adjusted_order if v.adjusted_order is not None else decision.get("order") or {}
+    explicit_price = price_override is not None
+    if explicit_price:
         price = float(price_override)
     else:
-        price = broker.latest_price(conn, code)
+        # W-A9（P1-5）：定价必须带口径——live=实时价可用；stale_close=实时缺失
+        # 回退昨收。陈旧昨收**不得自动成交**：应急/补清算单走其显式设计价
+        # （跌停价/盘前收盘，构造时即定价并留痕）；普通单挂起等 --price。
+        price, psource = broker.latest_price_with_source(conn, code)
         if price is None:
-            price = float((decision.get("order") or {}).get("price") or 0)
+            price = float(order.get("price") or 0)
             print("[confirm] 警告：无最新收盘，退回决策价 %.2f" % price)
-    order = v.adjusted_order if v.adjusted_order is not None else decision.get("order") or {}
+        elif psource == "stale_close":
+            if decision.get("emergency_scan") or decision.get("kill_liquidation"):
+                dp = float(order.get("price") or 0)
+                if dp <= 0:
+                    print("[confirm] 挂起：实时价缺失且决策无显式价，不自动以昨收成交")
+                    return None
+                stale_ref = price
+                price = dp
+                explicit_price = True   # 决策设计价 ≠ 自动昨收
+                record_event(conn, "stale_price_exec",
+                             "decision#%d %s 实时价缺失，按决策显式设计价 %.2f 执行"
+                             "（昨收 %.2f 不作为成交价）" % (decision_id, code, dp, stale_ref),
+                             decision_id)
+                print("[confirm] %s 应急/清算单按显式设计价 %.2f 执行（实时价缺失已留痕）"
+                      % ("emergency_scan" if decision.get("emergency_scan")
+                         else "kill_liquidation", dp))
+            else:
+                record_event(conn, "stale_price_halt",
+                             "decision#%d %s 实时价缺失（仅剩昨收 %.2f），拒绝自动以"
+                             "昨收成交，保留 approved 等待 --price 显式确认"
+                             % (decision_id, code, price), decision_id)
+                print("[confirm] 挂起：实时价缺失（仅剩昨收 %.2f），不自动以昨收成交；"
+                      "请稍后重试或 --price 显式确认（事件 stale_price_halt 已留痕）" % price)
+                return None
     shares = int(order.get("shares") or 0)
     if shares <= 0 or price <= 0:
         print("[confirm] 价格/数量非法，放弃执行")
@@ -1011,6 +1208,9 @@ def confirm(conn: sqlite3.Connection, decision_id: int, confirmed_by: str = "hum
     recheck_decision = dict(decision)
     recheck_decision["order"] = dict(order)
     recheck_decision["order"]["price"] = price
+    if explicit_price:
+        # W-A9：显式给价（--price / 应急设计价）→ 规则9 按显式口径留痕放行
+        recheck_decision["_explicit_price"] = True
     from risk import engine as _eng
     _eng.rule_price_guard(recheck_decision, ctx, CFG.get("risk", {}), recheck)
     _eng.rule_price_limit(recheck_decision, ctx, CFG.get("risk", {}), recheck)
@@ -1030,10 +1230,22 @@ def confirm(conn: sqlite3.Connection, decision_id: int, confirmed_by: str = "hum
 
 def reject(conn: sqlite3.Connection, decision_id: int, by: str = "human",
            reason: str = "", orders_dir: Optional[Path] = None) -> bool:
-    """人工否决：status=rejected + risk_event 留痕 + 清理 pending 文件。"""
+    """人工否决：status=rejected + risk_event 留痕 + 清理 pending 文件。
+
+    W-A6（P1-6）：executed/executed_unverified 一律拒绝 reject——已成交决策被置回
+    rejected 会让账实审计链断裂（trade 行还在、决策却显示否决）。
+    """
     got = _get_decision(conn, decision_id)
     if not got:
         print("[reject] decision#%d 不存在" % decision_id)
+        return False
+    cur_status = str(got[0][9] or "")
+    if cur_status in ("executed", "executed_unverified"):
+        record_event(conn, "manual_reject_rejected",
+                     "decision#%d 已成交（status=%s），拒绝 reject（审计链保护）"
+                     % (decision_id, cur_status), decision_id)
+        print("[reject] decision#%d 已成交（status=%s），不可否决（审计链保护）"
+              % (decision_id, cur_status))
         return False
     _set_status(conn, decision_id, "rejected")
     record_event(conn, "manual_reject", "%s: %s" % (by, reason or "未填写理由"), decision_id)

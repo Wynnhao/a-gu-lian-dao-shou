@@ -223,7 +223,8 @@ def test_pending_ttl_boundary_and_crossday_full_chain():
         v1 = runner.propose(conn, mk_decision("buy", "000001", 11.0, 100),
                             now=NOW10, orders_dir=orders)
         assert v1.approved and len(runner.list_pending(orders)) == 1
-        res = runner.confirm(conn, 1, confirmed_by="场景1", now=NOW10, orders_dir=orders)
+        res = runner.confirm(conn, 1, confirmed_by="场景1", now=NOW10, orders_dir=orders,
+                             price_override=11.0)   # W-A9：离线无实时价，显式价确认
         assert res is not None and res["ok"]
         assert conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0] \
             == "executed"
@@ -565,6 +566,44 @@ def test_weekly_cleanup_and_minute_series_roundtrip():
             os.environ["AGSICKLE_QUOTES_DIR"] = old_q
         shutil.rmtree(qdir, ignore_errors=True)
         conn.close()
+
+
+# ---------------- Sprint4 批次A：W-A7 midday 实时价（P0-6） ----------------
+
+def test_midday_live_override_prices_and_equity():
+    """W-A7：11:35（is_trading_time 界外）midday 用自身 force 拉取的实时快照作为
+    build_context 的 live_quotes_override——持仓表"实时价"=mock 实时价（非昨收）、
+    组合权益按实时价重算（此前回撤/权益全用昨收，P0-6 实证暴跌日止损失明）。"""
+    import pipeline.midday as midday_mod
+    _fresh_env("midday")
+    _seed_db(with_today=True)
+    conn = sqlite3.connect(os.environ["AGSICKLE_DB"])
+    conn.execute(
+        "INSERT INTO position (code, name, shares, avail_shares, cost, updated_at)"
+        " VALUES ('600519','贵州茅台',100,100,10.0,?)",
+        (datetime.now().isoformat(timespec="seconds"),))
+    conn.commit()
+    conn.close()
+    # SESSION_DIR 等目录常量为 import 期固化 → 指向 _fresh_env 的隔离目录
+    midday_mod.SESSION_DIR = Path(os.environ["AGSICKLE_SESSION_DIR"])
+
+    now = datetime.combine(_BASE, time(11, 35, 0))   # 冻结午评时点（11:35）
+    old_argv = sys.argv
+    sys.argv = ["midday.py", "--now", now.isoformat(timespec="seconds")]
+    try:
+        rc = midday_mod.main()   # --now 回放 → 产物写 SESSION_DIR/test
+    finally:
+        sys.argv = old_argv
+    assert rc == 0
+    bundle_json = midday_mod.SESSION_DIR / "test" / "midday_bundle.json"
+    assert bundle_json.is_file()
+    blob = json.loads(bundle_json.read_text(encoding="utf-8"))
+    # 权益 = 现金 1,000,000 + 100 股 × mock 实时价 1500（昨收口径应为 10.00 → 1,001,000）
+    assert blob["portfolio"]["equity"] == 1150000.0, blob["portfolio"]
+    bundle_md = (midday_mod.SESSION_DIR / "test" / "midday_bundle.md").read_text(
+        encoding="utf-8")
+    assert "1500.00" in bundle_md, "持仓表实时价列必须是 mock 实时价"
+    assert "10.00 | 1500.00" in bundle_md or "| 1500.00 |" in bundle_md
 
 
 # ----------------------- 直接运行入口 -----------------------
