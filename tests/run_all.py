@@ -27,6 +27,9 @@ FILES = [
     "test_repo.py", "test_limit_halt.py", "test_breadth.py", "test_macro.py",
     "test_guard_invariant.py", "test_sprint4_b.py", "test_sprint4_c.py",
     "test_sprint4_d.py",
+    # 缠论 R3 gate 批（批次 1/2a 并行交付 test_chanlib / test_chan_backtest，
+    # 文件先注册，缺失时上面 is_file() 跳过；批次 0 交付 test_chan_data）
+    "test_chanlib.py", "test_chan_backtest.py", "test_chan_data.py",
 ]
 
 
