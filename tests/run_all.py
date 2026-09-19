@@ -32,6 +32,12 @@ FILES = [
     # 批次 2b 交付 test_chan_causal）
     "test_chanlib.py", "test_chan_backtest.py", "test_chan_data.py",
     "test_chan_causal.py",
+    # 全量打包批（2026-09-20 §3.1 附带义务）：4 个测试名先预注册，文件由对应
+    # 批次创建，缺失时 is_file() 跳过（R3 并行惯例，避免并行 Edit 冲突）——
+    # 批次 0 交付 test_qfq_rebuild；批次 1 交付 test_hedge_pair；
+    # 批次 2 交付 test_chan_evidence；批次 3 交付 test_rotation_x
+    "test_qfq_rebuild.py", "test_hedge_pair.py", "test_chan_evidence.py",
+    "test_rotation_x.py",
 ]
 
 

@@ -9,6 +9,11 @@
   优先取它，缺失时回退不复权 close；high_qfq/low_qfq 由 close_qfq/close 比例
   同行导出（复权是逐行线性缩放），供 ATR 全复权计算（混用 raw H/L 与 qfq C
   会在除权日产生假 TR 跳变）；
+- daily_bar.open_qfq（批次0 Gate 0-B，2026-09-20）：与 high/low_qfq 同一等比
+  口径 open × (close_qfq/close)，round4 舍入单调 ⇒ raw low≤open≤high 成立时
+  导出值不破坏不等式。增量写路径（backfill_qfq/rebrush_qfq_full）在检测到
+  daily_bar 已有 open_qfq 列时同步写该列；列不存在则跳过（老库未跑过 Gate 0-B
+  回填时行为零变化，不自动迁移 schema——列由批次0 gate0b-apply 单事务创建）；
 - index_daily 存指数 close + high/low（RSRS 需要高低价回归）；
 - daily_bar.source / fetch_log.detail 记录实际命中数据源，降级口径可审计；
 - SQLite 连接统一 WAL + busy_timeout，webapp/catchup/postclose 三方并发写不再撞锁。
@@ -377,6 +382,34 @@ def call_ak(source: str, fn, *args, retries: int = 2, **kw):
     raise last
 
 
+# ---------------------------------------------------------------- qfq 列族写路径助手
+
+def _qfq_has_open_col(conn: sqlite3.Connection) -> bool:
+    """daily_bar 是否已有 open_qfq 列（批次0 Gate 0-B 增列后增量路径同步写它；
+    未增列的老库保持三列写入，行为零变化——schema 迁移权在 gate0b-apply）。"""
+    return bool({r[1] for r in conn.execute("PRAGMA table_info(daily_bar)")}
+                & {"open_qfq"})
+
+
+def _write_qfq_rows(conn: sqlite3.Connection, rows: list,
+                    with_open: bool) -> None:
+    """qfq 列族 UPDATE（close_qfq/high_qfq/low_qfq[+open_qfq]，等比同行导出）。
+
+    rows 元素 = (cq, hq, lq[, oq], code, trade_date)；with_open 由调用方经
+    _qfq_has_open_col 判定。open_qfq = round(open × cq / close, 4)，与
+    high/low_qfq 完全同一口径（Gate 0-B 增量一致性）。不 commit（事务归属调用方）。
+    """
+    if with_open:
+        conn.executemany(
+            "UPDATE daily_bar SET close_qfq=?, high_qfq=?, low_qfq=?, open_qfq=? "
+            "WHERE code=? AND trade_date=?", rows)
+    else:
+        conn.executemany(
+            "UPDATE daily_bar SET close_qfq=?, high_qfq=?, low_qfq=? "
+            "WHERE code=? AND trade_date=?",
+            [(cq, hq, lq, cd, d) for cq, hq, lq, _oq, cd, d in rows])
+
+
 # ---------------------------------------------------------------- 量纲归一
 
 def _norm_volume(volume, amount, close):
@@ -656,8 +689,9 @@ def rebrush_qfq_full(code: str, conn: sqlite3.Connection) -> tuple:
     if df is None or df.empty:
         log.error("%s qfq 全史重刷：两源均不可用", code)
         return 0, ""
-    raw = {d: (h, l, c) for d, h, l, c in conn.execute(
-        "SELECT trade_date, high, low, close FROM daily_bar WHERE code=?", (code,))}
+    raw = {d: (o, h, l, c) for d, o, h, l, c in conn.execute(
+        "SELECT trade_date, open, high, low, close FROM daily_bar WHERE code=?",
+        (code,))}
     rows = []
     for _, r in df.iterrows():
         d = r["date"].strftime("%Y-%m-%d")
@@ -666,20 +700,21 @@ def rebrush_qfq_full(code: str, conn: sqlite3.Connection) -> tuple:
             continue
         hq = r.get("high_qfq") if "high_qfq" in df.columns else None
         lq = r.get("low_qfq") if "low_qfq" in df.columns else None
-        rh, rl, rc = raw[d]
+        ro, rh, rl, rc = raw[d]
         if (hq is None or pd.isna(hq)) and rc and rh is not None and not pd.isna(rh):
             hq = float(rh) * float(cq) / float(rc)
         if (lq is None or pd.isna(lq)) and rc and rl is not None and not pd.isna(rl):
             lq = float(rl) * float(cq) / float(rc)
+        oq = (round(float(ro) * float(cq) / float(rc), 4)
+              if rc and ro is not None and not pd.isna(ro) else None)
         rows.append((round(float(cq), 4),
                      round(float(hq), 4) if hq is not None and not pd.isna(hq) else None,
                      round(float(lq), 4) if lq is not None and not pd.isna(lq) else None,
+                     oq,
                      code, d))
     if not rows:
         return 0, ""
-    conn.executemany(
-        "UPDATE daily_bar SET close_qfq=?, high_qfq=?, low_qfq=? "
-        "WHERE code=? AND trade_date=?", rows)
+    _write_qfq_rows(conn, rows, _qfq_has_open_col(conn))
     conn.execute(
         "INSERT INTO fetch_log VALUES (?,?,?,?,?)",
         (code, datetime.now().isoformat(timespec="seconds"),
@@ -747,8 +782,9 @@ def backfill_qfq(code: str, conn: sqlite3.Connection) -> int:
         log.error("%s 全史重刷失败（两源不可用），本次增量放弃写入（防伪跳变入库）", code)
         return 0
 
-    raw = {d: (h, l, c) for d, h, l, c in conn.execute(
-        "SELECT trade_date, high, low, close FROM daily_bar WHERE code=?", (code,))}
+    raw = {d: (o, h, l, c) for d, o, h, l, c in conn.execute(
+        "SELECT trade_date, open, high, low, close FROM daily_bar WHERE code=?",
+        (code,))}
     rows = []
     for _, r in df.iterrows():
         d = r["date"].strftime("%Y-%m-%d")
@@ -757,21 +793,23 @@ def backfill_qfq(code: str, conn: sqlite3.Connection) -> int:
             continue
         hq = r.get("high_qfq") if "high_qfq" in df.columns else None
         lq = r.get("low_qfq") if "low_qfq" in df.columns else None
-        rh, rl, rc = raw[d]
+        ro, rh, rl, rc = raw[d]
         # em 源只给收盘：复权是逐行线性缩放，high/low_qfq 按 close 比例同行导出
+        # （open_qfq 同一比例——批次0 Gate 0-B 增量一致性）
         if (hq is None or pd.isna(hq)) and rc and rh is not None and not pd.isna(rh):
             hq = float(rh) * float(cq) / float(rc)
         if (lq is None or pd.isna(lq)) and rc and rl is not None and not pd.isna(rl):
             lq = float(rl) * float(cq) / float(rc)
+        oq = (round(float(ro) * float(cq) / float(rc), 4)
+              if rc and ro is not None and not pd.isna(ro) else None)
         rows.append((round(float(cq), 4),
                      round(float(hq), 4) if hq is not None and not pd.isna(hq) else None,
                      round(float(lq), 4) if lq is not None and not pd.isna(lq) else None,
+                     oq,
                      code, d))
     if not rows:
         return 0
-    conn.executemany(
-        "UPDATE daily_bar SET close_qfq=?, high_qfq=?, low_qfq=? "
-        "WHERE code=? AND trade_date=?", rows)
+    _write_qfq_rows(conn, rows, _qfq_has_open_col(conn))
     # 窗边界不变量校验：任一相邻对 qfq 环比深于 raw 环比 >0.3pp → 伪跳变，全史重刷
     # （含窗前一日：伪跳变恰出现在"旧锚末行 → 新锚首行"的边界对上）
     got_dates = [r[0] for r in conn.execute(
