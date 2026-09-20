@@ -302,6 +302,78 @@ def test_daily_report_benchmark_missing_then_present():
     conn.close()
 
 
+# ---------------- 批次4a（全量批 P2 清债·风控执行域）2026-09-20 ----------------
+
+def test_mark_to_market_replay_before_dd_base_not_zeroed():
+    """P2①：补跑 dd_base_date **之前**的历史日报——旧口径 effective_peak 的
+    after=dd_base_date 与 before=回放日 组合恒空窗 → 回撤记 0，且 mark_to_market
+    的 INSERT OR REPLACE 把该历史日 drawdown 列覆写为 0。修复后回放日早于重置日
+    → 回退 250 行窗口：回撤按回放日之前的窗口峰值计算（1 - 100万/200万 = 50%）。"""
+    import json as _json
+    from execution import runner as _runner
+
+    conn = make_conn()
+    add_state(conn, "2099-01-05", 2_000_000.0)
+    add_state(conn, "2099-01-06", 1_000_000.0)
+    conn.commit()
+    ks_dir = tempfile.mkdtemp(prefix="agsickle_review_ddbase_")
+    ks_file = Path(ks_dir) / "kill.json"
+    orig_ks = _runner.KILL_STATE_FILE
+    _runner.KILL_STATE_FILE = ks_file
+    try:
+        ks_file.write_text(_json.dumps(
+            {"active": False, "until": None, "note": "", "dd_base": 900_000.0,
+             "dd_base_date": "2099-01-10", "kill_count": 1}, ensure_ascii=False),
+            encoding="utf-8")
+        st = daily.mark_to_market("2099-01-06", conn)  # 空持仓 → total=START_CASH
+        approx(st["total"], START)
+        approx(st["drawdown"], 1 - START / 2_000_000.0)   # 0.5，不是 0
+        # 覆写守卫：补跑后该历史日 drawdown 列保留窗口口径值（旧口径被覆写为 0）
+        row = conn.execute(
+            "SELECT drawdown FROM portfolio_state WHERE date='2099-01-06'").fetchone()
+        assert row is not None
+        approx(row[0], 1 - START / 2_000_000.0)
+    finally:
+        _runner.KILL_STATE_FILE = orig_ks
+        conn.close()
+
+
+def test_daily_report_kill_history_observation_line():
+    """P2⑤（ADR-S4-1 对冲观测接线）：kill.json 的 kill_count/lifetime_peak 此前
+    只写不读（无消费方）——分段 8% 口径下熔断史静默。日报必须输出熔断史累计
+    观测行；kill.json 缺累计键/缺失时无此行（行为不变）。"""
+    import json as _json
+    from execution import runner as _runner
+
+    conn = make_conn()
+    add_bar(conn, "600519", "2099-01-06", 800.0)
+    add_pos(conn, "600519", "贵州茅台", 1000, 800.0)
+    conn.commit()
+    ks_dir = tempfile.mkdtemp(prefix="agsickle_review_killks_")
+    ks_file = Path(ks_dir) / "kill.json"
+    orig_ks = _runner.KILL_STATE_FILE
+    _runner.KILL_STATE_FILE = ks_file
+    out = _Path(tempfile.mkdtemp())
+    try:
+        # 负例：kill.json 存在但无累计键 → 不输出熔断史行
+        ks_file.write_text(_json.dumps(
+            {"active": False, "until": None, "note": ""}, ensure_ascii=False),
+            encoding="utf-8")
+        t1 = daily.generate_daily_report("2099-01-06", conn, out_dir=out).read_text(encoding="utf-8")
+        assert "熔断史" not in t1
+        # 正例：kill_count=2 / lifetime_peak=160 万 → 熔断史行 + 全局回撤
+        # （total=200,000+800,000=1,000,000 → 全局回撤 1-100万/160万 = -37.50%）
+        ks_file.write_text(_json.dumps(
+            {"active": False, "until": None, "note": "", "kill_count": 2,
+             "lifetime_peak": 1_600_000.0}, ensure_ascii=False), encoding="utf-8")
+        t2 = daily.generate_daily_report("2099-01-06", conn, out_dir=out).read_text(encoding="utf-8")
+        assert "熔断史" in t2 and "kill_count=2" in t2
+        assert "1,600,000.00" in t2 and "-37.50%" in t2
+    finally:
+        _runner.KILL_STATE_FILE = orig_ks
+        conn.close()
+
+
 # ---------------------------------------------------------------- 周报数值断言（手算样例）
 
 def seed_week(conn, end_close, week_ret_target_total):
@@ -503,6 +575,39 @@ def test_signal_eval_persists_latest(tmp_path=None):
         assert not (_Path(sandbox) / "latest.json.tmp").exists()
     finally:
         conn.close()
+        _restore_env()
+
+
+def test_p2g12_signal_frame_excludes_null_profile_rows():
+    """P2-⑫ 负向（预注册要求）：_signal_frame 的 `OR profile IS NULL` 兼容条款
+    已删——NULL 行不得进入 IC 评估（潜伏混算闸）；只取当前 profile 行。"""
+    from review import signal_eval
+    old_prof = os.environ.get("AGSICKLE_SIGNALS_PROFILE")
+    os.environ["AGSICKLE_SIGNALS_PROFILE"] = "reversal_lowvol"
+    conn = __import__("sqlite3").connect(":memory:")
+    conn.executescript(DDL)
+    try:
+        conn.executemany(
+            "INSERT INTO signal (code, as_of, signals, score, profile)"
+            " VALUES (?,?,?,?,?)",
+            [("600519", "2026-09-18", "{}", 1.5, "reversal_lowvol"),
+             ("600519", "2026-09-17", "{}", 2.5, "momentum"),
+             ("600519", "2026-09-16", "{}", 3.5, None)])
+        conn.commit()
+        df = signal_eval._signal_frame(conn)
+        rows = {(r["code"], r["as_of"]) for _, r in df.iterrows()}
+        assert rows == {("600519", "2026-09-18")}, rows
+        # 全 NULL → 空 frame（不混入任何口径）
+        conn.execute("UPDATE signal SET profile=NULL")
+        conn.commit()
+        df2 = signal_eval._signal_frame(conn)
+        assert df2.empty, "profile 全 NULL 时 _signal_frame 必须为空"
+    finally:
+        conn.close()
+        if old_prof is None:
+            os.environ.pop("AGSICKLE_SIGNALS_PROFILE", None)
+        else:
+            os.environ["AGSICKLE_SIGNALS_PROFILE"] = old_prof
         _restore_env()
 
 

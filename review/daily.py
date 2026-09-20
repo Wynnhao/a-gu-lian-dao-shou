@@ -401,6 +401,23 @@ def _sec_positions(conn: sqlite3.Connection, trade_date: str) -> str:
     lines.append(f"- 组合总资产：{_fmt_money(st['total'])}（现金 {_fmt_money(st['cash'])} + 市值 {_fmt_money(st['market_value'])}）")
     lines.append(f"- 累计收益率：{_fmt_pct(cum)}（期初资金 {_fmt_money(START_CASH)}）")
     lines.append(f"- 当前回撤：{_fmt_pct(st['drawdown'])}；kill_switch：{st['kill_switch']}")
+    # 批次4a P2⑤（2026-09-20，ADR-S4-1 对冲观测接线）：kill.json 的 kill_count/
+    # lifetime_peak 此前只写不读（无消费方）——"分段 8%"口径下熔断史会静默。
+    # 日报补一行累计观测（kill 次数 + 全史峰值 + 全局回撤），全局口径不随
+    # 分段重置丢失（kill.json 缺失/无累计键 → 无此行，行为不变）。
+    from execution.runner import read_kill_state as _read_kill_state
+    _ks = _read_kill_state() or {}
+    _kc = _ks.get("kill_count")
+    _lp = float(_ks.get("lifetime_peak") or 0.0)
+    if _kc or _lp > 0:
+        _seg = f"- 熔断史（累计口径，分段 8% 外全局观测）：kill_count={_kc or 0}"
+        if _lp > 0:
+            # 全局回撤幅度（≥0）按损失方向显示为负号（与"当前回撤"口径一致）：
+            # 分段重置只影响 kill 判定口径，不丢全局观测
+            _gdd = max(0.0, 1.0 - float(st["total"]) / _lp) if float(st["total"]) > 0 else None
+            _seg += "；全史峰值 %s，全局回撤 %s" % (
+                _fmt_money(_lp), "n/a" if _gdd is None else f"-{_gdd * 100:.2f}%")
+        lines.append(_seg)
     if st["stale_codes"]:
         lines.append(f"- 注意：以下标的未用到 {trade_date} 收盘价（价格滞后）：{'、'.join(st['stale_codes'])}")
     return "\n".join(lines)

@@ -163,6 +163,21 @@ def _dedupe_emergency(conn: sqlite3.Connection, code: str, run_date: str) -> boo
     return n > 0
 
 
+def _next_exec_date(now: datetime) -> str:
+    """P2③（全量打包批 2026-09-20）：应急单预期执行日 = 自然日次日遇周末顺延。
+
+    周五盘后扫描此前给 run_date=周六：周一 09:14 failsafe 按 run_date==today
+    查不到该单、confirm 跨日闸（run_date>=today 放行）同样拒——自愈只剩 stuck
+    计数+周一重扫，连续跌停退出晚 3 天。周六/周日顺延到周一；法定节假日仍由
+    premarket"run_date=今天才执行"语义自然顺延（维持原已知限制：盘后时刻节后
+    首个交易日未必已入日历缓存，不引入交易日历依赖）。
+    """
+    d = now + timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
+
 def run_postclose_scan(conn: Optional[sqlite3.Connection] = None,
                        now: Optional[datetime] = None,
                        run_date: Optional[str] = None) -> dict:
@@ -180,9 +195,10 @@ def run_postclose_scan(conn: Optional[sqlite3.Connection] = None,
         from data.fetcher import get_conn
         c = get_conn()
     now = now or datetime.now()
-    # run_date = 预期执行日（次日交易日近似取自然日次日；跨日闸门按 run_date==today 放行，
-    # 节假日场景由 premarket 兜底的"run_date=今天才执行"语义自然顺延）
-    run_date = run_date or (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    # run_date = 预期执行日（P2③：自然日次日遇周末顺延到周一；跨日闸门按
+    # run_date==today 放行，节假日场景由 premarket 兜底的"run_date=今天才执行"
+    # 语义自然顺延）
+    run_date = run_date or _next_exec_date(now)
     try:
         # W-A4②：盘后自拉实时快照（腾讯/东财盘后仍可取，postclose 无现成快照可复用）
         # ——live_quotes 供条件②封单比；price/prev_close 供条件①现价校验与跌停价

@@ -28,7 +28,7 @@ from datetime import date, datetime, timedelta, time as dtime
 from typing import Any, Dict, List, Optional, Tuple
 
 from common.config import snapshot
-from common.market import in_trading_session
+from common.market import in_trading_session, limit_pct, limit_price
 from data import repo
 from data.fetcher import get_conn
 from risk.blacklist import check_blacklist, health_check
@@ -182,11 +182,25 @@ def effective_peak(conn: sqlite3.Connection, before: Optional[str] = None,
       portfolio_state 峰值——清仓重置前的历史峰值不再参与回撤判定；
     - 否则：最近 window 行窗口峰值（一条坏数据不永久抬高峰值）；
     - before 供日报回放口径（mark_to_market 只看该日之前）。
-    clamp（max 当前权益）由调用方做——峰值至少不低于当前权益。"""
+    clamp（max 当前权益）由调用方做——峰值至少不低于当前权益。
+
+    批次4a P2①⑥（2026-09-20）：
+    - ① 回放守卫：before 严格早于 dd_base_date 时（补跑重置日之前的历史日报），
+      after=dd_base_date 与 before=回放日 组合恒为空窗 → peak=None → 回撤记 0，
+      mark_to_market 的 INSERT OR REPLACE 会把该历史日 drawdown 列覆写为 0。
+      分段基准是"重置之后"的口径，不适用于重置之前的日期评估 → 回退无 dd_base
+      分支同款 window 行窗口（与该日当年实时写入值同口径）。before==dd_base_date
+      （重置当日）维持分段语义（空窗 → None → dd=0，与 kill 当日实时写入一致）。
+    - ⑥ 分段窗口：dd_base 分支同样限最近 window 行——dd_base_date 久远（段内
+      行数 > window）时，段内一条坏数据行同样会永久抬高分段峰值，与无 dd_base
+      分支引入窗口的初衷一致（"dd_base 感知窗口"，ADR-S4-1）。
+    """
     ks = read_kill_state() or {}
     base = ks.get("dd_base_date")
     if base:
-        return repo.peak_total(conn, after=str(base), before=before)
+        if before is not None and str(before) < str(base):
+            return repo.peak_total(conn, window=window, before=before)
+        return repo.peak_total(conn, after=str(base), before=before, window=window)
     return repo.peak_total(conn, window=window, before=before)
 
 
@@ -1143,6 +1157,9 @@ def confirm(conn: sqlite3.Connection, decision_id: int, confirmed_by: str = "hum
       校验——此前重跑风控用的是决策原始价，--price 覆盖价可绕过全部价格类风控；
     - 实时价缺失时（W-A9）不得自动以昨收成交：应急/补清算单按其显式设计价执行
       并留痕（stale_price_exec），普通单挂起保留 approved 等 --price 显式确认。
+      批次4a P2②：应急卖单的设计价（T 日跌停价）在 T+1 执行日按 min(设计价,
+      执行日跌停价) 执行——T+1 继续死封时 T 日跌停价是幻影价（高出真实可排队
+      价 ~11%），执行日跌停价才是"次日 09:15 集合竞价挂跌停价"的正确落点。
     """
     with _exec_lock():
         return _confirm_locked(conn, decision_id, confirmed_by=confirmed_by,
@@ -1244,22 +1261,51 @@ def _confirm_locked(conn: sqlite3.Connection, decision_id: int,
                 dp = float(order.get("price") or 0)
                 if dp <= 0:
                     print("[confirm] 挂起：实时价缺失且决策无显式价，不自动以昨收成交")
+                    notify("挂起：应急单无显式价",
+                           "decision#%d %s 实时价缺失且决策无显式设计价，已挂起"
+                           "（status 保持 approved），请人工处置" % (decision_id, code))
                     return None
                 stale_ref = price
-                price = dp
-                explicit_price = True   # 决策设计价 ≠ 自动昨收
+                price = dp   # 决策设计价 ≠ 自动昨收（价格出处已由事件留痕）
+                price_note = ""
+                # 批次4a P2②（2026-09-20）：应急设计价 = T 日跌停价。T+1 执行日若
+                # 继续死封，T 日跌停价高出 T+1 真实跌停价 ~11%（10% 板；20% 板
+                # +25%）——按设计价成交即幻影价成交（T+1 死封时真实可排队价是
+                # T+1 跌停价）。应急卖单执行定价改按**执行日跌停价**（基准
+                # =ctx.prev_close，与规则14/paper 停板防线同口径）：连续死封 =
+                # 真实排队价；开板 = 保守低估（真实成交价只会更高）。取
+                # min(设计价, 执行日跌停价) 保证不高于任一保守上界。kill_liquidation
+                # 设计价=最新收盘（无跌停排队前提），维持原口径不套用本式。
+                if decision.get("emergency_scan") \
+                        and str(decision.get("action") or "").strip().lower() == "sell":
+                    pc = (ctx.prev_close or {}).get(code)
+                    if pc and float(pc) > 0:
+                        down_exec = limit_price(float(pc), limit_pct(code), up=False)
+                        if 0 < down_exec < price:
+                            price = down_exec
+                            price_note = "，执行日继续死封口径 → 按执行日跌停价 %.2f 排队" % down_exec
+                            # 规则21 同语义：按执行日跌停价排队卖出 → 规则14
+                            # "卖价=跌停价拒卖"的应急豁免同步置位（下方执行价
+                            # 二次校验用）
+                            decision["emergency_pending_skip"] = True
                 record_event(conn, "stale_price_exec",
                              "decision#%d %s 实时价缺失，按决策显式设计价 %.2f 执行"
-                             "（昨收 %.2f 不作为成交价）" % (decision_id, code, dp, stale_ref),
+                             "（昨收 %.2f 不作为成交价%s）"
+                             % (decision_id, code, price, stale_ref, price_note),
                              decision_id)
                 print("[confirm] %s 应急/清算单按显式设计价 %.2f 执行（实时价缺失已留痕）"
                       % ("emergency_scan" if decision.get("emergency_scan")
-                         else "kill_liquidation", dp))
+                         else "kill_liquidation", price))
             else:
                 record_event(conn, "stale_price_halt",
                              "decision#%d %s 实时价缺失（仅剩昨收 %.2f），拒绝自动以"
                              "昨收成交，保留 approved 等待 --price 显式确认"
                              % (decision_id, code, price), decision_id)
+                # 批次4a P2④：挂起单主动通知——此前只 stdout+risk_event，人工需
+                # "碰巧在看"才知道单子挂起等 --price
+                notify("挂起：实时价缺失",
+                       "decision#%d %s 实时价缺失（仅剩昨收 %.2f），已挂起保留"
+                       " approved，等待 --price 显式确认或稍后重试" % (decision_id, code, price))
                 print("[confirm] 挂起：实时价缺失（仅剩昨收 %.2f），不自动以昨收成交；"
                       "请稍后重试或 --price 显式确认（事件 stale_price_halt 已留痕）" % price)
                 return None
@@ -1268,14 +1314,16 @@ def _confirm_locked(conn: sqlite3.Connection, decision_id: int,
         print("[confirm] 价格/数量非法，放弃执行")
         return None
 
-    # 执行价二次风控：price_guard + price_limit 用最终成交价重跑
+    # 执行价二次风控：price_guard + price_limit 用最终成交价重跑。
+    # （批次4a P2④，2026-09-20）原 recheck_decision["_explicit_price"]=True 死标记
+    # 已删除：它从未被任何规则消费；且显式价（--price / 应急设计价）本就必须过
+    # 执行价二次校验（F1b 语义，test_confirm_price_override_blocked_by_recheck
+    # 锁定）——接线让规则9"留痕放行"反而会打开 --price 绕过价格类风控的口子。
+    # 应急设计价路径实时价必缺失 → 规则9 已按 stale_close 口径降级为留痕放行。
     recheck = Verdict()
     recheck_decision = dict(decision)
     recheck_decision["order"] = dict(order)
     recheck_decision["order"]["price"] = price
-    if explicit_price:
-        # W-A9：显式给价（--price / 应急设计价）→ 规则9 按显式口径留痕放行
-        recheck_decision["_explicit_price"] = True
     from risk import engine as _eng
     _eng.rule_price_guard(recheck_decision, ctx, CFG.get("risk", {}), recheck)
     _eng.rule_price_limit(recheck_decision, ctx, CFG.get("risk", {}), recheck)
@@ -1283,6 +1331,11 @@ def _confirm_locked(conn: sqlite3.Connection, decision_id: int,
         for x in recheck.violations:
             record_event(conn, "price_recheck", x, decision_id)
             print("[confirm] [执行价校验] %s" % x)
+        # 批次4a P2④：挂起/拒执单主动通知（同 stale_price_halt 口径）
+        notify("执行价二次校验未过",
+               "decision#%d %s 执行价 %.2f 未通过二次校验（%s）；待确认单已保留，"
+               "可用更接近市价的 --price 重试或 reject"
+               % (decision_id, code, price, recheck.violations[0]))
         print("[confirm] 执行价 %.2f 未通过二次校验，保留待确认单（可用更接近市价的"
               " --price 重试或 reject）" % price)
         return None

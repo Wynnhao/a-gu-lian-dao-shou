@@ -229,6 +229,50 @@ def test_postclose_scan_proposes_and_dedupes(monkeypatch=None):
 
 # ---------------- 3. stuck 计数 + 5 日事件 ----------------
 
+
+def test_next_exec_date_skips_weekend():
+    """P2③：_next_exec_date 周末顺延——周五→周一、周六→周一、周日→周一、
+    周中→次日；法定节假日不在职责内（维持 premarket 自然顺延语义）。"""
+    from signals.limit_halt import _next_exec_date
+    assert _next_exec_date(datetime(2026, 9, 25, 15, 30)) == "2026-09-28"  # 周五→周一
+    assert _next_exec_date(datetime(2026, 9, 26, 15, 30)) == "2026-09-28"  # 周六→周一
+    assert _next_exec_date(datetime(2026, 9, 27, 15, 30)) == "2026-09-28"  # 周日→周一
+    assert _next_exec_date(datetime(2026, 9, 23, 15, 30)) == "2026-09-24"  # 周三→周四
+
+
+def test_postclose_scan_friday_run_date_is_monday():
+    """P2③：周五盘后扫描 run_date=下周一（原为周六→周一 09:14 failsafe 按
+    run_date==today 查不到该单、跨日闸拒，连续跌停退出晚 3 天）。"""
+    from execution import runner as _runner
+    conn = _mem_conn()
+    # 绝对日期夹具：2026-09-25 是周五；周四收 100 → 周五收 90（-10% 跌停）
+    code = "600519"
+    conn.execute("INSERT OR REPLACE INTO stock_info VALUES (?,?,?,?)",
+                 (code, "测试票", "2020-01-01", "x"))
+    for d, cl in (("2026-09-24", 100.0), ("2026-09-25", 90.0)):
+        conn.execute(
+            "INSERT OR REPLACE INTO daily_bar (code, trade_date, open, high, low,"
+            " close, volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (code, d, cl, cl, cl, cl, 10_000_000, cl * 10_000_000, 0.0, 1.0))
+    conn.execute(
+        "INSERT OR REPLACE INTO position (code, name, shares, avail_shares, cost,"
+        " updated_at) VALUES (?,?,?,?,?,?)",
+        (code, "测试票", 200, 200, 110.0, "2026-09-25"))
+    conn.commit()
+    orders_dir = Path(tempfile.mkdtemp(prefix="agsickle_lh_orders_"))
+    orig_orders_dir = _runner.ORDERS_DIR
+    _runner.ORDERS_DIR = orders_dir
+    try:
+        r = limit_halt.run_postclose_scan(conn, now=datetime(2026, 9, 25, 15, 30, 0))
+        assert r["proposed"] == ["600519"], r
+        row = conn.execute(
+            "SELECT run_date FROM decision WHERE emergency_scan=1").fetchone()
+        assert row is not None and row[0] == "2026-09-28", \
+            "周五盘后应急单 run_date 应顺延到下周一，而非周六"
+    finally:
+        _runner.ORDERS_DIR = orig_orders_dir
+        conn.close()
+
 def test_stuck_increment_and_five_day_event():
     """stuck 递增；5 日写 risk_event（同日同票去重）；不再命中即解除删除。"""
     conn = _mem_conn()

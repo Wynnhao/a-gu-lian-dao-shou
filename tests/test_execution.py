@@ -1578,6 +1578,144 @@ def test_confirm_emergency_stale_uses_design_price():
         shutil.rmtree(orders, ignore_errors=True)
 
 
+# ---------------- 批次4a（全量批 P2 清债·风控执行域）2026-09-20 ----------------
+
+def test_effective_peak_replay_before_dd_base_falls_back_to_window():
+    """P2①：回放/补跑 dd_base_date **之前**的历史日——旧口径 after=dd_base_date 与
+    before=回放日 组合恒空窗 → peak=None → 回撤记 0（且 mark_to_market 的
+    INSERT OR REPLACE 覆写该日 drawdown 列）。修复后回放日严格早于重置日 →
+    回退 250 行窗口口径（与该日当年实时写入值一致）；before==base 当日维持
+    分段语义（kill 当日 dd=0）。"""
+    conn = fresh_conn()
+    for d, total in (("2026-08-01", 2_000_000.0), ("2026-08-02", 1_700_000.0),
+                     ("2026-08-06", 1_100_000.0)):
+        conn.execute("INSERT INTO portfolio_state VALUES (?,?,?,?,?,?,?)",
+                     (d, 0.0, 0.0, total, 0.0, 0, "seed"))
+    conn.commit()
+    try:
+        runner.write_kill_state(None, "P2①回放测试", dd_base_equity=1_000_000.0,
+                                now=datetime(2026, 8, 5, 16, 0))
+        # 回放 08-02（严格早于 dd_base_date=08-05）→ 窗口峰值 200 万（旧口径 None）
+        assert runner.effective_peak(conn, before="2026-08-02") == 2_000_000.0
+        # before 晚于 base → 分段窗口照常
+        assert runner.effective_peak(conn, before="2026-08-07") == 1_100_000.0
+        # before==base（kill 重置当日）→ 维持分段语义：空窗 None（当日 dd 记 0）
+        assert runner.effective_peak(conn, before="2026-08-05") is None
+    finally:
+        if runner.KILL_STATE_FILE.exists():
+            runner.KILL_STATE_FILE.unlink()
+
+
+def test_effective_peak_dd_base_branch_windowed_250():
+    """P2⑥：dd_base 分支同样受 250 行窗口约束——重置日久远（段内 >250 行）时，
+    段内最旧一条坏数据行（total 999 万）不再永久抬高分段峰值。"""
+    conn = fresh_conn()
+    d0 = date(2025, 1, 1)
+    for i in range(260):
+        conn.execute("INSERT INTO portfolio_state VALUES (?,?,?,?,?,?,?)",
+                     ((d0 + timedelta(days=i)).isoformat(), 0.0, 0.0,
+                      9_999_999.0 if i == 0 else 1_000_000.0, 0.0, 0, "seed"))
+    conn.commit()
+    try:
+        runner.write_kill_state(None, "P2⑥窗口测试", dd_base_equity=1_000_000.0,
+                                now=datetime(2025, 1, 1, 16, 0))
+        # 段内 260 行，窗口 250 → 基准日当日那条 999 万（i=0，最旧）滑出窗口
+        assert runner.effective_peak(conn) == 1_000_000.0
+    finally:
+        if runner.KILL_STATE_FILE.exists():
+            runner.KILL_STATE_FILE.unlink()
+
+
+def test_confirm_emergency_next_day_stale_uses_execution_day_limit_down():
+    """P2②：应急设计价=T 日跌停价；T+1 执行日（run_date=T+1）实时价缺失路径按
+    **执行日跌停价**成交（昨收=T 收盘=设计价 9.81 → 执行日跌停=round(9.81×0.9)
+    =8.83）。旧口径按 T 日跌停价 9.81 成交=幻影价：T+1 继续死封时高出真实可排队
+    价 ~11%（10% 板）。同日 confirm（既有用例）不受影响——设计价即当日跌停价。"""
+    conn = fresh_conn()
+    _seed_rule21_market(conn)   # 昨收10.90/今收9.81（T 跌停）、持仓200股成本12
+    orders = Path(_tmp_dir())
+    try:
+        d = mk_decision("sell", "000001", 9.81, 200, emergency_scan=True)
+        v = runner.propose(conn, d, run_date=NEXT_DAY, now=NOW10, orders_dir=orders)
+        assert v.approved, v.violations
+        did = conn.execute("SELECT MAX(id) FROM decision").fetchone()[0]
+        # T+1 盘前 09:14 failsafe 同款路径：实时价缺失（stale_close）
+        now_t1 = datetime.combine(_BASE + timedelta(days=1), time(9, 14))
+        res = runner.confirm(conn, did, confirmed_by="emergency_timeout_failsafe",
+                             now=now_t1, orders_dir=orders)
+        assert res is not None and res["ok"], "T+1 应急单必须可成交"
+        row = trade_rows(conn)[0]
+        assert row[4] == 8.83, ("成交价必须是执行日跌停价 round(9.81*0.9)=8.83，"
+                                "不得按 T 日跌停价 9.81 幻影成交（实得 %.2f）" % row[4])
+        ev = conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
+                          " rule='stale_price_exec'").fetchone()[0]
+        assert ev == 1
+        # 执行日跌停价挂单卖出 → 规则14 跌停拒卖经规则21 豁免，不得二次校验拦截
+        n_rej = conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
+                             " rule='price_recheck'").fetchone()[0]
+        assert n_rej == 0, "应急单按执行日跌停价排队不得被价格二次校验拦截"
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
+def test_confirm_hang_paths_notify():
+    """P2④：挂起类分支（实时价缺失 stale_price_halt / 执行价二次校验未过）此前
+    只 stdout+risk_event、无主动通知——人工需"碰巧在看"才知道单子挂起等处理。
+    两分支现在都必须 notify。"""
+    calls = []
+    _orig_notify = runner.notify
+    runner.notify = lambda title, body="": (calls.append((title, body)) or {})
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        # 场景1：普通单实时价缺失 → stale_price_halt 挂起 + 主动通知
+        runner.propose(conn, mk_decision("buy", "000001", 11.0, 100),
+                       now=NOW10, orders_dir=orders)
+        assert runner.confirm(conn, 1, confirmed_by="t", now=NOW10,
+                              orders_dir=orders) is None
+        assert any(t.startswith("挂起") for t, _ in calls), calls
+        # 场景2：--price 12.0 超涨停 11.99 → 执行价二次校验拦截 + 主动通知
+        n0 = len(calls)
+        res = runner.confirm(conn, 1, confirmed_by="t", now=NOW10,
+                             orders_dir=orders, price_override=12.0)
+        assert res is None
+        assert any("二次校验" in t for t, _ in calls[n0:]), calls[n0:]
+        # pending 仍保留（挂起语义不变）
+        assert len(runner.list_pending(orders)) == 1
+    finally:
+        runner.notify = _orig_notify
+        shutil.rmtree(orders, ignore_errors=True)
+        conn.close()
+
+
+def test_explicit_price_marker_removed_and_recheck_still_enforced():
+    """P2④（死标记处置验证）：_explicit_price 死标记已删除——显式 --price 仍必须过
+    执行价二次校验（F1b 语义不放松），且注入该键不得产生任何豁免效果。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        d = mk_decision("buy", "000001", 11.0, 100, _explicit_price=True)
+        assert d.get("_explicit_price") is True   # 外部输入可携带（无剥离面：无消费者）
+        runner.propose(conn, d, now=NOW10, orders_dir=orders)
+        did = conn.execute("SELECT MAX(id) FROM decision").fetchone()[0]
+        # --price 12.0 超涨停 → 二次校验必须拦截（不得因显式价放行）
+        res = runner.confirm(conn, did, confirmed_by="t", now=NOW10,
+                             orders_dir=orders, price_override=12.0)
+        assert res is None
+        assert conn.execute("SELECT COUNT(*) FROM risk_event WHERE"
+                            " rule='price_recheck'").fetchone()[0] >= 1
+        assert conn.execute("SELECT status FROM decision WHERE id=?",
+                            (did,)).fetchone()[0] == "approved"
+        # 合法显式价（=昨收 11.0 未超涨停）照常成交——校验拦错价不拦对价
+        res2 = runner.confirm(conn, did, confirmed_by="t", now=NOW10,
+                              orders_dir=orders, price_override=11.0)
+        assert res2 is not None and res2["ok"]
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+
+
 # ---------------- 直接运行入口 ----------------
 
 if __name__ == "__main__":
