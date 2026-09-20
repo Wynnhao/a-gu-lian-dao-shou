@@ -25,6 +25,7 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 import argparse
+import fcntl
 import json
 import logging
 import logging.handlers
@@ -63,6 +64,17 @@ DEFAULT_INDEX_CODES = ["000001", "000300", "000905"]   # 上证指数 / 沪深30
 def _state_dir() -> Path:
     """调用时读 env（测试隔离，与 runner.STATE_DIR 同模式）。"""
     return Path(os.environ.get("AGSICKLE_STATE_DIR") or (BASE / "logs" / "state"))
+
+
+def _lock_path() -> Path:
+    """单实例锁文件（批次3a：recorder 与 catchup 无互斥的审查清债）。
+
+    锁目录走 _state_dir()（调用时读 AGSICKLE_STATE_DIR）：launchd 每 5 分钟
+    触发 + 手动补跑并发时，两个实例同时写 minute_snapshot/fetch_log——
+    minute_snapshot 有 INSERT OR REPLACE 幂等、WAL+busy_timeout 兜底不损数据，
+    但 fetch_log 会双记、快照拉取双倍请求。独立命名 .recorder.lock（不与
+    .catchup.lock 互斥——两者并发不冲突，catchup 不录快照）。"""
+    return _state_dir() / ".recorder.lock"
 
 
 def _heartbeat() -> None:
@@ -130,25 +142,44 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = ap.parse_args(argv)
     now = datetime.fromisoformat(args.now) if args.now else datetime.now()
 
-    conn = fetcher.get_conn()
+    # 单实例锁（批次3a：fcntl.flock 与 catchup 同款；POSIX flock 进程死亡由内核
+    # 释放。显式 close 释放——同进程重复调用 main()（测试/手动）换新 fd 时，
+    # 不 close 会让后续 LOCK_EX|LOCK_NB 自锁失败）。锁被占 → 本次退出不算失败。
+    lock_path = _lock_path()
     try:
-        # 双 gate：交易日 + 连续竞价时段（节假日/午休/收盘秒退，不算失败）
-        if not is_trading_day(conn, now.date()):
-            print("%s %s 非交易日，跳过" % (LOG_TAG, now.date()))
-            return 0
-        if not in_trading_session(now):
-            print("%s %s 非连续竞价时段，跳过" % (LOG_TAG, now.strftime("%H:%M")))
-            return 0
-        _heartbeat()
-        wanted, n, miss = record_once(conn, now)
-        if wanted and not n:
-            log.error("录制快照整轮失败：请求 %d、入库 0（fetch_log 已留痕，"
-                      "缺测率验收受影响）", wanted)
-            return 1
-        print("%s %s 入库 %d/%d（缺测 %d）" % (LOG_TAG, grid_ts(now), n, wanted, miss))
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fh = open(lock_path, "w")
+    except OSError as e:
+        print("%s 锁文件初始化失败: %r" % (LOG_TAG, e))
+        return 1
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("%s 已有实例在跑（锁 %s 被占），本次退出" % (LOG_TAG, lock_path))
+        lock_fh.close()
         return 0
+    try:
+        conn = fetcher.get_conn()
+        try:
+            # 双 gate：交易日 + 连续竞价时段（节假日/午休/收盘秒退，不算失败）
+            if not is_trading_day(conn, now.date()):
+                print("%s %s 非交易日，跳过" % (LOG_TAG, now.date()))
+                return 0
+            if not in_trading_session(now):
+                print("%s %s 非连续竞价时段，跳过" % (LOG_TAG, now.strftime("%H:%M")))
+                return 0
+            _heartbeat()
+            wanted, n, miss = record_once(conn, now)
+            if wanted and not n:
+                log.error("录制快照整轮失败：请求 %d、入库 0（fetch_log 已留痕，"
+                          "缺测率验收受影响）", wanted)
+                return 1
+            print("%s %s 入库 %d/%d（缺测 %d）" % (LOG_TAG, grid_ts(now), n, wanted, miss))
+            return 0
+        finally:
+            conn.close()
     finally:
-        conn.close()
+        lock_fh.close()
 
 
 if __name__ == "__main__":

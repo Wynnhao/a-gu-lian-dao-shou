@@ -15,6 +15,9 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 # ---- 测试隔离 env（必须在 import 任何项目模块之前设置）----
+# 直接赋值而非 setdefault（2026-09-21 生产库损毁事故回归锚）：W-D6 文件库
+# 用例含无 WHERE 的全表 DELETE，隔离若因 setdefault 未生效而漏到生产库，
+# 代价是不可逆的——本文件 env 一律强制钉到本进程沙箱。
 _TMP_ROOT = Path(tempfile.mkdtemp(prefix="agsickle_sprint4d_"))
 _ORIG_ENV = dict(os.environ)
 
@@ -31,15 +34,15 @@ def teardown_module(module=None):
     _restore_env()
 
 
-os.environ.setdefault("AGSICKLE_DB", str(_TMP_ROOT / "market.db"))
-os.environ.setdefault("AGSICKLE_REPORTS_DIR", str(_TMP_ROOT / "reports"))
-os.environ.setdefault("AGSICKLE_ORDERS_DIR", str(_TMP_ROOT / "orders"))
-os.environ.setdefault("AGSICKLE_STATE_DIR", str(_TMP_ROOT / "state"))
-os.environ.setdefault("AGSICKLE_DISABLE_NOTIFY", "1")
-os.environ.setdefault("AGSICKLE_DISABLE_LIVE_QUOTES", "1")
+os.environ["AGSICKLE_DB"] = str(_TMP_ROOT / "market.db")
+os.environ["AGSICKLE_REPORTS_DIR"] = str(_TMP_ROOT / "reports")
+os.environ["AGSICKLE_ORDERS_DIR"] = str(_TMP_ROOT / "orders")
+os.environ["AGSICKLE_STATE_DIR"] = str(_TMP_ROOT / "state")
+os.environ["AGSICKLE_DISABLE_NOTIFY"] = "1"
+os.environ["AGSICKLE_DISABLE_LIVE_QUOTES"] = "1"
 # run_all 会注入每文件独立沙箱；直跑（python tests/test_sprint4_d.py）兜底
-os.environ.setdefault("AGSICKLE_LOG_DIR", str(_TMP_ROOT / "logs"))
-os.environ.setdefault("AGSICKLE_SIGNAL_EVAL_DIR", str(_TMP_ROOT / "signal_eval"))
+os.environ["AGSICKLE_LOG_DIR"] = str(_TMP_ROOT / "logs")
+os.environ["AGSICKLE_SIGNAL_EVAL_DIR"] = str(_TMP_ROOT / "signal_eval")
 
 from data.fetcher import DDL, get_conn  # noqa: E402
 
@@ -57,6 +60,13 @@ def file_db_conn() -> sqlite3.Connection:
     """AGSICKLE_DB 指向的文件库连接（signals._hs300_close_series 走 get_conn()）。"""
     global _DDL_DONE
     conn = get_conn()
+    # 生产库保险丝：本文件用例对文件库做无 WHERE 的全表 DELETE，连接若因
+    # env 泄漏指向沙箱之外（最坏=生产库），宁可炸测试也不许动那上面的数据
+    main_file = next(r[2] for r in conn.execute("PRAGMA database_list")
+                     if r[1] == "main")
+    if str(_TMP_ROOT) not in str(main_file):
+        raise AssertionError(
+            "file_db_conn 指向沙箱之外的库（%s），拒绝执行破坏性用例" % main_file)
     if not _DDL_DONE:
         conn.executescript(DDL)
         _DDL_DONE = True

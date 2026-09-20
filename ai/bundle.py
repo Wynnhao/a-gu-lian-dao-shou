@@ -314,8 +314,11 @@ def chan_evidence_lines(conn: sqlite3.Connection, codes: Optional[list] = None) 
         else:
             no_label += 1
     return {"lines": lines, "no_label": no_label,
-            "note": ("缠论机械线 R3 已归档（重画率 FAIL）；标签为软证据，"
-                     "首发确认即锁定（批次2 口径）")}
+            "note": ("缠论机械线 R3 已归档：verdict=FAIL（因果性）——机械实现因果性不足"
+                     "（原 Gate2 重画率口径表述更正，策略库 §10.3/§10.5：终态结构是"
+                     "事后全体信息的函数）；证据版强制披露：T+20 终态相容率 70.22%、"
+                     "消失类 29.78%、相对基准超额未检验（Gate3 未跑，Gate2 预注册短路）。"
+                     "标签为软证据，首发确认即锁定（批次2 口径）")}
 
 
 # ---------------------------------------------------------------- 组装
@@ -430,21 +433,38 @@ def build_bundle(run_date: Optional[str] = None,
         if news_err:
             bundle["news_errors"] = news_err
 
-        # ---- 宏观估值（各指数最新一行）----
+        # ---- 宏观估值（各指数最新一行；P1-9：valuation_mode 兜底行降级披露）----
         try:
             macro = {}
+            has_mode = "valuation_mode" in {
+                r[1] for r in c.execute("PRAGMA table_info(index_valuation)")}
             codes = [r[0] for r in c.execute(
                 "SELECT DISTINCT index_code FROM index_valuation ORDER BY index_code").fetchall()]
             for ic in codes:
-                row = c.execute(
-                    "SELECT trade_date, pe, pe_pct, pb, pb_pct, close FROM index_valuation "
-                    "WHERE index_code=? ORDER BY trade_date DESC LIMIT 1", (ic,)).fetchone()
+                sql = ("SELECT trade_date, pe, pe_pct, pb, pb_pct, close%s "
+                       "FROM index_valuation WHERE index_code=? "
+                       "ORDER BY trade_date DESC LIMIT 1"
+                       % (", valuation_mode" if has_mode else ""))
+                row = c.execute(sql, (ic,)).fetchone()
                 if row:
                     macro[ic] = {"date": row[0], "pe": _f(row[1]), "pe_pct": _f(row[2]),
                                  "pb": _f(row[3]), "pb_pct": _f(row[4]), "close": _f(row[5])}
+                    if has_mode:
+                        # P1-9：'price_fallback'=估值源全挂时价格分位兜底——pe/pb 为
+                        # NULL、pe_pct 语义是价格分位，防 LLM 当真实估值分位解读
+                        macro[ic]["valuation_mode"] = row[6]
             bundle["macro"] = macro
             if not macro:
                 bundle["macro_missing"] = "index_valuation 表为空（需运行 data/macro.py）"
+            else:
+                _fb = sorted(ic for ic, m in macro.items()
+                             if m.get("valuation_mode") == "price_fallback")
+                if _fb:
+                    bundle["macro_fallback"] = {
+                        "indices": _fb,
+                        "note": ("以下指数为价格分位兜底口径（估值源全部失败）：pe/pb 为 NULL，"
+                                 "pe_pct 是近5年滚动价格分位而非 PE 估值分位——引用时必须注明"
+                                 "「兜底口径」，不得当真实估值分位使用：" + "、".join(_fb))}
         except Exception as e:
             bundle["macro"] = {}
             bundle["macro_missing"] = f"估值读取失败：{type(e).__name__}: {e}"
@@ -989,13 +1009,25 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120,
     lines += ["## 宏观估值（指数最新一行）", ""]
     macro = bundle.get("macro") or {}
     if macro:
+        # P1-9：兜底口径行降级披露——pe_pct 标注「价格分位兜底」，防当真实估值分位
+        def _pct_cell(v, mode):
+            if v is None:
+                return "n/a"
+            s = f"{v:.0%}"
+            return s + "（价格分位兜底）" if mode == "price_fallback" else s
         lines.append(_md_table(
-            ["指数", "日期", "PE", "PE分位", "PB", "PB分位", "收盘"],
+            ["指数", "日期", "PE", "PE分位", "PB", "PB分位", "收盘", "口径"],
             [(ic, m.get("date"), _f(m.get("pe")),
-              None if m.get("pe_pct") is None else f"{m['pe_pct']:.0%}",
+              _pct_cell(m.get("pe_pct"), m.get("valuation_mode")),
               _f(m.get("pb")),
-              None if m.get("pb_pct") is None else f"{m['pb_pct']:.0%}",
-              _f(m.get("close"))) for ic, m in sorted(macro.items())]))
+              _pct_cell(m.get("pb_pct"), m.get("valuation_mode")),
+              _f(m.get("close")),
+              "兜底（价格分位）" if m.get("valuation_mode") == "price_fallback"
+              else ("真实（PE历史分位）" if m.get("valuation_mode") == "real" else "-"))
+             for ic, m in sorted(macro.items())]))
+        fb = bundle.get("macro_fallback")
+        if fb:
+            lines.append(f"- ⚠️ **{fb['note']}**")
     else:
         lines.append(f"- 估值缺失：{bundle.get('macro_missing', '无数据')}")
     lines.append("")

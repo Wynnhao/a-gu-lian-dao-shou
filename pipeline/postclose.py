@@ -196,6 +196,51 @@ def _clear_pending_today(trade_date: Optional[str] = None) -> bool:
     return False
 
 
+def _sweep_expired_decisions(conn, now: Optional[datetime] = None,
+                             orders_dir: Optional[Path] = None) -> dict:
+    """步骤2.6 过期单清扫（批次3a，多agent审查 2026-09-21 P2 执行域：
+    15:05 TTL 惰性过期无 sweeper——陈旧 approved 单只在被 confirm 触碰时才
+    作废，无人触碰就永远挂着"可执行"的假象，pending 文件同步残留）。
+
+    口径：run_date < 今日 且 status='approved' 且 action IN ('buy','sell')
+    （hold/watch 无待执行语义，不属"单"；emergency_scan 单 run_date 恒为
+    真交易日，T 日执行未成的单在 T+1 盘后才被本清扫作废——与 confirm 跨日闸
+    "run_date 已过的陈旧应急单照常作废"同语义）。动作三件：
+    - decision.status → 'expired'（expired 不被 limit_halt._dedupe_emergency
+      视为已存在——同票同 run_date 可由后续扫描重新生成，正是该判重的设计）；
+    - 清对应 pending 落盘文件（runner._remove_pending，按 decision id 全目录匹配）；
+    - 逐笔 risk_event 留痕 + 汇总 notify 一次（AGSICKLE_DISABLE_NOTIFY=1 时短路）。
+
+    返回 {"expired": N, "codes": [...]}。
+    """
+    today_iso = (now or datetime.now()).strftime("%Y-%m-%d")
+    rows = conn.execute(
+        "SELECT id, code, action, run_date FROM decision "
+        "WHERE status='approved' AND run_date IS NOT NULL AND run_date < ? "
+        "AND action IN ('buy','sell') ORDER BY id", (today_iso,)).fetchall()
+    if not rows:
+        return {"expired": 0, "codes": []}
+    from execution import runner as _runner
+    from risk.engine import record_event
+    from risk.notify import notify
+    codes: list = []
+    for did, code, action, run_date in rows:
+        conn.execute("UPDATE decision SET status='expired' WHERE id=?", (did,))
+        n_files = _runner._remove_pending(int(did), orders_dir)
+        record_event(conn, "pending_expired_sweep",
+                     "pending_expired_sweep: decision#%d %s %s run_date=%s 已过期作废"
+                     "（run_date<今日 %s，清理 pending 文件 %d 个；expired 后同票"
+                     "同 run_date 可重新生成）"
+                     % (did, code, action, run_date, today_iso, n_files), int(did))
+        codes.append("%s#%s(%s)" % (code, did, action))
+    conn.commit()
+    notify("盘后过期单清扫",
+           "%d 笔 approved 决策 run_date 已过今日，置 expired 并清理 pending：%s"
+           % (len(rows), "、".join(codes)[:300]))
+    log.warning("步骤2.6 过期单清扫：%d 笔置 expired（%s）", len(rows), "、".join(codes))
+    return {"expired": len(rows), "codes": codes}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="盘后流水线：盯市 + 每日复盘报告（本周最后交易日/指定时含周报）")
     ap.add_argument("--date", default=None, dest="trade_date",
@@ -343,6 +388,16 @@ def main(argv=None) -> int:
                     log.info("步骤2.5 止损自检：未发现 breaches")
             except Exception as e:  # noqa: BLE001
                 log.error("步骤2.5 止损自检 FAIL（继续）: %s", repr(e))
+
+        # 2.6 过期单清扫（批次3a：15:05 TTL 惰性过期无 sweeper——陈旧 approved 单
+        # 主动置 expired + 清 pending 文件 + notify，不等被 confirm 触碰才作废；
+        # 在步骤3.5 应急扫描之前跑，保证扫描面对的是干净的过期状态）
+        try:
+            r_sweep = _sweep_expired_decisions(conn)
+            if r_sweep["expired"]:
+                log.info("步骤2.6 过期单清扫：expired %d 笔", r_sweep["expired"])
+        except Exception as e:  # noqa: BLE001
+            log.error("步骤2.6 过期单清扫 FAIL（继续）: %s", repr(e))
     finally:
         conn.close()
 

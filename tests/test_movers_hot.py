@@ -255,6 +255,129 @@ def test_pool_io_roundtrip_and_current():
     conn.close()
 
 
+# ============================================================
+# 批次3b · 任务6：候选 pct 自洽预检（审查 P2"600016 已进 movers 池缺预检"）
+# ============================================================
+
+def _seed_two_bars(conn, code, prev_close, last_close, last_pct,
+                   prev_cq=None, last_cq=None):
+    """两根自洽日线（前一根 prev_close、后一根 last_close/last_pct）。"""
+    from datetime import date, timedelta
+    d0 = date(2026, 9, 1)
+    for i, (c, cq) in enumerate([(prev_close, prev_cq), (last_close, last_cq)]):
+        conn.execute(
+            "INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
+            " volume, amount, pct_chg, turnover, close_qfq) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (code, (d0 + timedelta(days=i)).isoformat(), c, c * 1.01, c * 0.99,
+             c, 1e6, 6e7, last_pct if i == 1 else 0.0, 1.0, cq))
+    conn.commit()
+
+
+@test
+def test_task6_market_movers_dirty_pct_dropped():
+    """正用例（600016 场景）：快照价锚定库内 close（±0.5%）但 pct 与价格反推
+    偏差 >2pp（脏快照签名）→ 候选丢弃并计数留痕，不入池。"""
+    conn = _mem()
+    _seed_two_bars(conn, "600016", prev_close=4.00, last_close=4.00, last_pct=0.0)
+    spot = [{"代码": "600016", "名称": "民生银行", "最新价": 4.00, "涨跌幅": 9.9,
+             "量比": 5.0, "成交额": 6e7, "振幅": 3.0}]
+    rows = mv.compute_market_movers(spot, top_n=10, conn=conn)
+    assert rows == [], "脏 pct 候选不得入池: %s" % rows
+    assert mv.PCT_PRECHECK_LAST["dropped"] == 1, mv.PCT_PRECHECK_LAST
+    assert mv.PCT_PRECHECK_LAST["kept"] == 0
+    conn.close()
+
+
+@test
+def test_task6_market_movers_consistent_pct_kept():
+    """反用例：pct 与价格反推自洽（4.00→4.24 = +6%）→ 正常入池（对照组）。"""
+    conn = _mem()
+    _seed_two_bars(conn, "600016", prev_close=4.00, last_close=4.24, last_pct=6.0)
+    spot = [{"代码": "600016", "名称": "民生银行", "最新价": 4.24, "涨跌幅": 6.0,
+             "量比": 3.0, "成交额": 6e7, "振幅": 3.0}]
+    rows = mv.compute_market_movers(spot, top_n=10, conn=conn)
+    assert len(rows) == 1 and rows[0]["code"] == "600016", rows
+    assert any("涨幅" in r for r in rows[0]["reason"])
+    assert mv.PCT_PRECHECK_LAST["dropped"] == 0
+    conn.close()
+
+
+@test
+def test_task6_market_movers_band_violation_dropped_even_without_conn():
+    """正用例（停板带）：|pct| 超板幅+0.5pp → 单日不可能，conn=None（无法锚价）
+    也丢弃——同口径覆盖 test_sprint4_d 既有"无 conn 保留正常票"的语义。"""
+    spot = [{"代码": "600016", "名称": "民生银行", "最新价": 4.00, "涨跌幅": 12.0,
+             "量比": 5.0, "成交额": 6e7, "振幅": 3.0}]
+    rows = mv.compute_market_movers(spot, top_n=10, conn=None)
+    assert rows == [], rows
+    assert mv.PCT_PRECHECK_LAST["dropped"] == 1
+
+
+@test
+def test_task6_market_movers_unanchored_price_not_overdropped():
+    """反用例（防误杀）：快照价锚不上库内 close（盘中实时价/数据滞后）→ 只做
+    停板带检查，pct 合法即放行（预检不得把正常候选清空）。"""
+    conn = _mem()
+    _seed_two_bars(conn, "600016", prev_close=4.00, last_close=4.24, last_pct=6.0)
+    spot = [{"代码": "600016", "名称": "民生银行", "最新价": 4.77, "涨跌幅": 6.0,
+             "量比": 3.0, "成交额": 6e7, "振幅": 3.0}]
+    rows = mv.compute_market_movers(spot, top_n=10, conn=conn)
+    assert len(rows) == 1 and rows[0]["code"] == "600016", rows
+    conn.close()
+
+
+@test
+def test_task6_hot_stock_dirty_bar_pct_dropped():
+    """正用例：热门个股候选（新闻阈值已过）latest bar pct 与日线价格反推偏差
+    >2pp（脏 bar 签名）→ 丢弃并计数；对照自洽 bar 正常入池。"""
+    conn = _mem()
+    conn.execute("INSERT INTO stock_info VALUES (?,?,?,?)", ("600519", "贵州茅台", "x", "x"))
+    now = datetime.now()
+    from datetime import timedelta
+    for i in range(3):
+        ts = (now - timedelta(hours=2 + i)).strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute("INSERT INTO news (code,title,content,source,url,published_at,fetched_at)"
+                     " VALUES ('600519',?,'','t','',?,'x')", ("新闻%d" % i, ts))
+    # 脏 bar：价格自岿然不动，pct 却 +9%
+    _seed_two_bars(conn, "600519", prev_close=10.0, last_close=10.0, last_pct=9.0,
+                   prev_cq=10.0, last_cq=10.0)
+    conn.commit()
+    out = hot.compute_hot_stocks(conn)
+    assert not any(s["code"] == "600519" for s in out), out
+    assert hot._LAST_PCT_DROPPED == 1, hot._LAST_PCT_DROPPED
+    # 对照：pct 与价格自洽 → 正常入池
+    conn.execute("DELETE FROM daily_bar WHERE code='600519'")
+    _seed_two_bars(conn, "600519", prev_close=10.0, last_close=10.6, last_pct=6.0,
+                   prev_cq=10.0, last_cq=10.6)
+    conn.commit()
+    out2 = hot.compute_hot_stocks(conn)
+    assert any(s["code"] == "600519" for s in out2), out2
+    assert hot._LAST_PCT_DROPPED == 0
+    conn.close()
+
+
+@test
+def test_task6_hot_stock_exday_bar_conservative_keep():
+    """反用例（保守放行）：除权事件日（d(t) 跳变）raw pct 与价格反推天然背离
+    → 不做预检丢弃（除权日跳过校验，与 audit/movers 保守语义一致）。"""
+    conn = _mem()
+    conn.execute("INSERT INTO stock_info VALUES (?,?,?,?)", ("600519", "贵州茅台", "x", "x"))
+    now = datetime.now()
+    from datetime import timedelta
+    for i in range(3):
+        ts = (now - timedelta(hours=2 + i)).strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute("INSERT INTO news (code,title,content,source,url,published_at,fetched_at)"
+                     " VALUES ('600519',?,'','t','',?,'x')", ("新闻%d" % i, ts))
+    # 除权日：raw -30% 假跌、qfq 连续（d_jump=3.5 > 0.01 除权签名）
+    _seed_two_bars(conn, "600519", prev_close=10.0, last_close=7.0, last_pct=-30.0,
+                   prev_cq=10.0, last_cq=10.5)
+    conn.commit()
+    out = hot.compute_hot_stocks(conn)
+    assert any(s["code"] == "600519" for s in out), out
+    assert hot._LAST_PCT_DROPPED == 0
+    conn.close()
+
+
 def main() -> int:
     failed = 0
     for fn in _TESTS:

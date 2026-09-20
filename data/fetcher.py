@@ -94,6 +94,12 @@ CREATE TABLE IF NOT EXISTS index_daily (
 CREATE TABLE IF NOT EXISTS index_valuation (
     index_code TEXT, trade_date TEXT,
     pe REAL, pe_pct REAL, pb REAL, pb_pct REAL, close REAL,
+    -- P1-9（批次3b）：行级估值来源标记——'real'=PE/PB 历史分位真实口径；
+    -- 'price_fallback'=估值源全挂时近5年滚动价格分位兜底（此时 pe/pb 为 NULL、
+    -- pe_pct 语义是价格分位而非估值分位）。注意：**生产库的加列迁移待用户授权**
+    -- （施工方案 §5 清单①），授权前老库靠下方 ensure_valuation_mode_column()
+    -- 显式迁移函数（测试在临时库验证，生产不自动跑）。
+    valuation_mode TEXT,
     PRIMARY KEY (index_code, trade_date)
 );
 -- P2 信号：signals 为因子 JSON，score 为综合分；profile 标识打分口径
@@ -243,6 +249,24 @@ def _migrate_signal_profile(conn: sqlite3.Connection) -> None:
 
 
 _MIGRATED_FOR: Optional[str] = None  # 进程级：该库路径已完成 DDL+迁移（换库自动重跑）
+
+
+def ensure_valuation_mode_column(conn: sqlite3.Connection) -> bool:
+    """P1-9（批次3b）：index_valuation 显式幂等加列 valuation_mode TEXT。
+
+    老库（建表早于该列）补列；已有列则跳过（PRAGMA table_info 判定，幂等）。
+    **刻意不进 _MIGRATIONS 自动迁移**——生产库加列属施工方案 §5 待授权清单①，
+    授权前仅测试在临时库调用；授权后把 ("index_valuation", "valuation_mode", ...)
+    移入 _MIGRATIONS 即完成接线。
+    返回是否实际执行了 ALTER。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(index_valuation)")}
+    if cols and "valuation_mode" in cols:
+        return False
+    conn.execute("ALTER TABLE index_valuation ADD COLUMN valuation_mode TEXT")
+    conn.commit()
+    log.info("index_valuation 已加列 valuation_mode TEXT（P1-9 估值来源标记）")
+    return True
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -613,7 +637,7 @@ def fetch_daily(code: str, conn: sqlite3.Connection) -> int:
 
 
 def recalc_tx_pct(conn: sqlite3.Connection, code: Optional[str] = None,
-                  tol_pp: float = 0.1) -> tuple:
+                  tol_pp: Optional[float] = None) -> tuple:
     """W-B3（P1-10）：tx 源 pct_chg 除权修复——除权跳变日行 pct 用 qfq 环比。
 
     腾讯源 pct 由不复权 close 逐行差分（fetch_daily 首选 em 官方涨跌幅列，
@@ -624,9 +648,9 @@ def recalc_tx_pct(conn: sqlite3.Connection, code: Optional[str] = None,
     000001 的 tx 时代行 source 全为 NULL，同样带除权假跌签名；签名门槛保证
     em 官方口径行不被误改）。
 
-    检测口径（计划 W-B3）：d(t)=close−close_qfq 跳变日（|Δd|>0.01，即除权
-    事件）且 |现存 pct − qfq 环比| > tol_pp 才重算。**不能**只看背离：tx 加法型
-    复权下，除权段内的正常日 qfq 环比与 raw 环比天然不同（低价高 adj 票可达
+    检测口径（计划 W-B3）：d(t)=close−close_qfq 跳变日（|Δd|>TX_PCT_EXDAY_JUMP，
+    即除权事件）且 |现存 pct − qfq 环比| > tol_pp 才重算。**不能**只看背离：
+    tx 加法型复权下，除权段内的正常日 qfq 环比与 raw 环比天然不同（低价高 adj 票可达
     数 pp），全量按 qfq 环比重写会污染正常行——实测全库仅 ~7k 行是真除权错行。
 
     P2-⑦（2026-09-20）："前一行"取**上一日历行**（任意 source），不再是过滤集
@@ -637,12 +661,20 @@ def recalc_tx_pct(conn: sqlite3.Connection, code: Optional[str] = None,
     141 行/9 票，全在非 watchlist 票上）。日历行口径与 audit.check_db 的
     tx_pct_divergent 判定（prev_qfq/prev_close 全表滚动）对齐。
 
+    批次3b 任务5（P1-7 配套）：跳变/背离阈值默认取 data.audit 的
+    TX_PCT_EXDAY_JUMP / TX_PCT_DIVERGE_TOL_PP 单一口径源（此前 0.01/0.1 与
+    audit 的 0.01/1.0 双口径并存）——报警与修复同门，audit 报什么 --fix 修什么；
+    统一取 1.0pp 后存量 141 行 0.1~1.0pp 背离不再被自动改写（audit 亦不报警，
+    口径归一，如需收紧改 audit 常量一处）。tol_pp 显式传参仍可覆盖（测试用）。
+
     - 行自身或其上一日历行无 close_qfq → 跳过并计数（调用方汇报）；
     - code=None 时扫全表（存量重算 / audit --fix），指定 code 时只处理该票
       （backfill_qfq 每次增量后调用，"未来行有 qfq 即用 qfq 环比"的落地路径）。
 
     返回 (fixed, skipped_no_qfq)。不 commit（事务归属调用方）。
     """
+    from data.audit import TX_PCT_EXDAY_JUMP, TX_PCT_DIVERGE_TOL_PP  # 单一口径源（惰性导入避免 akshare 连带）
+    tol = TX_PCT_DIVERGE_TOL_PP if tol_pp is None else tol_pp
     where, args = ("WHERE code=? AND (source='tx' OR source IS NULL)", (str(code),)) if code \
         else ("WHERE source='tx' OR source IS NULL", ())
     targets = conn.execute(
@@ -670,7 +702,7 @@ def recalc_tx_pct(conn: sqlite3.Connection, code: Optional[str] = None,
             continue
         d_jump = abs((c - cq) - (pc - pcq))
         qfq_pct = (float(cq) / float(pcq) - 1.0) * 100.0
-        if d_jump > 0.01 and abs(float(pct) - qfq_pct) > tol_pp:
+        if d_jump > TX_PCT_EXDAY_JUMP and abs(float(pct) - qfq_pct) > tol:
             updates.append((round(qfq_pct, 4), cd, td))
     if updates:
         conn.executemany(
@@ -695,6 +727,57 @@ def _recent_full_rebrush(conn: sqlite3.Connection, code: str,
         "SELECT 1 FROM fetch_log WHERE code=? AND status='qfq_full_rebrush' "
         "AND run_at >= ? LIMIT 1", (code, cutoff)).fetchone()
     return row is not None
+
+
+# ---------------------------------------------------------------- 冷却窗命中 notify（批次3b 任务7 / 审查 P2）
+
+def _cooldown_notify_marker_path() -> Path:
+    """冷却 notify 幂等标记文件；AGSICKLE_STATE_DIR 调用时读（测试隔离，
+    与 quotes/recorder 同模式）。"""
+    state = Path(os.environ.get("AGSICKLE_STATE_DIR") or (BASE / "logs" / "state"))
+    return state / "cooldown_notify.json"
+
+
+def _notify_cooldown_hit(key: str, title: str, body: str,
+                         window_days: Optional[int] = None) -> str:
+    """冷却窗首次命中推送一条 risk.notify（每 key 每冷却窗限一次，防刷屏）。
+
+    幂等标记落 logs/state/cooldown_notify.json（key → 上次 notify 墙钟时间），
+    跨短命进程生效；窗内重复命中返回 "suppressed" 不再推送。测试环境双保险
+    短路：AGSICKLE_DISABLE_NOTIFY=1（与 risk.notify 同义）或 AGSICKLE_LOG_DIR
+    已设（测试逃生门，生产不设——防既有未设该变量的测试用例弹系统通知）。
+    任何异常只记日志绝不抛（通知失败不阻断数据主流程）。返回状态字符串。
+    """
+    if os.environ.get("AGSICKLE_DISABLE_NOTIFY") == "1":
+        return "disabled"
+    if os.environ.get("AGSICKLE_LOG_DIR"):
+        return "test_env_suppressed"
+    d = REBRUSH_COOLDOWN_DAYS if window_days is None else window_days
+    try:
+        marker = _cooldown_notify_marker_path()
+        now = time.time()
+        marks = {}
+        try:
+            marks = {str(k): float(v)
+                     for k, v in json.loads(marker.read_text(encoding="utf-8")).items()}
+        except (OSError, ValueError, TypeError, AttributeError):
+            marks = {}
+        last = marks.get(key)
+        if last is not None and now - last < d * 86400.0:
+            return "suppressed"
+        marks[key] = now
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tmp = marker.with_suffix(".tmp")
+        tmp.write_text(json.dumps(marks), encoding="utf-8")
+        tmp.replace(marker)
+        from risk.notify import notify  # 惰性导入：非冷却路径零开销
+        notify(title, body)
+        log.warning("冷却窗命中已 notify（key=%s，冷却 %d 天内限一次）: %s",
+                    key, d, body)
+        return "notified"
+    except Exception as e:  # noqa: BLE001
+        log.warning("冷却窗 notify 失败（不阻断）: %s %s", key, repr(e)[:120])
+        return "error"
 
 
 def rebrush_qfq_full(code: str, conn: sqlite3.Connection) -> tuple:
@@ -875,6 +958,15 @@ def backfill_qfq(code: str, conn: sqlite3.Connection) -> int:
             log.warning("%s 增量窗边界伪跳变命中，但 %d 天内已全史重刷"
                         "（加法型口径不可收敛），跳过重刷保留增量窗",
                         code, REBRUSH_COOLDOWN_DAYS)
+            # 批次3b 任务7（审查 P2）：冷却窗（保留窗）命中此前仅 log.warning 无
+            # notify——数据带已知口径偏差静默留存，人碰巧在看板前才可见。
+            # 每 key 每冷却窗限一次（落盘幂等标记，跨进程防刷屏）。
+            _notify_cooldown_hit(
+                "qfq_rebrush:%s" % code,
+                "qfq 重刷冷却窗命中：%s" % code,
+                "%s 增量窗边界伪跳变在 %d 天冷却期内（加法型口径不可收敛），"
+                "已保留增量窗未重刷——该票 qfq 带已知口径偏差，留意数据体检"
+                % (code, REBRUSH_COOLDOWN_DAYS))
         else:
             log.warning("%s 增量窗边界伪跳变（qfq 环比深于 raw >0.3pp），转全史重刷", code)
             n, real_src = rebrush_qfq_full(code, conn)

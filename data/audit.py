@@ -47,6 +47,34 @@ def _limit_pct(code: str) -> float:
     return _market.limit_pct(code) * 100 + 0.5
 
 
+# ----------------------------------------------------------------
+# tx pct 工程判据单一口径源（P1-7 / 批次3b 任务5，2026-09-21）
+# audit.check_db（本文件）与 fetcher.recalc_tx_pct（写入口径 owner）共用以下两个
+# 常量——此前 audit 内联 0.01/1.0、recalc 内联 0.01/0.1，构成「报警 >1pp、
+# 修复 >0.1pp」双口径（审查 P2「两套判据并存」）。统一取报警侧 1.0pp：报警与
+# 修复同门、--fix 收敛性质不变、且不新增报警（若统一取 0.1pp 会对存量
+# 141 行/9 码立即新增 divergent 报警，属行为变化而非对齐）。后续收紧只改这里。
+TX_PCT_EXDAY_JUMP = 0.01      # d(t)=close−close_qfq 跳变阈值（除权事件签名）
+TX_PCT_DIVERGE_TOL_PP = 1.0   # pct 与除权日合法口径的背离容忍（百分点）
+
+
+def _pct_is_recalc_exday(pct, c, cq, pc, pcq) -> bool:
+    """ex 事件日 pct 是否落在 recalc 写入口径（qfq 环比，±TX_PCT_DIVERGE_TOL_PP）。
+
+    recalc（fetcher.recalc_tx_pct）对除权跳变日写入 pct = qfq 环比＝含分红/送转
+    的总回报。该口径在「除权日涨跌停 + 分红」时天然超过停板幅度（如 002271
+    2024-09-26 +12.22% = 官方除息口径涨停 ~10.04% 叠加分红回报），旧豁免判据
+    「|qfq环比|≤停板」对 recalc 写入值恒假 → 40 行/16 码 pct_out_of_range 永久
+    报警且 --fix 无修法（审查 P1-7）。本判定把 audit 豁免/比对判据对齐到 recalc
+    的实际写入口径：pct ≈ qfq 环比（±统一容差）即视为合法除权日口径。
+    前置条件：d(t) 跳变已由调用方判定。任一价格缺失返回 False（保守照报）。
+    """
+    if None in (pct, c, cq, pc, pcq) or not pcq or pcq <= 0:
+        return False
+    qfq_pct = (float(cq) / float(pcq) - 1.0) * 100.0
+    return abs(float(pct) - qfq_pct) <= TX_PCT_DIVERGE_TOL_PP
+
+
 def _norm_volume(volume, amount, close):
     """审计口径量纲归一：判别核心在 common/market.py；无法判定返回 None（体检报问题）
     ——与 fetcher 薄壳的原值回退不同（红线4）。"""
@@ -73,8 +101,15 @@ def check_db(conn: sqlite3.Connection, limit: int = 200) -> list:
     - 302 创业板新段按 ±20% 判（此前只认 300/301/688/689）。
 
     W-B3（Sprint4，P1-10）：新增 tx_pct_divergent——source='tx' 行 pct_chg 与
-    前复权环比背离 >1pp（除权日假跌的另一半：跌幅未超停板但方向/幅度已错，
-    例如 000001 2024-06-14 存 -5.74% 实为 -0.71%）。--fix 按 qfq 环比重算。
+    前复权环比背离超统一容差 TX_PCT_DIVERGE_TOL_PP 且 d(t) 跳变（除权事件）才报
+    （除权日假跌的另一半：跌幅未超停板但方向/幅度已错，例如 000001 2024-06-14
+    存 -5.74% 实为 -0.71%）。--fix 按 qfq 环比重算，与报警共用同一套常量
+    （批次3b 任务5：报警 1.0pp / 修复 0.1pp 双口径已并一，见文件头单一口径源）。
+
+    P1-7（批次3b，2026-09-21）：除权事件日（d(t) 跳变）且 pct 就是 recalc 写入
+    的 qfq 环比总回报口径（_pct_is_recalc_exday）→ pct_out_of_range 豁免——
+    该口径含分红回报，涨跌停叠加分红日可合法超停板（40 行/16 码永久报警根因）。
+    qfq 环比超板但 pct 与之背离超容差的行仍照报（真异常不豁免）。
     """
     issues = []
     rows = conn.execute(
@@ -102,6 +137,10 @@ def check_db(conn: sqlite3.Connection, limit: int = 200) -> list:
         if o is not None and h is not None and l is not None:
             if h < max(o, c) - 1e-9 or l > min(o, c) + 1e-9 or h < l:
                 flag("ohlc_broken", f"o={o} h={h} l={l} c={c}")
+        # d(t) 跳变（除权事件签名）——pct 豁免与 divergent 判据共用（常量单一口径源）
+        exday_jump = (cq is not None and prev_cq is not None
+                      and prev_c is not None and c is not None
+                      and abs((c - cq) - (prev_c - prev_cq)) > TX_PCT_EXDAY_JUMP)
         if pct is not None and td != first_date[code]:
             lp = _limit_pct(code)
             if abs(pct) > lp:
@@ -109,14 +148,18 @@ def check_db(conn: sqlite3.Connection, limit: int = 200) -> list:
                     pass  # 上市前 5 个交易日无涨跌幅限制
                 elif cq and prev_cq and abs((cq / prev_cq - 1) * 100) <= lp:
                     pass  # 除权假跌：前复权后真实涨跌幅在停板内
+                elif exday_jump and _pct_is_recalc_exday(pct, c, cq, prev_c, prev_cq):
+                    # P1-7：recalc 写入的除权日总回报口径（qfq 环比），涨跌停叠加
+                    # 分红可合法超板——豁免判据与 recalc 写入口径对齐
+                    pass
                 else:
                     flag("pct_out_of_range", f"pct_chg={pct} 超过停板幅度±{lp}%")
-            # W-B3：tx 行 pct 与 qfq 环比背离 >1pp 且 d(t) 跳变（除权事件）才报——
-            # tx 加法型复权在除权段内正常日两口径天然不同，只看背离会误报上万行
-            if (source == "tx" and cq and prev_cq and prev_cq > 0
-                    and prev_c is not None and c is not None
-                    and abs((c - cq) - (prev_c - prev_cq)) > 0.01
-                    and abs(pct - (cq / prev_cq - 1) * 100) > 1.0):
+            # W-B3：tx 行 pct 与 qfq 环比背离超统一容差且 d(t) 跳变（除权事件）才报——
+            # tx 加法型复权在除权段内正常日两口径天然不同，只看背离会误报上万行；
+            # P1-7 对齐：pct 已是 recalc 写入的 qfq 环比口径（±同一容差）不算背离
+            if (source == "tx" and exday_jump and pct is not None
+                    and prev_cq and prev_cq > 0
+                    and not _pct_is_recalc_exday(pct, c, cq, prev_c, prev_cq)):
                 flag("tx_pct_divergent",
                      f"pct_chg={pct} vs qfq环比={(cq / prev_cq - 1) * 100:.2f}%")
         if amt and amt > 0 and v is not None and v > 0:
@@ -166,10 +209,20 @@ def fix_tx_pct(conn: sqlite3.Connection) -> tuple:
 
 
 def backup_db(conn: sqlite3.Connection) -> Path:
-    """VACUUM INTO 快照备份，保留最近 BACKUP_KEEP 份；失败不阻塞主流程。"""
+    """VACUUM INTO 快照备份，保留最近 BACKUP_KEEP 份；失败不阻塞主流程。
+
+    批次3a（多agent审查 2026-09-21 P1-5）：幂等——目标已存在（同分钟二跑，
+    2026-09-20 08:29 实测）→ 跳过并记"已存在"，**不得覆盖**：VACUUM INTO 对
+    已存在目标直接抛 `output file already exists`，此前该异常会顺着 run()
+    冒泡把已完成的体检结论一起吞掉。不同分钟名的新目标仍正常落盘（当日多份
+    快照语义保留，轮转清理不变）。
+    """
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     path = BACKUP_DIR / (
         "market-" + datetime.now().strftime("%Y%m%d-%H%M") + ".db")
+    if path.exists():
+        log.info("备份目标已存在，跳过（幂等，不覆盖）: %s", path.name)
+        return path
     conn.execute("VACUUM INTO ?", (str(path),))
     backups = sorted(BACKUP_DIR.glob("market-*.db"))
     for old in backups[:-BACKUP_KEEP]:
@@ -193,9 +246,18 @@ def run(fix: bool = False, backup: bool = False, limit: int = 200) -> dict:
         by_kind = {}
         for it in issues:
             by_kind[it["kind"]] = by_kind.get(it["kind"], 0) + 1
+        result = {"total": total, "by_kind": by_kind, "issues": issues,
+                  "limit": limit}
         if backup:
-            backup_db(conn)
-        return {"total": total, "by_kind": by_kind, "issues": issues, "limit": limit}
+            # 批次3a（P1-5）：体检结果独立落盘——备份失败只记 backup_error，
+            # 不再让 by_kind/issues 随异常一起丢失（postclose 步骤2.0 的
+            # "数据体检发现 N 个问题" 必须看到真实体检结论）。
+            try:
+                result["backup"] = str(backup_db(conn))
+            except Exception as e:  # noqa: BLE001
+                log.error("库备份 FAIL（体检结论不受影响）: %r", e)
+                result["backup_error"] = repr(e)
+        return result
     finally:
         conn.close()
 

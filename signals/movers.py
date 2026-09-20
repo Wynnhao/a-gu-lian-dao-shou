@@ -53,6 +53,55 @@ def _limit_band(code: str) -> float:
     return 10.0
 
 
+# ---------------------------------------------------------------- 候选 pct 自洽预检
+# 批次3b 任务6（审查 P2"600016 已进 movers 池缺预检"）：全市场快照是外部源
+# （em→tx 兜底，字段错位/口径混装不可控），脏 pct 曾直接进动态池污染 LLM 上下文。
+# 候选入池前校验 pct 与价格自洽，不自洽即丢弃并计数留痕。
+PCT_SNAPSHOT_TOL_PP = 2.0     # 快照 pct 与价格反推的偏差容忍（pp）：2 位小数价格
+                              # 在低价股上的反推误差 ≤0.5pp，2.0 只拦真脏快照
+PCT_PRICE_ANCHOR_REL = 0.005  # 快照最新价锚定库内 close 的相对容差（0.5%）
+PCT_PRECHECK_LAST = {"dropped": 0, "kept": 0}   # 最近一次预检计数（留痕，供 refresh 汇报）
+
+
+def anchor_prev_close(conn: sqlite3.Connection, code: str, price) -> Optional[float]:
+    """快照价锚定库内日线：price 与近 6 根 close 之一相符（±0.5%）→ 返回其前一根
+    close 作为 prev_close；锚不上（盘中实时价/数据滞后）返回 None（只做停板带检查）。
+    锚定而非取"最新一根前一根"：快照与日线落库时点可错位，锚错 prev 会把单日
+    pct 对两日收益误判。"""
+    if conn is None or price is None:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT close FROM daily_bar WHERE code=? ORDER BY trade_date DESC LIMIT 6",
+            (str(code),)).fetchall()
+    except sqlite3.Error:
+        return None
+    closes = [float(r[0]) for r in rows if r[0]]
+    for i, c in enumerate(closes):
+        if c > 0 and abs(float(price) - c) <= PCT_PRICE_ANCHOR_REL * c:
+            return closes[i + 1] if i + 1 < len(closes) else None
+    return None
+
+
+def pct_selfcheck_snapshot(code: str, price, pct, prev_close) -> Optional[str]:
+    """全市场快照候选 pct 自洽校验：返回丢弃原因；None = 通过或无法校验（放行）。
+
+    1. 停板带：|pct| > 板幅+0.5pp（与 audit._limit_pct 同容差）→ 单日不可能；
+    2. 价格反推：prev_close 在手时 |快照 pct − (price/prev_close−1)×100| > 容差
+       → pct 与价格不自洽（脏快照签名，600016 场景）。
+    signals/hot.py 的日线候选预检复用同一容差常量（互指，勿单侧改）。"""
+    band = _limit_band(code)
+    if pct is None or abs(float(pct)) > band + 0.5:
+        return "pct=%s 超停板带 ±%.1f%%（单日不可能）" % (pct, band)
+    if not prev_close or price is None or not price:
+        return None
+    implied = (float(price) / float(prev_close) - 1.0) * 100.0
+    if abs(float(pct) - implied) > PCT_SNAPSHOT_TOL_PP:
+        return ("pct=%+.2f%% 与价格反推 %+.2f%% 偏差 >%.1fpp（脏快照签名）"
+                % (float(pct), implied, PCT_SNAPSHOT_TOL_PP))
+    return None
+
+
 # ---------------------------------------------------------------- 自选池模式
 
 def compute_watchlist_movers(conn: sqlite3.Connection,
@@ -256,6 +305,8 @@ def compute_market_movers(spot: List[dict], top_n: int = 20,
     c = _cfg()
     amount_floor = float(c.get("amount_floor", 5e7))
     out: List[dict] = []
+    PCT_PRECHECK_LAST["dropped"] = 0
+    PCT_PRECHECK_LAST["kept"] = 0
     from datetime import date as _date
     for r in spot:
         code = str(r.get("代码") or "")
@@ -279,6 +330,14 @@ def compute_market_movers(spot: List[dict], top_n: int = 20,
         price, pct, vr, amount = r.get("最新价"), r.get("涨跌幅"), r.get("量比"), r.get("成交额")
         if price is None or pct is None:
             continue
+        # 批次3b 任务6：pct 自洽预检——脏快照候选入池前丢弃并计数留痕
+        _drop = pct_selfcheck_snapshot(code, price, pct,
+                                       anchor_prev_close(conn, code, price))
+        if _drop:
+            PCT_PRECHECK_LAST["dropped"] += 1
+            log.warning("异动池候选 pct 预检丢弃 %s(%s): %s", code, name, _drop)
+            continue
+        PCT_PRECHECK_LAST["kept"] += 1
         reasons: List[str] = []
         strength = 0.0
         if pct is not None and abs(pct) >= c.get("pct_chg", 5.0):
@@ -334,5 +393,7 @@ def refresh(conn: sqlite3.Connection, as_of: Optional[str] = None,
             rows = rows[:top_n]  # 兜底口径同样受池子容量约束，与全市场口径一致
         mode = "watchlist"
     n = dynpool.upsert_pool_rows(conn, "movers", rows, day, mode=mode)
-    log.info("异动池刷新 mode=%s 入池 %d 只（as_of=%s）", mode, n, day)
-    return {"mode": mode, "count": n, "rows": rows}
+    log.info("异动池刷新 mode=%s 入池 %d 只（as_of=%s，pct 预检丢弃 %d）",
+             mode, n, day, PCT_PRECHECK_LAST["dropped"])
+    return {"mode": mode, "count": n, "rows": rows,
+            "pct_precheck": dict(PCT_PRECHECK_LAST)}

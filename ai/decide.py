@@ -27,6 +27,15 @@ MIN_CONFIDENCE = float(RISK_CFG.get("min_confidence", 0.60))
 
 _ACTIONS = ("buy", "sell", "hold", "watch")
 
+# 批次3a（多agent审查 2026-09-21 P2 执行域）：decide 侧快照清洗名单。
+# validate 的 normalized 白名单本就不放行提权键，但 load_and_save 组合快照
+# （{"bundle":…, "decisions": 原文}）存的是 **LLM 原文**——execution.runner
+# ._decision_from_row 会按 code+action 从快照恢复 emergency_pending_skip
+# （规则14 跌停价卖出豁免 flag），不剥离即外部输入借道获得服务端特权，
+# 违反"提权键只能服务端注入"声明（合法注入点仅规则21 与 confirm 执行日
+# 死封路径）。runner.load_decision_file / propose 入口的剥离名单同批补齐。
+_PRIVILEGED_SNAPSHOT_KEYS = ("emergency_pending_skip",)
+
 try:
     from ai.bundle import PROMPT_VERSION
 except Exception:  # noqa: BLE001  避免循环依赖时退化
@@ -342,6 +351,15 @@ def load_and_save(json_path, run_date: Optional[str] = None,
               "run_date=%s" % (run_date or date.today().isoformat()))
         return []
 
+    # 批次3a：快照清洗——LLM 原文携带提权键（见 _PRIVILEGED_SNAPSHOT_KEYS 注释）
+    # 在进入 input_snapshot 前剥离（validate 白名单只护决策内容，护不住快照原文）。
+    for item in data:
+        if isinstance(item, dict):
+            for _k in _PRIVILEGED_SNAPSHOT_KEYS:
+                if item.pop(_k, None) is not None:
+                    log.warning("决策输入携带 %s，已从快照剥离"
+                                "（仅规则21/confirm 执行价路径可设置）", _k)
+
     conn = get_conn()
     try:
         run_date = run_date or date.today().isoformat()
@@ -361,7 +379,9 @@ def load_and_save(json_path, run_date: Optional[str] = None,
             snapshot = json.dumps({"bundle": bundle_obj, "decisions": data},
                                   ensure_ascii=False)
         else:
-            snapshot = text
+            # 无 bundle 时不再退回文件原文（原文可能携带提权键，清洗只作用于
+            # data）——对清洗后的 data 再序列化，内容等价、提权键不回流
+            snapshot = json.dumps(data, ensure_ascii=False)
         # 引用核验锚定 bundle 内容（此前误传决策文件原文，理由必然命中，核验形同虚设）
         anchor_text = json.dumps(bundle_obj, ensure_ascii=False) \
             if bundle_obj is not None else ""

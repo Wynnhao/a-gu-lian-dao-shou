@@ -15,8 +15,9 @@ from datetime import datetime, timedelta
 # 不隔离时会读到**生产**拥挤状态——2026-09-17 盘后生产激活 crowded=true 后，
 # 本文件 12 个买入用例被真实状态压到 5% 上限而批量失败。指向空沙箱目录，
 # 缺文件 → crowded=False（与 test_signals 的 K3 沙箱同模式）。
-os.environ.setdefault("AGSICKLE_SIGNAL_EVAL_DIR",
-                      tempfile.mkdtemp(prefix="agsickle_re_se_"))
+# 批次3a（P2 工程域）：强制赋值（原 setdefault）——防 shell 残留变量击穿沙箱。
+os.environ["AGSICKLE_SIGNAL_EVAL_DIR"] = \
+    tempfile.mkdtemp(prefix="agsickle_re_se_")
 
 from risk.engine import (RiskContext, Verdict, check, record_event, apply_kill_switch,
                          flush_events, limit_pct, in_trading_session)
@@ -968,6 +969,88 @@ def test_health_check_empty_calendar_weekend_fallback():
     conn.execute("DELETE FROM daily_bar WHERE trade_date > '2026-09-18'")
     issues = health_check(conn, today=_date(2026, 9, 21))
     assert not any("滞后" in s for s in issues), issues
+
+
+# ---------------- 批次3a：规则22 停牌拒单 fail-closed（多agent审查 2026-09-21 P2 执行域） ----------------
+
+def test_rule22_halted_code_rejects_buy_and_sell():
+    """正（触发）：halted_codes 命中 → buy/sell 对称拒单（停牌票双向委托均为
+    废单，paper 不得虚构成交）。"""
+    ctx = mk_ctx(halted_codes={"600519"})
+    v_buy = check(mk_dec("buy", "600519", 1500.0, 100), ctx, CFG)
+    assert not v_buy.approved and hit(v_buy, "停牌拒单"), v_buy.violations
+    ctx_sell = mk_ctx(
+        positions={"600519": {"name": "贵州茅台", "shares": 100,
+                              "avail_shares": 100, "cost": 1500.0}},
+        halted_codes={"600519"})
+    v_sell = check(mk_dec("sell", "600519", 1490.0, 100), ctx_sell, CFG)
+    assert not v_sell.approved and hit(v_sell, "停牌拒单"), v_sell.violations
+
+
+def test_rule22_no_evidence_passes_clean():
+    """反（不触发）：无停牌证据 → 不产生规则22 违规，合法买卖照常裁决。"""
+    ctx = mk_ctx()
+    v = check(mk_dec("buy", "600519", 1500.0, 100), ctx, CFG)
+    assert v.approved and not hit(v, "停牌拒单"), v.violations
+
+
+def test_rule22_evidence_is_per_code():
+    """反（不触发）：停牌证据按票隔离——他票停牌不影响本票。"""
+    ctx = mk_ctx(halted_codes={"000001"})
+    v = check(mk_dec("buy", "600519", 1500.0, 100), ctx, CFG)
+    assert v.approved and not hit(v, "停牌拒单"), v.violations
+
+
+def test_rule22_hold_watch_untouched():
+    """反（不触发）：hold/watch 无交易动作，不触达规则22。"""
+    ctx = mk_ctx(halted_codes={"600519"})
+    v = check(mk_dec("hold", "600519", 0, 0,
+                     order={"side": "hold", "price": 0, "shares": 0}), ctx, CFG)
+    assert v.approved and not hit(v, "停牌拒单"), v.violations
+
+
+def test_rule22_kill_liquidation_exempt_with_once_today_event():
+    """豁免+回退：kill_liquidation 补清算卖单在停牌证据下留痕放行（强平优先，
+    防清仓被停牌焊死），沿用 kill_liquidation_health_exempt 的 once_today
+    留痕模式——flush_events 两次同票只落一条。"""
+    ctx = mk_ctx(
+        positions={"600519": {"name": "贵州茅台", "shares": 100,
+                              "avail_shares": 100, "cost": 1500.0}},
+        halted_codes={"600519"})
+    d = mk_dec("sell", "600519", 1490.0, 100, kill_liquidation=True,
+               target_weight=0.0, confidence=1.0)
+    v = check(d, ctx, CFG)
+    assert v.approved, (v.violations, v.report_only)
+    assert not hit(v, "停牌拒单")
+    assert any(w.startswith("规则22豁免") for w in v.warnings), v.warnings
+    assert any(e["rule"] == "kill_liquidation_halt_exempt"
+               and e.get("once_today_prefix", "").startswith(
+                   "kill_liquidation_halt_exempt: 600519 ")
+               for e in v.events), v.events
+    conn = _mem_conn()
+    try:
+        flush_events(conn, v, decision_id=None)
+        flush_events(conn, v, decision_id=None)
+        n = conn.execute("SELECT COUNT(*) FROM risk_event WHERE "
+                         "rule='kill_liquidation_halt_exempt'").fetchone()[0]
+        assert n == 1, "once_today 去重：同票同日只落一条, got %d" % n
+    finally:
+        conn.close()
+
+
+def test_rule22_emergency_scan_sell_still_rejected_when_halted():
+    """反：规则21 应急单无停牌豁免——死封跌停票仍在交易（有 bar 有量），证据
+    腿不命中、应急链不受影响；真停牌时现实中同样卖不出，拒单=如实模拟
+    （stuck 计数次日再生成）。"""
+    ctx = mk_ctx(
+        positions={"600519": {"name": "贵州茅台", "shares": 100,
+                              "avail_shares": 100, "cost": 1500.0}},
+        latest_prices={"600519": 1341.0},
+        prev_close={"600519": 1490.0},
+        halted_codes={"600519"})
+    d = mk_dec("sell", "600519", 1341.0, 100, emergency_scan=True)
+    v = check(d, ctx, CFG)
+    assert not v.approved and hit(v, "停牌拒单"), v.violations
 
 
 # ---------------- 直接运行入口 ----------------

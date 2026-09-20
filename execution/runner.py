@@ -294,6 +294,30 @@ def build_context(conn: sqlite3.Connection, now: datetime,
             total_equity += p["shares"] * float(lp if lp is not None else p["cost"])
         total_equity = round(total_equity, 2)
 
+    # 批次3a（多agent审查 2026-09-21 P2 执行域）：停牌证据组装 → ctx.halted_codes
+    # （规则22 停牌拒单 fail-closed 的数据源，两腿并集）：
+    # - 日线腿：全库最新交易日该票缺 bar（当日/长停牌，也覆盖数据源断供单票）；
+    # - 实时腿：连续竞价时段内实时快照 volume==0（快照缺 volume 字段=未知不判；
+    #   午休/盘前快照零成交是常态，故限 in_trading_session 口径）。
+    halted_codes: set = set()
+    row_latest = conn.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()[0]
+    if row_latest:
+        latest_by_code = {str(c): d for c, d in conn.execute(
+            "SELECT code, MAX(trade_date) FROM daily_bar GROUP BY code").fetchall()}
+        for code in sorted(codes):
+            if latest_by_code.get(code) != row_latest:
+                halted_codes.add(code)
+    if live_quotes and in_trading_session(now):
+        for code, q in live_quotes.items():
+            vol = q.get("volume")
+            if vol is None:
+                continue
+            try:
+                if float(vol) <= 0:
+                    halted_codes.add(str(code))
+            except (TypeError, ValueError):
+                continue
+
     today = now.strftime("%Y-%m-%d")
     today_trades = int(conn.execute(
         "SELECT COUNT(*) FROM trade WHERE trade_date=? AND status IN ('filled','submitted')",
@@ -396,6 +420,7 @@ def build_context(conn: sqlite3.Connection, now: datetime,
         ctx_notes=ctx_notes,
         live_quotes=live_quotes,   # W-A4②：此前恒为空 dict，规则21 条件②从未算过
         price_source=price_source,  # W-A9：昨收冒充实价的口径标记
+        halted_codes=halted_codes,  # 批次3a：停牌证据（规则22 数据源）
     )
 
 
@@ -1017,9 +1042,12 @@ def _propose_locked(conn: sqlite3.Connection, decision: dict,
     # 审查补丁批 Fix A：skip_gate/confirmed_by 只能由规则 21 在下方 check() 内设置；
     # 任何调用方传入的这两个键一律剥离（防决策输入注入"免闸门直写"标志——
     # 否则 emergency_direct_exec=true 时自带 skip_gate 的 buy 也能直写成交）。
-    for _k in ("skip_gate", "confirmed_by"):
+    # 批次3a（P2 执行域）：emergency_pending_skip 同罪剥离——规则14 豁免 flag
+    # 只能由规则 21（check 内）或 confirm 执行日死封路径设置，外部输入自带即
+    # 借道获得"按跌停价卖出"豁免，违反"提权键只能服务端注入"声明。
+    for _k in ("skip_gate", "confirmed_by", "emergency_pending_skip"):
         if decision.pop(_k, None) is not None:
-            log.warning("propose 收到的决策携带 %s，已剥离（仅规则21 可设置）", _k)
+            log.warning("propose 收到的决策携带 %s，已剥离（仅规则21/confirm 执行价路径可设置）", _k)
     if decision_id is None:
         run_date = run_date or now.strftime("%Y-%m-%d")
         if _dedupe_check(conn, decision, run_date):
@@ -1482,7 +1510,9 @@ def load_decision_file(path: str) -> List[dict]:
         # （豁免规则3/4/18、跨日/TTL 闸、stale 设计价执行），与 skip_gate 同类
         # 提权面——文件输入一律剥离；合法注入点仅在服务端
         # （signals.limit_halt 扫描器 / runner.resolve_liquidations）。
-        for _k in ("kill_liquidation", "emergency_scan"):
+        # 批次3a（P2 执行域）：emergency_pending_skip（规则14 跌停价卖出豁免
+        # flag）同名单剥离——合法注入点仅规则21 与 confirm 执行日死封路径。
+        for _k in ("kill_liquidation", "emergency_scan", "emergency_pending_skip"):
             if d.pop(_k, None):
                 log.warning("决策文件 %s 携带 %s，已剥离（仅服务端链路可设置）", path, _k)
     return out

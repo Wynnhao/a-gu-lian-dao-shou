@@ -35,20 +35,22 @@ from datetime import date, datetime, time, timedelta
 from typing import List, Optional, Tuple
 
 # ---- 测试隔离 env（必须在 import 任何项目模块之前设置）----
+# 批次3a（P2 工程域）：强制赋值（原 setdefault）——防 shell 残留的 AGSICKLE_*
+# 变量（指向真实库/目录）击穿隔离；直接赋值保证沙箱恒生效。
 _TMP_ROOT = Path(tempfile.mkdtemp(prefix="agsickle_pipeline_"))
-os.environ.setdefault("AGSICKLE_DISABLE_LIVE_QUOTES", "1")  # 实时行情保持离线
-os.environ.setdefault("AGSICKLE_DISABLE_NOTIFY", "1")       # 不弹系统通知
-os.environ.setdefault("AGSICKLE_DISABLE_SLIPPAGE", "1")
-os.environ.setdefault("AGSICKLE_DISABLE_FETCHER", "1")      # 日线采集短路
-os.environ.setdefault("AGSICKLE_DISABLE_NEWS", "1")
-os.environ.setdefault("AGSICKLE_DISABLE_MACRO", "1")
-os.environ.setdefault("AGSICKLE_DISABLE_SPOT", "1")         # 全市场快照/板块榜短路（movers/hot）
-os.environ.setdefault("AGSICKLE_STATE_DIR", str(_TMP_ROOT / "state"))
-os.environ.setdefault("AGSICKLE_ORDERS_DIR", str(_TMP_ROOT / "state"))
-os.environ.setdefault("AGSICKLE_BACKUP_DIR", str(_TMP_ROOT / "backup"))
+os.environ["AGSICKLE_DISABLE_LIVE_QUOTES"] = "1"  # 实时行情保持离线
+os.environ["AGSICKLE_DISABLE_NOTIFY"] = "1"       # 不弹系统通知
+os.environ["AGSICKLE_DISABLE_SLIPPAGE"] = "1"
+os.environ["AGSICKLE_DISABLE_FETCHER"] = "1"      # 日线采集短路
+os.environ["AGSICKLE_DISABLE_NEWS"] = "1"
+os.environ["AGSICKLE_DISABLE_MACRO"] = "1"
+os.environ["AGSICKLE_DISABLE_SPOT"] = "1"         # 全市场快照/板块榜短路（movers/hot）
+os.environ["AGSICKLE_STATE_DIR"] = str(_TMP_ROOT / "state")
+os.environ["AGSICKLE_ORDERS_DIR"] = str(_TMP_ROOT / "state")
+os.environ["AGSICKLE_BACKUP_DIR"] = str(_TMP_ROOT / "backup")
 # signal_eval 沙箱：compute_all/premarket 会写 factor_crowding.json，缺此隔离时
 # 直跑（run_all 之外）会把合成拥挤状态写进**生产** logs/signal_eval/
-os.environ.setdefault("AGSICKLE_SIGNAL_EVAL_DIR", str(_TMP_ROOT / "signal_eval"))
+os.environ["AGSICKLE_SIGNAL_EVAL_DIR"] = str(_TMP_ROOT / "signal_eval")
 
 _MOCK_QUOTES_FILE = _TMP_ROOT / "mock_quotes.json"
 _MOCK_QUOTES_FILE.write_text(json.dumps({
@@ -734,6 +736,301 @@ def test_midday_live_override_prices_and_equity():
         encoding="utf-8")
     assert "1500.00" in bundle_md, "持仓表实时价列必须是 mock 实时价"
     assert "10.00 | 1500.00" in bundle_md or "| 1500.00 |" in bundle_md
+
+
+# ---------------- 批次3a（多agent审查 2026-09-21 P2/P1 清债）：执行域修复 ----------------
+
+def test_recorder_single_instance_lock():
+    """批次3a：recorder flock 单实例锁——锁被占时第二实例让位退出（rc=0）且
+    零快照零 fetch_log；锁释放后恢复录制（正/反/回退）。锁文件独立命名
+    .recorder.lock，落 AGSICKLE_STATE_DIR 沙箱（不写真实 logs/）。"""
+    import fcntl as _fcntl
+    import pipeline.recorder as rec
+    conn = fresh_conn()
+    seed_market(conn)
+    orig_snap = _patch_fetch_snapshot(lambda codes, index_codes=None: {
+        "600519": {"price": 1500.0, "volume": 1.0, "amount": None,
+                   "prev_close": 1490.0, "time": "t", "source": "t"}})
+    orig_gc = _patch_recorder_conn(conn)
+    lock_path = rec._lock_path()
+    try:
+        assert lock_path.name == ".recorder.lock"
+        assert lock_path.parent != BASE / "logs" / "state"   # 不落生产 logs/
+        # 正：无竞争正常录制
+        now = datetime.combine(_BASE, time(10, 2))
+        assert rec.main(["--now", now.isoformat()]) == 0
+        n0 = conn.execute("SELECT COUNT(*) FROM minute_snapshot").fetchone()[0]
+        assert n0 == 1
+        # 反：外部持锁 → 第二实例 rc=0 退出，零新增（不双写 minute_snapshot）
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        holder = open(lock_path, "w")
+        _fcntl.flock(holder, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        try:
+            rc = rec.main(["--now", datetime.combine(_BASE, time(10, 7)).isoformat()])
+            assert rc == 0
+            assert conn.execute("SELECT COUNT(*) FROM minute_snapshot"
+                                ).fetchone()[0] == n0
+            assert conn.execute("SELECT COUNT(*) FROM fetch_log WHERE"
+                                " code='minute_snapshot'").fetchone()[0] == 1
+        finally:
+            _fcntl.flock(holder, _fcntl.LOCK_UN)
+            holder.close()
+        # 回退：锁释放后恢复录制
+        assert rec.main(["--now", datetime.combine(_BASE, time(10, 12)).isoformat()]) == 0
+        assert conn.execute("SELECT COUNT(*) FROM minute_snapshot"
+                            ).fetchone()[0] == n0 + 1
+    finally:
+        rec.quotes.fetch_snapshot = orig_snap
+        rec.fetcher.get_conn = orig_gc
+        conn.close()
+
+
+def test_postclose_sweep_expired_decisions():
+    """批次3a：postclose 步骤2.6 过期单 sweeper——run_date<今日 且 approved 的
+    buy/sell 单置 expired + 清 pending 文件 + risk_event 留痕；今日单 / rejected /
+    expired / hold/watch 不动；expired 后同票同 run_date 可重新生成
+    （limit_halt._dedupe_emergency 语义协同，链路不死锁）。"""
+    import pipeline.postclose as postclose
+    from signals import limit_halt as lh
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(tempfile.mkdtemp(prefix="pipe_sweep_orders_"))
+    try:
+        yday = (date.today() - timedelta(days=1)).isoformat()
+        today_str = date.today().isoformat()
+
+        def _dec(code, action, run_date, status="approved", esc=0):
+            cur = conn.execute(
+                "INSERT INTO decision (run_date, code, action, target_weight,"
+                " confidence, reasons, risk_notes, input_snapshot, status,"
+                " created_at, emergency_scan) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (run_date, code, action, 0.0, 0.9, '["r1","r2"]', '[]', '{}',
+                 status, datetime.now().isoformat(timespec="seconds"), esc))
+            return int(cur.lastrowid)
+
+        stale_buy = _dec("600519", "buy", yday)                    # 正：过期 buy
+        stale_emg = _dec("000001", "sell", yday, esc=1)            # 正：过期应急单
+        today_buy = _dec("600519", "buy", today_str)               # 反：今日单不动
+        _dec("600519", "buy", yday, status="rejected")             # 反：rejected 不动
+        hold = _dec("600519", "hold", yday)                        # 反：hold 不动
+        # 应急单 approved 在案 → _dedupe_emergency 先判"已存在"
+        assert lh._dedupe_emergency(conn, "000001", yday) is True
+        stale_emg_pending = orders / yday / ("pending_%d.json" % stale_emg)
+        stale_emg_pending.parent.mkdir(parents=True, exist_ok=True)
+        stale_emg_pending.write_text("{}", encoding="utf-8")
+        today_pending = orders / today_str / ("pending_%d.json" % today_buy)
+        today_pending.parent.mkdir(parents=True, exist_ok=True)
+        today_pending.write_text("{}", encoding="utf-8")
+        conn.commit()
+
+        r = postclose._sweep_expired_decisions(
+            conn, now=datetime.combine(date.today(), time(15, 30)),
+            orders_dir=orders)
+        assert r["expired"] == 2, r
+        st = dict(conn.execute("SELECT id, status FROM decision").fetchall())
+        assert st[stale_buy] == "expired" and st[stale_emg] == "expired"
+        assert st[today_buy] == "approved" and st[hold] == "approved"
+        assert any(v == "rejected" for v in st.values())
+        assert not stale_emg_pending.exists(), "过期单 pending 文件应被清理"
+        assert today_pending.exists(), "今日单 pending 文件不得误清"
+        n_ev = conn.execute("SELECT COUNT(*) FROM risk_event WHERE "
+                            "rule='pending_expired_sweep'").fetchone()[0]
+        assert n_ev == 2, "每笔清扫留痕一条"
+        # 协同：expired 后 _dedupe_emergency 不再挡同票同 run_date 重生
+        assert lh._dedupe_emergency(conn, "000001", yday) is False
+        # 幂等：再扫一轮无新增
+        assert postclose._sweep_expired_decisions(
+            conn, now=datetime.combine(date.today(), time(15, 30)),
+            orders_dir=orders)["expired"] == 0
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+        conn.close()
+
+
+def test_postclose_main_wires_expired_sweep():
+    """步骤2.6 接线：进程内 postclose.main 跑通，库中陈旧 approved 单被清扫。"""
+    import pipeline.postclose as postclose
+    _fresh_env("sweepwire")
+    today_str = _seed_db(with_today=True)
+    yday = (date.today() - timedelta(days=1)).isoformat()
+    conn = sqlite3.connect(os.environ["AGSICKLE_DB"])
+    conn.execute(
+        "INSERT INTO decision (run_date, code, action, target_weight, confidence,"
+        " reasons, risk_notes, input_snapshot, status, created_at)"
+        " VALUES (?, '600519', 'buy', 0.0, 0.9, '[]', '[]', '{}', 'approved', 'x')",
+        (yday,))
+    conn.commit()
+    conn.close()
+    sandbox = Path(tempfile.mkdtemp(prefix="agsickle_sweepwire_"))
+    orig = (postclose.REPORTS_DIR, postclose.LOCK_FILE)
+    postclose.REPORTS_DIR = sandbox / "reports"
+    postclose.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    postclose.LOCK_FILE = sandbox / ".postclose.lock"
+    try:
+        assert postclose.main(["--date", today_str]) == 0
+        conn = sqlite3.connect(os.environ["AGSICKLE_DB"])
+        st = conn.execute("SELECT status FROM decision WHERE run_date=?",
+                          (yday,)).fetchone()[0]
+        conn.close()
+        assert st == "expired", st
+    finally:
+        postclose.REPORTS_DIR, postclose.LOCK_FILE = orig
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def test_audit_backup_idempotent_and_check_result_independent():
+    """批次3a / P1-5：备份幂等——目标已存在 → 跳过并记"已存在"，不得覆盖
+    （同分钟二跑此前抛 output file already exists）；体检结论独立落盘——备份
+    失败只记 backup_error，by_kind/issues 不随异常丢失。全沙箱（AGSICKLE_DB +
+    BACKUP_DIR 均指临时目录，不碰生产库）。"""
+    from data import audit as data_audit
+    sandbox = Path(tempfile.mkdtemp(prefix="agsickle_bak_"))
+    old_db = os.environ.get("AGSICKLE_DB")
+    os.environ["AGSICKLE_DB"] = str(sandbox / "market.db")
+    orig_dir, orig_backup = data_audit.BACKUP_DIR, data_audit.backup_db
+    data_audit.BACKUP_DIR = sandbox
+    conn = fresh_conn()
+    seed_market(conn)
+    try:
+        p1 = data_audit.backup_db(conn)
+        assert p1.is_file()
+        first_bytes = p1.read_bytes()
+        p2 = data_audit.backup_db(conn)             # 同分钟二跑 → 幂等跳过
+        assert p2 == p1 and p2.read_bytes() == first_bytes   # 不覆盖
+        assert len(list(sandbox.glob("market-*.db"))) == 1
+        # 体检结论独立：备份 sabotage → run(backup=True) 仍返回体检结果
+        def _boom(c):
+            raise RuntimeError("sabotaged backup")
+        data_audit.backup_db = _boom
+        try:
+            r = data_audit.run(backup=True)
+        finally:
+            data_audit.backup_db = orig_backup
+        assert "backup_error" in r and "sabotaged backup" in r["backup_error"]
+        assert isinstance(r["by_kind"], dict) and "issues" in r and "total" in r
+        # 正常路径：run(backup=True) 返回备份路径
+        r2 = data_audit.run(backup=True)
+        assert "backup" in r2 and Path(r2["backup"]).is_file()
+    finally:
+        data_audit.BACKUP_DIR, data_audit.backup_db = orig_dir, orig_backup
+        if old_db is None:
+            os.environ.pop("AGSICKLE_DB", None)
+        else:
+            os.environ["AGSICKLE_DB"] = old_db
+        conn.close()
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def test_catchup_failsafe_branch_window_and_mutex():
+    """批次3a / P1-4：catchup 09:14~09:30 应急兜底专属分支——当日 premarket 已
+    跑（bundle 新鲜）→ 调 limit_halt.premarket_failsafe（conn/now 透传）；窗外
+    不调；bundle 缺失时与步骤2a 重跑互斥（premarket 自身步骤0.5 兜底，
+    catchup 不重复调）。执行幂等由 premarket_failsafe 的
+    run_date=今日+status='approved' 查询保证（见 test_limit_halt 覆盖）。"""
+    import signals.limit_halt as lh_mod
+    _fresh_env("failsafe")
+    today_str = _seed_db(with_today=True)
+    conn = sqlite3.connect(os.environ["AGSICKLE_DB"])
+    # signal 对齐（避免 2a 判信号错位而整套重跑 premarket）
+    conn.execute("INSERT INTO signal (code, as_of, signals, score, profile)"
+                 " VALUES ('600519', ?, '{}', 0.0, 'reversal_lowvol')",
+                 (today_str,))
+    conn.commit()
+    conn.close()
+    session_dir = Path(os.environ["AGSICKLE_SESSION_DIR"])
+    (session_dir / today_str).mkdir(parents=True, exist_ok=True)
+    bundle = session_dir / today_str / "bundle.md"
+    bundle.write_text("# bundle", encoding="utf-8")
+
+    calls: List[str] = []
+    fs_calls: List[tuple] = []
+    orig_fs = lh_mod.premarket_failsafe
+
+    def fake_fs(conn=None, now=None, do_exec=None):
+        fs_calls.append((now.strftime("%H:%M") if now else None,
+                         conn is not None))
+        return {"pending": [], "executed": [], "notified": False}
+
+    lh_mod.premarket_failsafe = fake_fs
+    try:
+        with _CatchupPatches(calls):
+            # 正：窗口内 + bundle 新鲜 → failsafe 被调，premarket 不重跑
+            rc = catchup.catch_up(now=datetime.combine(date.today(), time(9, 20)))
+            assert rc == 0, calls
+            assert fs_calls == [("09:20", True)], fs_calls
+            assert "pipeline/premarket.py" not in calls, calls
+            # 反1：窗外（10:00）→ 不调
+            fs_calls.clear()
+            catchup.catch_up(now=datetime.combine(date.today(), time(10, 0)))
+            assert fs_calls == [], fs_calls
+            # 反2/互斥：bundle 缺失（9:20）→ 走 2a 重跑 premarket，不直接调
+            bundle.unlink()
+            fs_calls.clear()
+            calls.clear()
+            catchup.catch_up(now=datetime.combine(date.today(), time(9, 20)))
+            assert fs_calls == [], fs_calls
+            assert "pipeline/premarket.py" in calls, calls
+    finally:
+        lh_mod.premarket_failsafe = orig_fs
+
+
+def test_catchup_step1_crossday_stale_heal():
+    """批次3a（自3b移入）：catchup 步骤1 跨日愈合——历史日盯市 note 含
+    「价格滞后:」且滞后票该日 bar 已到位 → 重跑愈合，重跑后 note 重写收敛
+    （第二跑不再触发）；真停牌（bar 仍缺）与无滞后标记的历史日不重跑。"""
+    _fresh_env("heal")
+    yday = (date.today() - timedelta(days=1)).isoformat()
+    older = (date.today() - timedelta(days=2)).isoformat()
+    _seed_db(with_today=False)                    # 600519/000001 均有昨日 bar
+    conn = sqlite3.connect(os.environ["AGSICKLE_DB"])
+    conn.execute("INSERT INTO portfolio_state VALUES (?,?,?,?,?,?,?)",
+                 (yday, 0.0, 0.0, 1000000.0, 0.0, 0,
+                  "mark_to_market@x; 价格滞后:600519@%s" % older))
+    conn.commit()
+    conn.close()
+    reports = Path(os.environ["AGSICKLE_REPORTS_DIR"])
+    (reports / ("%s.md" % yday)).write_text("# 降级日报", encoding="utf-8")
+
+    calls: List[str] = []
+    with _CatchupPatches(calls):
+        rc = catchup.catch_up(now=datetime.combine(date.today(), time(15, 20)))
+    assert rc == 0, calls
+    assert "report:%s" % yday in calls, calls      # 愈合重跑发生
+    conn = sqlite3.connect(os.environ["AGSICKLE_DB"])
+    note = conn.execute("SELECT note FROM portfolio_state WHERE date=?",
+                        (yday,)).fetchone()[0]
+    conn.close()
+    assert "价格日期=%s" % yday in note, note       # 盯市行已按到位 bar 重写
+    # 收敛：第二跑不再触发愈合
+    calls.clear()
+    with _CatchupPatches(calls):
+        rc2 = catchup.catch_up(now=datetime.combine(date.today(), time(15, 20)))
+    assert rc2 == 0, calls
+    assert "report:%s" % yday not in calls, calls
+
+    # 反1（真停牌）：滞后票该日仍无 bar → 不重跑（不进死循环）
+    conn = sqlite3.connect(os.environ["AGSICKLE_DB"])
+    conn.execute("UPDATE portfolio_state SET note=? WHERE date=?",
+                 ("mark_to_market@y; 价格滞后:999999@%s" % older, yday))
+    conn.commit()
+    conn.close()
+    calls.clear()
+    with _CatchupPatches(calls):
+        rc3 = catchup.catch_up(now=datetime.combine(date.today(), time(15, 20)))
+    assert rc3 == 0, calls
+    assert "report:%s" % yday not in calls, calls
+
+    # 反2（无滞后标记）：note=「价格日期=」的历史日不受影响
+    conn = sqlite3.connect(os.environ["AGSICKLE_DB"])
+    conn.execute("UPDATE portfolio_state SET note=? WHERE date=?",
+                 ("mark_to_market@z; 价格日期=%s" % yday, yday))
+    conn.commit()
+    conn.close()
+    calls.clear()
+    with _CatchupPatches(calls):
+        rc4 = catchup.catch_up(now=datetime.combine(date.today(), time(15, 20)))
+    assert rc4 == 0, calls
+    assert "report:%s" % yday not in calls, calls
 
 
 # ----------------------- 直接运行入口 -----------------------

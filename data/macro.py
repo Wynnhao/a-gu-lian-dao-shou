@@ -52,6 +52,19 @@ _PB_CHAINS = {
                ("stock_market_pb_lg", "上证", "市净率")],
 }
 
+# P1-9（批次3b）：index_valuation.valuation_mode 行级来源标记——bundle/webapp
+# 据此区分"PE/PB 历史分位"与"价格分位兜底"两种 pe_pct 语义（此前 fail-open：
+# 兜底行把价格分位写进 pe_pct 且库内无来源标记，消费方无法辨识）。
+VALUATION_MODE_REAL = "real"                # PE/PB 历史分位（legu 系接口）
+VALUATION_MODE_FALLBACK = "price_fallback"  # 估值源全挂 → 近5年滚动价格分位兜底
+
+
+def _valuation_has_mode_col(conn) -> bool:
+    """index_valuation 是否已有 valuation_mode 列（生产库加列待授权——授权前
+    老库无该列，写路径自动退回 7 列模式，行为零变化）。"""
+    return "valuation_mode" in {
+        r[1] for r in conn.execute("PRAGMA table_info(index_valuation)")}
+
 
 def pct_rank(series: pd.Series) -> pd.Series:
     """在全部可得历史中的百分位（0~1，pandas rank 平均法；NaN 输入保持 NaN）。"""
@@ -111,17 +124,33 @@ def _fetch_series(chain: list):
     return None, None
 
 
-def _write_valuation(code: str, conn, vals: dict) -> int:
-    """INSERT OR REPLACE 写 index_valuation，vals: {date: (pe, pe_pct, pb, pb_pct, close)}。"""
-    rows = [(code, d) + v for d, v in sorted(vals.items())]
-    conn.executemany("INSERT OR REPLACE INTO index_valuation VALUES (?, ?, ?, ?, ?, ?, ?)",
-                     rows)
+def _write_valuation(code: str, conn, vals: dict,
+                     mode: str = VALUATION_MODE_REAL) -> int:
+    """INSERT OR REPLACE 写 index_valuation，vals: {date: (pe, pe_pct, pb, pb_pct, close)}。
+
+    P1-9（批次3b）：列名显式写入；表已有 valuation_mode 列时逐行标注来源 mode
+    （real / price_fallback），老库（待授权加列）自动退回 7 列写法零行为变化。
+    """
+    if _valuation_has_mode_col(conn):
+        rows = [(code, d) + v + (mode,) for d, v in sorted(vals.items())]
+        conn.executemany(
+            "INSERT OR REPLACE INTO index_valuation "
+            "(index_code, trade_date, pe, pe_pct, pb, pb_pct, close, valuation_mode) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    else:
+        rows = [(code, d) + v for d, v in sorted(vals.items())]
+        conn.executemany("INSERT OR REPLACE INTO index_valuation VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         rows)
     conn.commit()
     return len(rows)
 
 
 def _price_percentile_fallback(code: str, conn, years: int) -> int:
-    """估值源全部失败：用 index_daily close 算近5年滚动价格分位，pe/pb 置 NULL。"""
+    """估值源全部失败：用 index_daily close 算近5年滚动价格分位，pe/pb 置 NULL。
+
+    P1-9（批次3b）：fail-open → 至少可辨识——兜底行 valuation_mode='price_fallback'
+    （pe_pct 语义是价格分位而非估值分位），且日志升 warning；bundle 据此降级披露。
+    """
     rows = conn.execute(
         "SELECT trade_date, close FROM index_daily WHERE index_code=? ORDER BY trade_date",
         (code,)).fetchall()
@@ -133,9 +162,9 @@ def _price_percentile_fallback(code: str, conn, years: int) -> int:
     pcts = rolling_price_pct(dates, closes, years=years)
     vals = {d: (None, p, None, None, c)
             for d, c, p in zip(dates, closes, pcts) if p is not None}
-    n = _write_valuation(code, conn, vals)
-    log.info("%s 价格分位口径: %d 行（pe/pb 置 NULL, pe_pct=近%d年价格分位）",
-             code, n, years)
+    n = _write_valuation(code, conn, vals, mode=VALUATION_MODE_FALLBACK)
+    log.warning("%s 价格分位兜底口径: %d 行（pe/pb 置 NULL, pe_pct=近%d年价格分位，"
+                "valuation_mode=%s）", code, n, years, VALUATION_MODE_FALLBACK)
     return n
 
 
@@ -148,7 +177,8 @@ def _valuation_one(code: str, conn, years: int = 5) -> dict:
 
     if pe_df is None and pb_df is None:
         n = _price_percentile_fallback(code, conn, years)
-        return {"mode": "价格分位口径", "pe_source": None, "pb_source": None, "rows": n}
+        return {"mode": "价格分位口径", "valuation_mode": VALUATION_MODE_FALLBACK,
+                "pe_source": None, "pb_source": None, "rows": n}
 
     pe_val, pe_pct, pe_close = {}, {}, {}
     pb_val, pb_pct, pb_close = {}, {}, {}
@@ -174,7 +204,8 @@ def _valuation_one(code: str, conn, years: int = 5) -> dict:
     n = _write_valuation(code, conn, vals)
     log.info("index_valuation %s: %d 行 (pe源=%s, pb源=%s, PE历史分位口径)",
              code, n, pe_src, pb_src)
-    return {"mode": "PE历史分位", "pe_source": pe_src, "pb_source": pb_src, "rows": n}
+    return {"mode": "PE历史分位", "valuation_mode": VALUATION_MODE_REAL,
+            "pe_source": pe_src, "pb_source": pb_src, "rows": n}
 
 
 def fetch_index_valuation(codes=None, years: int = 5) -> dict:

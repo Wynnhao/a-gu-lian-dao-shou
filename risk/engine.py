@@ -56,6 +56,10 @@ class RiskContext:
     # ---- C-ARC-4（T2）：build_context 内 fail-open 的留痕便签 ----
     # 只追加、不参与裁决；调用方在 flush_events 时转成 failopen_regime_cap 事件落库。
     ctx_notes: List[str] = field(default_factory=list)
+    # ---- 批次3a（多agent审查 2026-09-21 P2 执行域）：停牌证据（规则22） ----
+    # build_context 组装：最新全市场交易日缺 bar / 盘中实时快照 volume==0 的票。
+    # 缺省空 set = 规则22 自动跳过（旧调用方/测试直构 RiskContext 向后兼容）。
+    halted_codes: set = field(default_factory=set)
 
 
 @dataclass
@@ -227,6 +231,45 @@ def rule_trading_session(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict
         v.violations.append(
             "非交易时段：%s 不在 周一~周五 09:30-11:30/13:00-15:00，拒绝买卖"
             % ctx.now.strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def rule_halt_guard(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
+    """规则22：停牌拒单 fail-closed（多agent审查 2026-09-21 P2 执行域：停牌票
+    此前可被 paper 模拟成交——无显式停牌防线，快照 volume==0 / 最新交易日缺
+    该票 bar 即应拒单）。买卖对称：A 股停牌票双向委托均为废单，paper 侧照单
+    全收等于虚构成交，故 buy/sell 一律拒绝。
+
+    证据来源 ctx.halted_codes（build_context 组装，两腿并集）：
+    - 日线腿：全库最新交易日该票缺 bar（当日停牌/长停牌；也覆盖数据源断供单票
+      ——fail-closed 方向，宁拒勿虚构）；
+    - 实时腿：连续竞价时段内实时快照 volume==0（停牌最及时的口径；快照缺
+      volume 字段=未知，不判停牌）。
+
+    豁免：kill_liquidation 补清算卖单——强平最高优先级（CONSTRAINTS §3.3），
+    否则持仓票停牌会把 kill 清仓/递延补清算永久焊死；沿用
+    kill_liquidation_health_exempt 的 once_today 留痕模式（同票同日一条）。
+    规则21 应急单不豁免：死封跌停票仍在交易（有 bar、有量），证据腿不会命中；
+    真停牌时现实中同样卖不出，拒单=如实模拟（stuck 计数次日再生成）。
+    hold/watch 无交易动作，check() 主流程在结构校验前已放行，本规则不触达。
+    """
+    code = str(decision.get("code") or "")
+    if not code or code not in (ctx.halted_codes or set()):
+        return
+    if decision.get("kill_liquidation") and \
+            str(decision.get("action") or "").strip().lower() == "sell":
+        v.warnings.append(
+            "规则22豁免：kill 补清算卖单 %s 在停牌证据下留痕放行（强平优先，"
+            "防清仓被停牌焊死）" % code)
+        v.events.append({
+            "rule": "kill_liquidation_halt_exempt",
+            "detail": "kill_liquidation_halt_exempt: %s 停牌证据在案仍放行补清算卖单"
+                      "（强平最高优先级，不受停牌拒单约束）" % code,
+            "once_today_prefix": "kill_liquidation_halt_exempt: %s " % code})
+        return
+    v.violations.append(
+        "停牌拒单：%s 无最新交易日 bar 或盘中快照零成交（停牌证据），"
+        "拒绝%s单（fail-closed）"
+        % (code, "买" if decision.get("action") == "buy" else "卖"))
 
 
 def rule_kill_switch(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
@@ -443,10 +486,18 @@ def rule_lot_size(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> No
 
 
 def rule_price_limit(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
-    """规则14：涨跌停保护——买价达到涨停拒买，卖价达到跌停拒卖。
+    """规则14：涨跌停保护——委托买价 ≥ 涨停价拒买，委托卖价 ≤ 跌停价拒卖。
 
-    豁免：decision['emergency_pending_skip']=True 且 risk_event 已有
-    'limit_halt_emergency' 记录 → 仅记 warning 放行（让应急单穿透规则 14）。
+    基准：ctx.prev_close（build_context 以实时昨收覆盖 DB bar，即**执行日**
+    的涨跌停基准；confirm 执行价二次校验复用本规则时，同一次 check 上下文的
+    prev_close 即执行日口径）。停板幅度按板块 limit_pct（主板 10%/创科 20%/
+    北交 30%）。
+
+    豁免：decision['emergency_pending_skip']=True → 仅记 warning 放行（让应急
+    单穿透规则 14）。该 flag 由**同次 check 内先行运行的规则 21**（命中三条件时
+    置位，见 rule_limit_halt_emergency——本函数在 check() 序列中排在其后）或
+    confirm 执行日死封路径（runner._confirm_locked 按执行日跌停价排队时置位）
+    写入；本函数只读 flag，**不**查 risk_event 留痕（留痕由置位方/事件流负责）。
     """
     order = decision.get("order") or {}
     code = str(decision.get("code") or "")
@@ -809,6 +860,7 @@ def check(decision: dict, ctx: RiskContext, cfg: dict) -> Verdict:
 
     rule_trading_session(decision, ctx, cfg, v)  # 规则4
     rule_blacklist(decision, ctx, cfg, v)        # 规则1
+    rule_halt_guard(decision, ctx, cfg, v)       # 规则22（批次3a：停牌拒单 fail-closed）
     rule_price_guard(decision, ctx, cfg, v)      # 规则9
     rule_limit_halt_emergency(decision, ctx, cfg, v)   # 规则21（Sprint 1，必须在规则14之前：先写豁免 flag）
     rule_price_limit(decision, ctx, cfg, v)      # 规则14（被 21 触发的 emergency_pending_skip 豁免）

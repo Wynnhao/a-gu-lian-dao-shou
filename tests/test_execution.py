@@ -18,12 +18,16 @@ import traceback
 from datetime import date, datetime, time, timedelta
 from typing import Dict, Optional
 
-os.environ.setdefault("AGSICKLE_DISABLE_LIVE_QUOTES", "1")  # 测试保持离线确定价
-os.environ.setdefault("AGSICKLE_DISABLE_NOTIFY", "1")       # 测试不弹系统通知
-os.environ.setdefault("AGSICKLE_DISABLE_SLIPPAGE", "1")     # 测试金额断言不含滑点
+# 批次3a（P2 工程域）：测试 env 强制赋值（原 setdefault）——shell 残留的
+# AGSICKLE_* 变量（如曾 export 过真实目录）可击穿沙箱隔离，setdefault 会放行
+# 残留值；直接赋值保证测试永远落在临时沙箱。conftest.py 的 setdefault 属
+# pytest 直跑兜底（注释已说明），不在本专项范围。
+os.environ["AGSICKLE_DISABLE_LIVE_QUOTES"] = "1"  # 测试保持离线确定价
+os.environ["AGSICKLE_DISABLE_NOTIFY"] = "1"       # 测试不弹系统通知
+os.environ["AGSICKLE_DISABLE_SLIPPAGE"] = "1"     # 测试金额断言不含滑点
 _TMP_STATE = tempfile.mkdtemp(prefix="agsickle_state_")
-os.environ.setdefault("AGSICKLE_STATE_DIR", _TMP_STATE)     # kill.json 隔离到临时目录
-os.environ.setdefault("AGSICKLE_ORDERS_DIR", _TMP_STATE)    # 执行锁文件隔离
+os.environ["AGSICKLE_STATE_DIR"] = _TMP_STATE     # kill.json 隔离到临时目录
+os.environ["AGSICKLE_ORDERS_DIR"] = _TMP_STATE    # 执行锁文件隔离
 
 from data.fetcher import DDL
 from execution.paper import PaperBroker, compute_fees
@@ -1714,6 +1718,163 @@ def test_explicit_price_marker_removed_and_recheck_still_enforced():
         assert res2 is not None and res2["ok"]
     finally:
         shutil.rmtree(orders, ignore_errors=True)
+
+
+# ---------------- 批次3a（多agent审查 2026-09-21 P2）：提权键剥离 + 规则22 停牌拒单 ----------------
+
+def test_load_decision_file_strips_emergency_pending_skip():
+    """批次3a：规则14 豁免 flag 进文件输入剥离名单——emergency_pending_skip
+    只能由规则21/confirm 执行日死封路径设置，文件输入自带即借道提权。"""
+    d = Path(tempfile.mkdtemp(prefix="agsickle_exec_eps_"))
+    f = d / "decision.json"
+    f.write_text(json.dumps([{"action": "sell", "code": "600519",
+                              "target_weight": 0.0, "confidence": 0.9,
+                              "reasons": ["r1"], "risk_notes": [],
+                              "emergency_pending_skip": True}]),
+                 encoding="utf-8")
+    out = runner.load_decision_file(str(f))
+    assert out and "emergency_pending_skip" not in out[0]
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_propose_strips_emergency_pending_skip_from_input_snapshot():
+    """批次3a：propose 入口剥离——传入 dict 自带的 flag 不得存活到落库
+    input_snapshot（_decision_from_row 会按 code+action 从快照恢复该 flag）。
+    正常决策的其它键不受影响（不误伤）。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_tmp_dir())
+    try:
+        d = mk_decision("buy", "000001", 11.0, 100, emergency_pending_skip=True)
+        v = runner.propose(conn, d, now=NOW10, orders_dir=orders)
+        assert v.approved
+        assert "emergency_pending_skip" not in d        # 入口已剥离
+        snap = conn.execute("SELECT input_snapshot FROM decision WHERE id=1"
+                            ).fetchone()[0]
+        assert "emergency_pending_skip" not in (snap or ""), snap
+        assert json.loads(snap)["order"]["price"] == 11.0   # 正常键原样保留
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+        conn.close()
+
+
+def test_decide_snapshot_strips_emergency_pending_skip():
+    """批次3a：decide 侧快照清洗——LLM 原文的提权 flag 不得进入
+    input_snapshot（无 bundle 回退路径原本直接存文件原文，同样要清洗）。"""
+    import ai.decide as decide_mod
+    tmp = Path(tempfile.mkdtemp(prefix="agsickle_dec_snap_"))
+    dec = {"action": "buy", "code": "600519", "target_weight": 0.1,
+           "confidence": 0.9, "reasons": ["r1", "r2"], "risk_notes": [],
+           "order": {"side": "buy", "price": 1450.0, "shares": 100},
+           "emergency_pending_skip": True}
+    f_flag = tmp / "with_flag.json"
+    f_flag.write_text(json.dumps(dec), encoding="utf-8")
+    f_clean = tmp / "clean.json"
+    f_clean.write_text(json.dumps({k: v for k, v in dec.items()
+                                   if k != "emergency_pending_skip"}),
+                       encoding="utf-8")
+    captured = {}
+
+    def fake_save(conn, decisions, input_snapshot, run_date, **kw):
+        captured["decisions"] = decisions
+        captured["snapshot"] = input_snapshot
+        return []
+
+    orig_base, orig_save = decide_mod.BASE, decide_mod.save_decisions
+    old_db = os.environ.get("AGSICKLE_DB")
+    os.environ["AGSICKLE_DB"] = str(tmp / "market.db")
+    decide_mod.BASE = tmp                       # bundle 探测指到沙箱
+    decide_mod.save_decisions = fake_save
+    try:
+        # 无 bundle：快照退化为决策原文 → 清洗后不得携带 flag
+        decide_mod.load_and_save(str(f_flag), run_date="2099-01-01")
+        assert "emergency_pending_skip" not in captured["snapshot"], \
+            captured["snapshot"]
+        assert "emergency_pending_skip" not in captured["decisions"][0]
+        # 正：干净输入不误伤（order/键原样）
+        decide_mod.load_and_save(str(f_clean), run_date="2099-01-01")
+        assert captured["decisions"][0]["order"]["price"] == 1450.0
+        # 有 bundle：组合快照 {"bundle":…, "decisions":…} 同样清洗
+        (tmp / "logs" / "session" / "2099-01-01").mkdir(parents=True)
+        (tmp / "logs" / "session" / "2099-01-01" / "bundle.json").write_text(
+            "{}", encoding="utf-8")
+        decide_mod.load_and_save(str(f_flag), run_date="2099-01-01")
+        snap_obj = json.loads(captured["snapshot"])
+        assert "emergency_pending_skip" not in json.dumps(snap_obj["decisions"])
+    finally:
+        decide_mod.BASE, decide_mod.save_decisions = orig_base, orig_save
+        if old_db is None:
+            os.environ.pop("AGSICKLE_DB", None)
+        else:
+            os.environ["AGSICKLE_DB"] = old_db
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_build_context_assembles_halt_evidence():
+    """批次3a：build_context 停牌证据两腿——日线腿（最新交易日缺 bar）+
+    实时腿（连续竞价时段快照 volume==0）；快照缺 volume 字段=未知不判停牌。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    conn.execute("DELETE FROM daily_bar WHERE code='300750' AND trade_date=?",
+                 (NOW_DATE,))
+    conn.commit()
+    ctx = runner.build_context(conn, NOW10)
+    assert "300750" in ctx.halted_codes        # 日线腿：缺最新交易日 bar
+    assert "000001" not in ctx.halted_codes    # bar 齐全不判停
+    with set_live_quotes({"000001": {"price": 11.0, "prev_close": 10.9, "volume": 0},
+                          "600519": {"price": 1500.0, "prev_close": 1490.0}}):
+        ctx2 = runner.build_context(conn, NOW10)
+    assert "000001" in ctx2.halted_codes       # 实时腿：volume==0
+    assert "600519" not in ctx2.halted_codes   # 缺 volume 字段不判停
+    conn.close()
+
+
+def test_rule22_halt_guard_blocks_propose_and_exempts_liquidation():
+    """规则22 执行层联动（正/豁免/回退）：停牌证据下 propose 拒单
+    （status=rejected）；kill_liquidation 补清算单豁免放行走闸门，confirm 仍可
+    成交；证据消失（停牌恢复）后同票恢复可交易。"""
+    conn = fresh_conn()
+    seed_market(conn)
+    conn.execute("INSERT INTO position (code, name, shares, avail_shares, cost,"
+                 " updated_at) VALUES ('300750','宁德时代',100,100,400.0,'x')")
+    conn.commit()
+    orders = Path(_tmp_dir())
+    live = {"300750": {"price": 330.51, "prev_close": 325.0, "volume": 0}}
+    try:
+        with set_live_quotes(live):
+            d = mk_decision("buy", "300750", 330.51, 100)
+            v = runner.propose(conn, d, now=NOW10, orders_dir=orders)
+            assert not v.approved and any("停牌拒单" in x for x in v.violations), \
+                v.violations
+            st = conn.execute("SELECT status FROM decision WHERE id=1"
+                              ).fetchone()[0]
+            assert st == "rejected", st
+
+            # kill_liquidation 豁免：补清算卖单放行（闸门开启 → pending 等确认）
+            d2 = mk_decision("sell", "300750", 330.51, 100, kill_liquidation=True,
+                             target_weight=0.0, confidence=1.0)
+            v2 = runner.propose(conn, d2, now=NOW10, orders_dir=orders)
+            assert v2.approved, (v2.violations, v2.report_only)
+            assert any(w.startswith("规则22豁免") for w in v2.warnings), v2.warnings
+            st2 = conn.execute("SELECT status FROM decision WHERE id=2"
+                               ).fetchone()[0]
+            assert st2 == "approved", st2
+            # confirm（重跑风控同样豁免）→ 成交
+            res = runner.confirm(conn, 2, confirmed_by="批次3a", now=NOW10,
+                                 orders_dir=orders, price_override=330.51)
+            assert res is not None and res["ok"]
+            st2b = conn.execute("SELECT status FROM decision WHERE id=2"
+                                ).fetchone()[0]
+            assert st2b == "executed", st2b
+        # 回退：停牌恢复（volume 回到正常）→ 同票 propose 不再被规则22 拒
+        live_ok = {"300750": {"price": 330.51, "prev_close": 325.0, "volume": 12345.0}}
+        with set_live_quotes(live_ok):
+            d3 = mk_decision("buy", "300750", 330.51, 100)
+            v3 = runner.propose(conn, d3, now=NOW10, orders_dir=orders)
+            assert not any("停牌拒单" in x for x in v3.violations), v3.violations
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+        conn.close()
 
 
 # ---------------- 直接运行入口 ----------------

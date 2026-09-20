@@ -236,7 +236,10 @@ def test_build_bundle_with_data():
                  "('600519',?,1,1,1,1,1,1,0,0)", (bar_date,))
     # signal 与日线同日：bundle 按最新 bar 日期取信号截面
     conn.execute("INSERT INTO signal (code, as_of, signals, score, profile) VALUES ('600519',?, '{\"ma_trend\":\"up\"}',0.7,'reversal_lowvol')", (bar_date,))
-    conn.execute("INSERT INTO index_valuation VALUES ('000300','2026-09-11',12,0.5,1.3,0.6,4000)")
+    # valuation_mode 列（批次3b P1-9）：DDL 已 8 列，命名列写入（老库无该列时
+    # bundle 读取自动降级，见 tests/test_macro.py 兼容用例）
+    conn.execute("INSERT INTO index_valuation (index_code, trade_date, pe, pe_pct,"
+                 " pb, pb_pct, close) VALUES ('000300','2026-09-11',12,0.5,1.3,0.6,4000)")
     conn.execute("INSERT INTO portfolio_state VALUES ('2026-09-11',900000,100000,1000000,0,0,'t')")
     conn.commit()
     b = ai_bundle.build_bundle(run_date="2026-09-11", conn=conn)
@@ -507,6 +510,55 @@ def test_build_bundle_evidence_fields_degrade_on_empty():
         assert "no_label" in cs or "error" in cs
         md = ai_bundle.bundle_to_markdown(b)
         assert "研究证据参考" in md
+    finally:
+        conn.close()
+
+
+def test_bundle_chan_note_disclosure_upgraded():
+    """批次3b 任务8（审查 P2 披露域 + P1-13）：LLM 可见缠论 note 补量化披露——
+    「消失类 29.78%、超额未检验（Gate3 未跑）」；「重画率 FAIL」更正为「机械实现
+    因果性不足」（研究结论披露措辞，依据策略库 §10.3/§10.5）。正反两断言：
+    新表述在位、旧表述不再出现。"""
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(DDL)
+    try:
+        cs = ai_bundle.chan_evidence_lines(conn, codes=["600999"])
+        note = cs["note"]
+        assert "机械实现因果性不足" in note, note
+        assert "消失类 29.78%" in note, note
+        assert "Gate3 未跑" in note, note
+        assert "已归档" in note, "归档披露必须保留（既有用例锚点）"
+        assert "重画率 FAIL" not in note, "旧措辞应被更正"
+        # markdown 渲染带披露
+        md = ai_bundle.bundle_to_markdown({
+            "run_date": "2026-09-21",
+            "chan_structure": {"lines": [], "no_label": 1, "note": note}})
+        assert "机械实现因果性不足" in md and "29.78%" in md
+    finally:
+        conn.close()
+
+
+def test_bundle_macro_fallback_row_disclosed_in_json_and_md():
+    """批次3b 任务3（P1-9 配套）：兜底口径行（valuation_mode='price_fallback'）
+    在 bundle JSON 带模式标记、markdown 数值旁标「价格分位兜底」，防 LLM 把
+    兜底值当真实估值分位。负向：真实口径行不受影响。"""
+    from data.fetcher import DDL as _DDL
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(_DDL)
+    try:
+        conn.execute(
+            "INSERT INTO index_valuation (index_code, trade_date, pe, pe_pct, pb,"
+            " pb_pct, close, valuation_mode) VALUES"
+            " ('000300','2026-09-11',NULL,0.62,NULL,NULL,4000,'price_fallback'),"
+            " ('000905','2026-09-11',25.0,0.4,2.1,0.3,5100.0,'real')")
+        conn.commit()
+        b = ai_bundle.build_bundle(run_date="2026-09-11", conn=conn)
+        assert b["macro"]["000300"]["valuation_mode"] == "price_fallback"
+        assert b["macro"]["000905"]["valuation_mode"] == "real"
+        assert b["macro_fallback"]["indices"] == ["000300"]
+        md = ai_bundle.bundle_to_markdown(b)
+        assert "62%（价格分位兜底）" in md
+        assert "40%（价格分位兜底）" not in md  # 真实行不被误标
     finally:
         conn.close()
 

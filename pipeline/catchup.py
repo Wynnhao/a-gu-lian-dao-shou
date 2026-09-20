@@ -136,6 +136,35 @@ def _stale_codes_from_note(note):
     return out
 
 
+def _stale_heal_due(conn, td: str) -> bool:
+    """批次3a（自3b移入，P2⑬跨日扩展）：历史缺失日之外的「降级盯市跨日愈合」判据。
+
+    该日已有盯市行且日报已存在，但 portfolio_state.note 含「价格滞后:」
+    （写行时按最近可得收盘降级盯市），且**滞后代码中至少一个在该 td 的
+    daily_bar 已到位** → 该日盯市未完成，应重跑愈合。滞后代码仍全数无该日
+    bar（真停牌/数据真未出）→ 算完成（不触发重跑循环）；愈合重跑后 note 由
+    mark_to_market 按最新数据重写（全到位 →「价格日期=」；仍缺 → 滞后段只剩
+    真 Missing 票，再判即为 False）→ 收敛，每波数据到位至多重跑一次。
+
+    复用 _stale_codes_from_note 解析滞后段；不做 _mm_done 的「无价格标记也算
+    未完成」扩展——历史日 note 可能被 kill_switch 等覆写为其它文案，跨日分支
+    只对显式「价格滞后:」负责，避免把无关历史日拖入重跑。
+    """
+    ps = repo.state_on(conn, td)
+    note = (ps["note"] if ps is not None else "") or ""
+    if "价格滞后:" not in note:
+        return False
+    codes = _stale_codes_from_note(note)
+    if not codes:
+        return False
+    for code in codes:
+        if conn.execute(
+                "SELECT 1 FROM daily_bar WHERE code=? AND trade_date=? LIMIT 1",
+                (code, td)).fetchone():
+            return True
+    return False
+
+
 def _mm_done(ps, conn=None) -> bool:
     """W-D2（P1-16）+ P2⑬ 愈合分支：盯市已完成判定。
 
@@ -220,15 +249,24 @@ def catch_up(now: Optional[datetime] = None) -> int:
             latest_td = _latest_trade_date(conn)
 
         # ---- 1) 历史缺失日：盯市 + 日报（+周报：本周最后交易日，D-0d）----
+        # 批次3a（自3b移入）：日报已存在但盯市为「价格滞后」降级口径且滞后票
+        # 日线已到位的历史日，同样进入重跑（跨日愈合，判据 _stale_heal_due）。
         oldest_missing = None
         for td in tds:
             if td >= today_str:
                 continue
             has_state = repo.has_state(conn, td)
             report = REPORTS_DIR / (td + ".md")
+            heal_due = False
             if has_state and report.is_file():
-                continue
-            _say("步骤1 补跑 %s 的盯市/日报（盘后任务缺失）" % td)
+                # W-C7 防覆写守卫下重跑不会改写既有日报；愈合的实质动作是
+                # mark_to_market 重写该日盯市行（note 回到「价格日期=」口径）。
+                heal_due = _stale_heal_due(conn, td)
+                if not heal_due:
+                    continue
+                _say("步骤1 %s 盯市为「价格滞后」降级且滞后票日线已到 → 重跑愈合" % td)
+            else:
+                _say("步骤1 补跑 %s 的盯市/日报（盘后任务缺失）" % td)
             try:
                 daily.mark_to_market(td)
                 daily.generate_daily_report(td)
@@ -248,6 +286,11 @@ def catch_up(now: Optional[datetime] = None) -> int:
                 elif not report.is_file():
                     failures += 1
                     _say("  ↳ 补跑 %s 后日报产物缺失（%s.md 未落盘）" % (td, td))
+                elif heal_due and _stale_heal_due(conn, td):
+                    # 批次3a：愈合重跑后仍未收敛（滞后票 bar 已到位但 note 仍
+                    # 报滞后）→ 计失败，不留"愈合成功"假象
+                    failures += 1
+                    _say("  ↳ %s 愈合重跑后盯市 note 仍报价格滞后且 bar 已到位" % td)
             except Exception as e:  # noqa: BLE001
                 failures += 1
                 _say("  ↳ 补跑 %s 失败: %r" % (td, e))
@@ -291,6 +334,29 @@ def catch_up(now: Optional[datetime] = None) -> int:
                     failures += 1
             elif sig_misaligned:
                 pass  # 11:00 后信号未对齐属盘后常态（当日 bar 15:30 后才入库），静默跳过
+            # 2a.5 应急单超时兜底专属分支（批次3a / P1-4：09:14 failsafe 节点此前
+            # 只活在 premarket 步骤0.5，而正常日 8:30 tick 写完 bundle 后 premarket
+            # 上午不再重跑 → 09:14 自动执行/再通知无人触发，"机器睡过头且 bundle
+            # 仍缺失"的悖论场景才可达）。条件三合一：
+            # - 09:14~09:30 窗口（catchup */30 tick 与手动补跑的可达交集）；
+            # - 当日 premarket 已跑过（bundle 当日新鲜）——未跑过时走 2a 重跑，
+            #   由 premarket 自身步骤0.5 兜底，天然互斥不双触发；
+            # - 幂等：premarket_failsafe 按 run_date=今日 且 status='approved' 查询，
+            #   confirm 后状态离开 approved（executed/rejected）→ 同日同票不会
+            #   重复执行（执行链幂等由 DB 状态保证，另见 test_limit_halt 覆盖）。
+            if not need_premarket and latest_td \
+                    and (now.hour, now.minute) >= (9, 14) \
+                    and (now.hour, now.minute) <= (9, 30) \
+                    and _file_fresh_today(bundle):
+                _say("步骤2a.5 当日 bundle 已生成且在 09:14 兜底窗口 → 应急单超时兜底")
+                try:
+                    from signals import limit_halt
+                    fs = limit_halt.premarket_failsafe(conn=conn, now=now)
+                    _say("  ↳ pending=%s executed=%s notified=%s"
+                         % (fs.get("pending"), fs.get("executed"), fs.get("notified")))
+                except Exception as e:  # noqa: BLE001
+                    failures += 1
+                    _say("  ↳ 应急单超时兜底 FAIL: %r" % e)
             # 2b) 午间包缺失（11:00 后）→ 补午评准备（midday 落盘同在当日会话目录）
             midday_bundle = SESSION_DIR / today_str / "midday_bundle.md"
             if now.hour >= 11 and not _file_fresh_today(midday_bundle):

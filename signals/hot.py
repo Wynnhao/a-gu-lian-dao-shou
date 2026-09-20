@@ -109,6 +109,47 @@ def compute_hot_themes(conn: sqlite3.Connection, window_days: int = 2) -> List[d
     return out
 
 
+# 批次3b 任务6（与 signals/movers.py pct 自洽预检互指，容差勿单侧改）：
+# 热门个股候选无快照 pct，预检对象改为其 latest daily bar 自身——库内 pct_chg
+# 与 close/prev_close 反推不自洽（脏 bar 签名）的候选不入池并计数留痕。
+from signals.movers import PCT_SNAPSHOT_TOL_PP as _PCT_TOL_PP  # noqa: E402
+from signals.movers import _limit_band as _movers_limit_band   # noqa: E402
+
+_LAST_PCT_DROPPED = 0  # 最近一次 compute_hot_stocks 的 pct 预检丢弃计数（留痕）
+
+
+def _bar_pct_selfcheck(conn: sqlite3.Connection, code: str) -> Optional[str]:
+    """候选最新日线 pct 自洽校验：返回丢弃原因；None = 通过/数据不足（放行）。
+
+    - 无日线（纯新闻候选）→ 放行（热门池判据是新闻热度，不因缺 bar 拦人）；
+    - d(t)=close−close_qfq 跳变（除权事件，签名同 data.audit TX_PCT_EXDAY_JUMP
+      =0.01）→ 跳过校验（除权日 raw pct 与价格反推天然背离，保守放行）；
+    - |存储 pct − close/prev_close 反推| > PCT_SNAPSHOT_TOL_PP → 脏 bar，丢弃；
+    - |存储 pct| > 板幅+0.5pp → 同上（复用 movers 停板带口径）。"""
+    try:
+        rows = conn.execute(
+            "SELECT close, close_qfq, pct_chg FROM daily_bar WHERE code=? "
+            "ORDER BY trade_date DESC LIMIT 2", (code,)).fetchall()
+    except sqlite3.Error:
+        return None
+    if len(rows) < 2 or rows[0][0] is None or rows[1][0] is None:
+        return None
+    close, cq, pct = rows[0]
+    prev_close, prev_cq = rows[1][0], rows[1][1]
+    if pct is None:
+        return None
+    if cq is not None and prev_cq is not None and prev_close is not None:
+        if abs((float(close) - float(cq)) - (float(prev_close) - float(prev_cq))) > 0.01:
+            return None  # 除权事件日：raw pct 与反推天然背离，保守放行
+    implied = (float(close) / float(prev_close) - 1.0) * 100.0
+    if abs(float(pct)) > _movers_limit_band(code) + 0.5:
+        return "pct=%s 超停板带（脏 bar 签名）" % pct
+    if abs(float(pct) - implied) > _PCT_TOL_PP:
+        return ("pct=%+.2f%% 与日线价格反推 %+.2f%% 偏差 >%.1fpp（脏 bar 签名）"
+                % (float(pct), implied, _PCT_TOL_PP))
+    return None
+
+
 def compute_hot_stocks(conn: sqlite3.Connection) -> List[dict]:
     """自选池个股新闻突增：近24小时条数 ≥min_news 且 ≥stock_vs_avg×前7日日均。
 
@@ -134,6 +175,7 @@ def compute_hot_stocks(conn: sqlite3.Connection) -> List[dict]:
     except Exception:  # noqa: BLE001
         core = set(repo.all_codes(conn))  # 兜底：配置异常时退回全表（原行为）
     codes = [c for c in repo.all_codes(conn) if c in core]
+    pct_dropped = 0
     for code in codes:
         if bl_ok.get(code, True) is False:
             continue  # 黑名单票不进热门池（N/ST/次新）
@@ -149,6 +191,13 @@ def compute_hot_stocks(conn: sqlite3.Connection) -> List[dict]:
         avg = week_n / 7.0
         if avg > 0 and today_n < vs_avg * avg:
             continue
+        # 批次3b 任务6：pct 自洽预检——新闻阈值已过（真候选）但 latest bar 带脏
+        # pct 签名的丢弃并计数留痕，防脏数据借热门池进 LLM 上下文
+        _drop = _bar_pct_selfcheck(conn, code)
+        if _drop:
+            pct_dropped += 1
+            log.warning("热门个股候选 pct 预检丢弃 %s: %s", code, _drop)
+            continue
         name_row = conn.execute("SELECT name FROM stock_info WHERE code=?",
                                 (code,)).fetchone()
         samples = [r[0] for r in conn.execute(
@@ -161,6 +210,8 @@ def compute_hot_stocks(conn: sqlite3.Connection) -> List[dict]:
                     "strength": round(today_n / max(avg, 1.0), 2),
                     "today_news": today_n})
     out.sort(key=lambda r: -r["strength"])
+    global _LAST_PCT_DROPPED
+    _LAST_PCT_DROPPED = pct_dropped  # 预检计数留痕（refresh 汇报）
     return out
 
 
@@ -219,7 +270,8 @@ def refresh(conn: sqlite3.Connection, as_of: Optional[str] = None) -> dict:
                                                        t.get("baseline", 0.0))] + t["samples"],
          "strength": t["hits"]} for t in themes], day, mode="watchlist")
     n2 = dynpool.upsert_pool_rows(conn, "hot_stock", stocks, day, mode="watchlist")
-    log.info("热门池刷新：题材 %d、个股 %d（as_of=%s）", n1, n2, day)
+    log.info("热门池刷新：题材 %d、个股 %d（as_of=%s，pct 预检丢弃 %d）",
+             n1, n2, day, _LAST_PCT_DROPPED)
     boards = board_hot()
     return {"themes": themes, "stocks": stocks, "boards": boards,
-            "count": n1 + n2}
+            "count": n1 + n2, "pct_dropped": _LAST_PCT_DROPPED}

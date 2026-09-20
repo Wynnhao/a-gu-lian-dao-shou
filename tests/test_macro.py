@@ -258,6 +258,143 @@ def test_premarket_refresh_bond_etf_calls_both_and_never_raises():
         macro.fetch_etf_share = orig_es
 
 
+# ============================================================
+# 批次3b · P1-9：index_valuation 加 valuation_mode 列（临时库验证）
+# 生产库不执行迁移（待授权清单①）——本节全部用 :memory:/临时库。
+# ============================================================
+
+_OLD_VALUATION_DDL = """
+CREATE TABLE IF NOT EXISTS index_valuation (
+    index_code TEXT, trade_date TEXT,
+    pe REAL, pe_pct REAL, pb REAL, pb_pct REAL, close REAL,
+    PRIMARY KEY (index_code, trade_date)
+);
+"""
+
+
+def _old_schema_conn() -> sqlite3.Connection:
+    """模拟未授权加列的老库：手工建 7 列 index_valuation + 其余表走 DDL。"""
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(DDL)
+    conn.execute("DROP TABLE index_valuation")
+    conn.executescript(_OLD_VALUATION_DDL)
+    conn.commit()
+    return conn
+
+
+@test
+def test_p1c9_old_schema_not_auto_migrated_and_ensure_is_idempotent():
+    """正+反（迁移）：init_db 对老库**不**自动加列（生产加列待授权的机制保证）；
+    ensure_valuation_mode_column 首调加列、再调跳过（幂等），存量数据保留。"""
+    from data.fetcher import ensure_valuation_mode_column
+    conn = _old_schema_conn()
+    try:
+        conn.execute("INSERT INTO index_valuation VALUES "
+                     "('000300','2026-09-11',12,0.5,1.3,0.6,4000)")
+        conn.commit()
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(index_valuation)")}
+        assert "valuation_mode" not in cols, "init_db 不得对老库自动加列"
+        assert ensure_valuation_mode_column(conn) is True, "首调应实际加列"
+        cols2 = {r[1] for r in conn.execute("PRAGMA table_info(index_valuation)")}
+        assert "valuation_mode" in cols2
+        row = conn.execute("SELECT pe, close FROM index_valuation"
+                           " WHERE index_code='000300'").fetchone()
+        assert row == (12.0, 4000.0), "存量数据必须保留"
+        assert ensure_valuation_mode_column(conn) is False, "二调必须跳过（幂等）"
+        # 新 DDL 库（已带列）→ ensure 直接 False
+        conn2 = _mem_conn()
+        try:
+            assert ensure_valuation_mode_column(conn2) is False
+        finally:
+            conn2.close()
+    finally:
+        conn.close()
+
+
+@test
+def test_p1c9_write_valuation_marks_mode_fallback_and_real():
+    """正用例（写入口径标注）：价格分位兜底行 valuation_mode='price_fallback'
+    （pe/pb NULL）；真实口径行 'real'。"""
+    conn = _mem_conn()  # 新 DDL：已带 valuation_mode 列
+    try:
+        rows = [("2026-01-05", 3200.0), ("2026-01-06", 3250.0)]
+        conn.executemany(
+            "INSERT OR REPLACE INTO index_daily VALUES ('000300',?,3200,3200,3200)",
+            [(d, ) for d, _ in rows])
+        conn.commit()
+        n = macro._price_percentile_fallback("000300", conn, years=5)
+        assert n == 2
+        r = conn.execute(
+            "SELECT pe, pe_pct, pb, pb_pct, valuation_mode FROM index_valuation"
+            " ORDER BY trade_date").fetchall()
+        assert all(x[0] is None and x[2] is None for x in r), "兜底行 pe/pb 必须为 NULL"
+        assert all(x[1] is not None for x in r), "pe_pct=价格分位"
+        assert {x[4] for x in r} == {macro.VALUATION_MODE_FALLBACK}
+        # 真实口径
+        macro._write_valuation("000905", conn, {"2026-01-06": (25.0, 0.4, 2.1, 0.3, 5100.0)},
+                               mode=macro.VALUATION_MODE_REAL)
+        got = conn.execute("SELECT pe, valuation_mode FROM index_valuation"
+                           " WHERE index_code='000905'").fetchone()
+        assert got == (25.0, macro.VALUATION_MODE_REAL), got
+    finally:
+        conn.close()
+
+
+@test
+def test_p1c9_write_valuation_old_schema_compat():
+    """反用例（兼容）：老库（未加列）写路径自动退回 7 列模式，零行为变化。"""
+    conn = _old_schema_conn()
+    try:
+        n = macro._write_valuation("000300", conn,
+                                   {"2026-01-06": (25.0, 0.4, 2.1, 0.3, 5100.0)})
+        assert n == 1
+        row = conn.execute("SELECT pe, pe_pct, pb, pb_pct, close FROM index_valuation"
+                           ).fetchone()
+        assert row == (25.0, 0.4, 2.1, 0.3, 5100.0), row
+    finally:
+        conn.close()
+
+
+@test
+def test_p1c9_bundle_macro_fallback_disclosure():
+    """正用例（bundle 降级披露）：兜底行透出 valuation_mode='price_fallback' 并
+    生成 macro_fallback 披露；markdown 数值旁标「价格分位兜底」。真实口径行不受
+    影响；老库（无 mode 列）读取不崩、不产出兜底披露。"""
+    from ai.bundle import bundle_to_markdown, build_bundle
+    conn = _mem_conn()
+    try:
+        macro._write_valuation("000300", conn,
+                               {"2026-09-11": (None, 0.62, None, None, 4000.0)},
+                               mode=macro.VALUATION_MODE_FALLBACK)
+        macro._write_valuation("000905", conn,
+                               {"2026-09-11": (25.0, 0.4, 2.1, 0.3, 5100.0)},
+                               mode=macro.VALUATION_MODE_REAL)
+        conn.commit()
+        b = build_bundle(run_date="2026-09-11", conn=conn)
+        assert b["macro"]["000300"]["valuation_mode"] == "price_fallback"
+        assert b["macro"]["000905"]["valuation_mode"] == "real"
+        assert b["macro_fallback"]["indices"] == ["000300"], b.get("macro_fallback")
+        assert "兜底口径" in b["macro_fallback"]["note"]
+        md = bundle_to_markdown(b)
+        assert "价格分位兜底" in md and "兜底（价格分位）" in md
+        assert "真实（PE历史分位）" in md
+    finally:
+        conn.close()
+    # 老库（无 mode 列）：读取降级不崩、无兜底披露
+    old = _old_schema_conn()
+    try:
+        old.execute("INSERT INTO index_valuation VALUES "
+                    "('000300','2026-09-11',NULL,0.62,NULL,NULL,4000)")
+        old.commit()
+        b2 = build_bundle(run_date="2026-09-11", conn=old)
+        assert "valuation_mode" not in b2["macro"]["000300"]
+        assert "macro_fallback" not in b2
+        md2 = bundle_to_markdown(b2)
+        assert "兜底（价格分位）" not in md2
+    finally:
+        old.close()
+
+
 def main() -> int:
     import traceback
     failed = 0
