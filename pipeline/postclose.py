@@ -150,6 +150,30 @@ def _postclose_stop_loss_check(conn, now: datetime) -> list:
     return breaches
 
 
+def _clear_pending_today(trade_date: Optional[str] = None) -> bool:
+    """W-D1 代码部分（P1-17）：postclose 成功路径顺手清当日 PENDING 兜底文件。
+
+    P2⑲（全量打包批 2026-09-20）：仅当本次成功的 postclose 跑的就是"今日"
+    （trade_date==今天）才清——`--date 补历史` 成功不得清今日 PENDING：
+    今日 daily_bar 仍缺时该提醒物必须保留（此前成功尾部一律 unlink 今日
+    PENDING，历史补跑成功会误删今日提醒）。删除失败不阻断（只影响兜底
+    文件残留，下次成功 postclose 再清）。返回是否实际清除。
+    """
+    today_iso = date.today().isoformat()
+    if trade_date is not None and trade_date != today_iso:
+        return False   # --date 非今日的成功补跑：今日 PENDING 与它无关
+    pending_today = REPORTS_DIR / ("PENDING-%s.md" % today_iso)
+    try:
+        if pending_today.is_file():
+            pending_today.unlink()
+            log.info("当日 PENDING 兜底文件已清除（postclose 成功）: %s",
+                     pending_today)
+            return True
+    except OSError as e:
+        log.warning("当日 PENDING 清除失败（不阻断）: %s", e)
+    return False
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="盘后流水线：盯市 + 每日复盘报告（周五/指定时含周报）")
     ap.add_argument("--date", default=None, dest="trade_date",
@@ -382,14 +406,8 @@ def main(argv=None) -> int:
     # 5. W-D1 代码部分（P1-17）：postclose 成功路径顺手清当日 PENDING 兜底文件。
     # 此前清除逻辑只在 catchup 步骤4（launchd 死亡期间从未运行）——PENDING-09-17/18.md
     # 至今残留。盯市/日报已完成（走到这里即 exit 0），当日 PENDING 已无意义；
-    # 删除失败不阻断（只影响兜底文件残留，下次成功 postclose 再清）。
-    try:
-        pending_today = REPORTS_DIR / ("PENDING-%s.md" % date.today().isoformat())
-        if pending_today.is_file():
-            pending_today.unlink()
-            log.info("当日 PENDING 兜底文件已清除（postclose 成功）: %s", pending_today)
-    except OSError as e:
-        log.warning("当日 PENDING 清除失败（不阻断）: %s", e)
+    # P2⑲：--date 补历史成功不清今日 PENDING（见 _clear_pending_today）。
+    _clear_pending_today(trade_date)
 
     log.info("==== postclose done exit=0 ====")
     return 0

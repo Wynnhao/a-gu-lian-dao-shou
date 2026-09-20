@@ -439,6 +439,11 @@ def build_bundle(run_date: Optional[str] = None,
         # 此前 Σ卖出−Σ买入 会把未平仓买入全算成"已实现亏损"（P1-20：建仓后 LLM
         # 看到接近持仓成本的假巨亏）。现按每票移动平均成本结转：卖出额 − 卖出股数×
         # 持仓移动成本；全部平仓后与"净投入现金"口径数值一致。
+        # 口径差（P2⑭，2026-09-20 核实留档，计算不变）：本处移动成本用 trade.amount
+        # （含费用：买入=价×股+佣金，paper.py L4/L91），而 paper 持仓 position.cost =
+        # 成交价加权平均**不含费用**（paper.py L8/L286，费用只影响现金）——两处成本
+        # 每股差买入佣金分摊。realized_pnl 是已平仓口径（费用计入损益合理），
+        # position.cost 是持仓均价口径；note 文案已注明"（含佣金印花税）"。
         try:
             trows = c.execute(
                 "SELECT code, side, amount, shares FROM trade WHERE status='filled' "

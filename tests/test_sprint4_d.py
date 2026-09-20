@@ -97,6 +97,49 @@ def test_wd2_mm_done_note_semantics():
     conn.close()
 
 
+def test_p2c13_mm_done_heals_when_degraded_day_bar_arrives():
+    """P2⑬（全量打包批 2026-09-20）：--date 降级盯市日的自愈判定——
+    note=价格滞后: 且滞后代码在该交易日已有 daily_bar → 未完成（catchup
+    步骤4 据此重跑 postclose 愈合）；滞后代码仍全数无该日 bar（真停牌）→
+    算完成（W-D2 防停票残留重跑循环语义保持）；无 conn 旧形态 → 旧语义。"""
+    import pipeline.catchup as c
+    conn = sandbox_conn()
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "INSERT INTO portfolio_state VALUES ('2026-09-18',1,1,2,0,0,?)",
+            ("mark_to_market@t; 价格滞后:600096@2026-09-17,600100@2026-09-16",))
+        ps = c.repo.state_on(conn, "2026-09-18")
+        # 该日全无 bar（数据未到/停票）→ 完成，不触发重跑
+        assert c._mm_done(ps, conn)
+        # 一个滞后代码当日 bar 到位 → 降级盯市未完成，须重跑愈合
+        conn.execute("INSERT INTO daily_bar (code, trade_date, close) VALUES"
+                     " ('600096','2026-09-18',10.0)")
+        assert not c._mm_done(ps, conn)
+        # 无 conn 旧调用形态 → 无法核对，维持 W-D2 语义算完成
+        assert c._mm_done(ps)
+        # 「无任何行情」形态的滞后条目同样可解析出代码参与愈合判定
+        conn.execute("DELETE FROM portfolio_state")
+        conn.execute(
+            "INSERT INTO portfolio_state VALUES ('2026-09-18',1,1,2,0,0,?)",
+            ("mark_to_market@t; 价格滞后:600200:无任何行情",))
+        assert c._stale_codes_from_note(
+            "mark_to_market@t; 价格滞后:600200:无任何行情") == ["600200"]
+        ps2 = c.repo.state_on(conn, "2026-09-18")
+        assert c._mm_done(ps2, conn)      # 该票当日仍无 bar → 完成
+        conn.execute("INSERT INTO daily_bar (code, trade_date, close) VALUES"
+                     " ('600200','2026-09-18',5.0)")
+        assert not c._mm_done(ps2, conn)  # bar 到位 → 未完成
+        # 当日价盯市（价格日期=）→ 恒完成
+        conn.execute("DELETE FROM portfolio_state")
+        conn.execute(
+            "INSERT INTO portfolio_state VALUES ('2026-09-18',1,1,2,0,0,?)",
+            ("mark_to_market@t; 价格日期=2026-09-18",))
+        assert c._mm_done(c.repo.state_on(conn, "2026-09-18"), conn)
+    finally:
+        conn.close()
+
+
 # ============================================================
 # W-D3（P1-18）：--date 守卫的"有痕降级"——报告头价格滞后标注 + PENDING 文案
 # ============================================================
@@ -572,6 +615,48 @@ def test_wd6_pass_gate_requires_full_universe():
     assert isinstance(r_mom["pass"], bool)                 # 同源打分可跑通
 
 
+def test_p2c17_pass_gate_pool_validation():
+    """P2⑰（全量打包批 2026-09-20）：pass 门池校验——pool 码集与
+    watchlist_core 完全相等而标签为 full → 标签不可信，pass 强制 null
+    （防 core 池冒充 full 出非法 pass；现实触发路径=backtest_cloddsbot_validate
+    默认加载 core 池 + run_backtest 默认 universe="full" 的组合）。
+    合成小池（非 core 码集）与显式 core 标签均不受影响。"""
+    import numpy as np
+    import pandas as pd
+    from common.config import core_codes
+    from signals.backtest import run_backtest
+    rng = np.random.default_rng(47)
+    dates = pd.date_range("2026-01-01", periods=60, freq="B").strftime(
+        "%Y-%m-%d")
+    rows = []
+    for code in core_codes():
+        close = 20.0
+        for d in dates:
+            close *= (1.0 + rng.normal(0.0005, 0.015))
+            rows.append({"code": str(code), "trade_date": d, "close": close,
+                         "close_qfq": close, "high": close * 1.01,
+                         "low": close * 0.99, "amount": 2e8, "turnover": 3.0})
+    pool = pd.DataFrame(rows)
+    idx = pd.Series(np.linspace(4000, 4400, len(dates)),
+                    index=pd.Index(dates))
+    # core 池冒充 full → pass=null + 池校验留痕
+    r = run_backtest(pool, idx, strategy="reversal_lowvol", universe="full")
+    assert r["pass"] is None, r["pass"]
+    assert r["pass_criteria"]["universe_ok"] is False
+    assert r["pass_criteria"]["pool_gate_tripped"] is True
+    assert "池校验" in r["pass_criteria"]["note"]
+    # 同池显式 core 标签 → 原宇宙不符语义不变
+    r2 = run_backtest(pool, idx, strategy="reversal_lowvol", universe="core")
+    assert r2["pass"] is None
+    assert r2["pass_criteria"]["pool_gate_tripped"] is False
+    assert "宇宙不符（core=人工挑选池" in r2["pass_criteria"]["note"]
+    # 合成小池（非 core 码集）标 full → 不误伤（W-D6⑥ 既有语义保持）
+    tiny, tidx = _tiny_pool()
+    r3 = run_backtest(tiny, tidx, strategy="reversal_lowvol", universe="full")
+    assert r3["pass_criteria"]["universe_ok"] is True
+    assert r3["pass_criteria"]["pool_gate_tripped"] is False
+
+
 # ============================================================
 # W-D7：trade_cal / groups 死代码 / movers / 锁下沉 / trade_date
 # ============================================================
@@ -732,19 +817,30 @@ def test_wd7_exec_lock_reentrant_and_sunk():
         conn.close()
 
 
-def test_wd7_wd1_pending_cleared_on_postclose_success(tmp_path=None):
-    """W-D1 代码部分：postclose 成功路径清当日 PENDING——PENDING 只写"今日"名
-    （_write_pending 用 today_iso 命名），成功尾部清除同一命名，两者闭合。"""
+def test_wd7_wd1_pending_cleared_on_postclose_success():
+    """W-D1 代码部分 + P2⑱/⑲（全量打包批 2026-09-20）：postclose 成功路径
+    清当日 PENDING——此前测试自己 unlink stub（同义反复，没测到 postclose
+    任何代码）。现直调 postclose._clear_pending_today：
+    - trade_date=今天（无 --date 默认路径/当日 --date）→ 真清除返回 True；
+    - trade_date=历史日（--date 补历史成功）→ 不清（P2⑲：今日 daily_bar 仍缺
+      时今日 PENDING 提醒物必须保留，不得被历史补跑误删）；
+    - 无 PENDING 文件时幂等返回 False。"""
     from datetime import date
     from pipeline import postclose
     pending = postclose.REPORTS_DIR / ("PENDING-%s.md" % date.today().isoformat())
     pending.parent.mkdir(parents=True, exist_ok=True)
     pending.write_text("stub", encoding="utf-8")
-    # 模拟成功路径的清除块（与 postclose.main 尾部同一实现）
-    try:
-        pending.unlink()
-    except OSError:
-        pass
+    # --date 补历史成功：不清今日 PENDING
+    assert postclose._clear_pending_today("2026-09-15") is False
+    assert pending.is_file(), "--date 历史补跑成功不得误删今日 PENDING（P2⑲）"
+    # 本次成功跑的就是今日：清除
+    assert postclose._clear_pending_today(date.today().isoformat()) is True
+    assert not pending.exists(), "今日成功路径必须清除今日 PENDING（W-D1）"
+    # 幂等：文件已不在 → False 不抛
+    assert postclose._clear_pending_today(date.today().isoformat()) is False
+    # 默认参（未指定 trade_date）= 今日语义，同样走清除分支
+    pending.write_text("stub", encoding="utf-8")
+    assert postclose._clear_pending_today() is True
     assert not pending.exists()
     assert postclose._write_pending.__doc__ is not None
 

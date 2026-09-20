@@ -332,6 +332,71 @@ def test_validate_earnings_confidence_boost_capped():
     assert ok5 and abs(norm5["confidence"] - 0.70) < 1e-9
 
 
+# ---------------------------------------------------------------- P2⑮（全量打包批 2026-09-20）：realized_pnl 遗漏用例
+
+def _add_filled_trade(conn, d, code, side, amount, shares):
+    """status='filled' 成交流水（amount=现金净流口径，买入含费用）。"""
+    conn.execute(
+        "INSERT INTO trade (trade_date, code, name, side, price, shares, amount,"
+        " order_id, status, decision_id, shots, confirmed_by, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (d, code, "票" + code, side, amount / max(shares, 1), shares, amount,
+         "ord", "filled", None, "[]", "test", d + "T09:35:00"))
+
+
+def test_p2c15_realized_pnl_orphan_sell():
+    """P2⑮：orphan 卖出——无持仓（或超出持仓）部分的卖出无成本可结转，
+    按卖出额比例全额计入 realized_pnl 并在 note 留痕降级，不静默失真。
+    部分孤儿：买 100@成本 10、卖 150——100 股按移动成本结转、50 股全额计入。"""
+    conn = make_conn()
+    try:
+        _add_filled_trade(conn, "2026-09-10", "600001", "buy", 1000.0, 100)
+        _add_filled_trade(conn, "2026-09-11", "600001", "sell", 1800.0, 150)
+        conn.commit()
+        b = ai_bundle.build_bundle(conn=conn)
+        # matched 100 股：1800×(100/150) − 10×100 = 200；orphan 50 股：1800×(50/150)=600
+        assert abs(b["realized_pnl"] - 800.0) < 1e-6, b["realized_pnl"]
+        assert "1 笔无持仓卖出" in b["realized_pnl_note"], b["realized_pnl_note"]
+        assert abs(b["net_cash_outlay"] - 800.0) < 1e-6
+        # 完全孤儿（无任何买入）：全额计入 + 计数留痕
+        conn.execute("DELETE FROM trade")
+        _add_filled_trade(conn, "2026-09-12", "000002", "sell", 500.0, 50)
+        conn.commit()
+        b2 = ai_bundle.build_bundle(conn=conn)
+        assert abs(b2["realized_pnl"] - 500.0) < 1e-6, b2["realized_pnl"]
+        assert "1 笔无持仓卖出" in b2["realized_pnl_note"]
+    finally:
+        conn.close()
+
+
+def test_p2c15_realized_pnl_mixed_lots_across_gaps():
+    """P2⑮：混源跨缺口——多码交错 + 同码跨日期缺口（09-05→09-20）+ 同日
+    买卖对（(trade_date, id) 排序保证 buy 先于 sell 结转）的移动平均成本
+    配比逐段手算核对；全部平仓后 realized_pnl 与净投入现金副口径一致。"""
+    conn = make_conn()
+    try:
+        # 600001：两段建仓 → 部分平仓 → 跨缺口再建仓 → 全平；000002 交错其中
+        _add_filled_trade(conn, "2026-09-01", "600001", "buy", 1000.0, 100)   # lot avg 10.0
+        _add_filled_trade(conn, "2026-09-02", "000002", "buy", 500.0, 50)     # lot avg 10.0
+        _add_filled_trade(conn, "2026-09-02", "600001", "buy", 1200.0, 100)   # lot 200 @ 11.0
+        _add_filled_trade(conn, "2026-09-05", "600001", "sell", 1875.0, 150)  # +1875−1650=225
+        # —— 日期缺口（09-06..09-19 无成交）——
+        _add_filled_trade(conn, "2026-09-20", "600001", "buy", 1500.0, 100)   # lot 150 @ 2050/150
+        _add_filled_trade(conn, "2026-09-21", "600001", "buy", 700.0, 50)     # 同日 buy 先于 sell
+        _add_filled_trade(conn, "2026-09-21", "600001", "sell", 720.0, 50)    # +720−700=20
+        _add_filled_trade(conn, "2026-09-25", "600001", "sell", 2250.0, 150)  # +2250−2050=200
+        _add_filled_trade(conn, "2026-09-25", "000002", "sell", 550.0, 50)    # +550−500=50
+        conn.commit()
+        b = ai_bundle.build_bundle(conn=conn)
+        assert abs(b["realized_pnl"] - 495.0) < 1e-6, b["realized_pnl"]
+        assert "无持仓卖出" not in b["realized_pnl_note"], b["realized_pnl_note"]
+        # 全部平仓 → 与净投入现金副口径一致（W-C2 一致性）
+        assert abs(b["realized_pnl"] - b["net_cash_outlay"]) < 1e-6, \
+            (b["realized_pnl"], b["net_cash_outlay"])
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------- 直接运行入口
 
 def _main() -> int:

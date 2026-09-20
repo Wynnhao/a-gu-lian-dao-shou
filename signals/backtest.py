@@ -24,7 +24,9 @@
     +14pp 年化虚高）；market.py 红线5 同步废止；
 8.  momentum 分支改调生产 _score_momentum 同源打分面板（0.35 趋势 + 0.40
     mom20 + 0.25 RSI14，缺因子重归一化）——此前是纯 mom20 TopN 截面，
-    "回测通过的就不是生产在跑的策略"（P0-3 证据链第 4 条）；
+    "回测通过的就不是生产在跑的策略"（P0-3 证据链第 4 条）；"同源"指同权重
+    同公式，面板实现按日历位置 rolling vs 生产按 bar 序列，停牌票可分叉
+    （P2⑯ 措辞降级，影响 ≤3/816 票、不改 FAIL 结论）；
 9.  pass 硬性要求 universe==full（W-D6⑥）：core 宇宙 = 人工挑选池，幸存者
     偏差全进年化，core 跑可以但 pass 字段必须 null 并注明宇宙不符；
     main 默认 universe 由 core 改为 full（C-TEST-5：中证800/全宇宙防前视）；
@@ -230,6 +232,10 @@ def _momentum_score_panel(wide: pd.DataFrame) -> pd.DataFrame:
     此前回测 momentum 分支 = 纯 mom20 TopN 截面——回测通过的根本不是生产在跑
     的策略。MA 用 rolling(min_periods=n)（= factors.ma 长度不足返回 None）；
     mom20 分母为 0 → NaN（= factors.mom 返回 None）；RSI 用 _wilder_rsi_series。
+    已知分叉（P2⑯，2026-09-20 措辞降级）：ma/mom 按面板日历位置 rolling，
+    生产 factors.* 按各票 bar 序列——停牌票（面板 NaN 缺口、shift 可落在缺口）
+    两口径可分叉，实测影响 ≤3/816 票、不改变 momentum FAIL 结论（见产出
+    metadata.momentum_scoring）。
     """
     ma5 = wide.rolling(5, min_periods=5).mean()
     ma20 = wide.rolling(20, min_periods=20).mean()
@@ -255,6 +261,28 @@ def _momentum_score_panel(wide: pd.DataFrame) -> pd.DataFrame:
            + r_h.fillna(0.0) * w_r)
     den = w_t + w_m + w_r
     return (num / den.where(den > 0.0, 1.0)).where(den > 0.0, 0.5).clip(0.0, 1.0)
+
+
+def _pool_is_core_watchlist(pool) -> bool:
+    """P2⑰（全量打包批 2026-09-20）：pass 门的防御性池校验。
+
+    pass 此前只信任 universe 标签——core 池被标成 full 会给出非法 pass 布尔值
+    （现实触发路径：backtest_cloddsbot_validate 默认加载 core 池、而
+    run_backtest 默认 universe="full"）。仅当 pool 码集与 config.watchlist_core
+    **完全相等**才判 core 池（测试合成小池/真全库池都不会误伤）。config 不可
+    读时不拦（防御性校验不得把正常路径拦死）。
+    """
+    try:
+        from common.config import core_codes
+        core = {str(c) for c in core_codes()}
+    except Exception:  # noqa: BLE001
+        return False
+    if not core or "code" not in getattr(pool, "columns", []):
+        return False
+    try:
+        return {str(c) for c in pool["code"].unique()} == core
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def run_backtest(pool: pd.DataFrame, idx_close: pd.Series, strategy: str = "reversal_lowvol",
@@ -393,7 +421,10 @@ def run_backtest(pool: pd.DataFrame, idx_close: pd.Series, strategy: str = "reve
     # core 宇宙产物不得再给出 pass 布尔值（强制 null + 注明宇宙不符）。
     calmar_ok = bool(st_mdd != 0.0 and (st_ann / abs(st_mdd)) > 0.5)
     beat_ok = bool(st_ann > b_ann)
-    universe_ok = (universe == "full")
+    # P2⑰：full 标签下池码集与 watchlist_core 完全相等 → 标签不可信，
+    # 按宇宙不符处理（pass 强制 null），防 core 池冒充 full 出非法 pass。
+    pool_gate_tripped = (universe == "full") and _pool_is_core_watchlist(pool)
+    universe_ok = (universe == "full") and not pool_gate_tripped
     pass_val: object = bool(calmar_ok and beat_ok) if universe_ok else None
 
     return {
@@ -436,10 +467,14 @@ def run_backtest(pool: pd.DataFrame, idx_close: pd.Series, strategy: str = "reve
             "benchmark_beat": beat_ok,
             "universe": universe,
             "universe_ok": universe_ok,
+            "pool_gate_tripped": pool_gate_tripped,
             "note": ("v1 单阈值 pass 偏严（两个 profile 全不通过），改双判据"
                      if universe_ok else
-                     "宇宙不符（core=人工挑选池，幸存者偏差）——pass 强制 null，"
-                     "结果仅供相对比较，不得作为选型依据（W-D6⑥/P0-3②）"),
+                     ("宇宙不符（池校验：pool 码集与 watchlist_core 完全相等而"
+                      "标签为 full，标签不可信）——pass 强制 null（P2⑰）"
+                      if pool_gate_tripped else
+                      "宇宙不符（core=人工挑选池，幸存者偏差）——pass 强制 null，"
+                      "结果仅供相对比较，不得作为选型依据（W-D6⑥/P0-3②）")),
         },
     }
 
@@ -535,7 +570,15 @@ def main():
                        "被放大，如 600096 2024-01 raw -5.5% vs qfq -7.28%——跨源/跨期读数须知"),
                    "limit_rounding": "exchange",
                    "limit_price_impl": "common.market.limit_price（Decimal HALF_UP 到分，交易所口径；W-D6④）",
-                   "momentum_scoring": "生产 signals._score_momentum 同源（0.35 趋势+0.40 mom20+0.25 RSI14，W-D6⑤）",
+                   # P2⑯（全量打包批 2026-09-20）措辞降级：面板实现**非严格同源**——
+                   # ma/mom 按面板日历位置 rolling（停牌日=NaN 缺口，shift(20) 可落在
+                   # 缺口上），生产 factors.* 按各票 bar 序列计算；停牌票两口径可分叉
+                   # （完工审查实测影响 ≤3/816 票，不改变 momentum FAIL 结论）。数值未动。
+                   "momentum_scoring": (
+                       "生产 signals._score_momentum 同权重同公式（0.35 趋势+0.40 mom20"
+                       "+0.25 RSI14，W-D6⑤），非严格同源：面板 ma/mom 按日历位置 rolling、"
+                       "生产按各票 bar 序列，停牌票（面板 NaN 缺口）两口径可分叉，实测影响"
+                       " ≤3/816 票、不改变 momentum FAIL 结论（P2⑯）"),
                    "ivol_basis": "factors.ivol 同口径（带截距 OLS + 样本矩 ddof=1 + 全窗，P2-2）",
                    "turn20_min_periods": TURN20_WINDOW // 2,
                },

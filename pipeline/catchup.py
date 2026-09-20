@@ -1,9 +1,9 @@
 """兜底补跑器：机器漏开时错过的定时任务，在下次开机/唤醒后自动补齐。
 
 触发方式（二选一或并存）：
-1. launchd 看门狗（deploy/com.agsickle.catchup.plist，StartInterval=1800）——
-   macOS launchd 语义：错过的 StartInterval 触发会在唤醒后合并执行一次，
-   这正是"没开机"场景的兜底入口（cron/ZCode cron 均为纯跳过）。
+1. 系统级节点：crontab 30 分钟兜底 tick（W-D1 收敛调度；launchd plist 从未
+   成功——中文路径编码+TCC——plist 模板已删除（P2㉑），cron 错过的 tick 纯跳过，
+   靠本脚本幂等补齐"没开机"场景）。
 2. 手动/任意会话运行：.venv/bin/python3 pipeline/catchup.py（幂等，随时可跑）。
 
 补跑内容（全部确定性脚本，不含 LLM 决策）：
@@ -111,8 +111,32 @@ def _file_fresh_today(p: Path) -> bool:
     return p.is_file() and datetime.fromtimestamp(p.stat().st_mtime).date() == date.today()
 
 
-def _mm_done(ps) -> bool:
-    """W-D2（P1-16）：盯市已完成判定。
+def _stale_codes_from_note(note):
+    """解析 portfolio_state.note 中「价格滞后:」段列出的代码。
+
+    mark_to_market 写入格式（review/daily.py）：`价格滞后:code@bar_date,code2:无任何行情`
+    （分段以 "; " 连接）。无滞后段返回空列表。
+    """
+    if not note:
+        return []
+    out = []
+    for part in note.split(";"):
+        part = part.strip()
+        if not part.startswith("价格滞后:"):
+            continue
+        payload = part[len("价格滞后:"):]
+        for entry in payload.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            code = entry.split("@", 1)[0].split(":", 1)[0].strip()
+            if code:
+                out.append(code)
+    return out
+
+
+def _mm_done(ps, conn=None) -> bool:
+    """W-D2（P1-16）+ P2⑬ 愈合分支：盯市已完成判定。
 
     ps 为 repo.state_on 的 sqlite3.Row（date/cash/market_value/total/drawdown/
     kill_switch/note）。此前读 ps[0]（date 列）与 note 子串比较 → 恒 False →
@@ -120,10 +144,32 @@ def _mm_done(ps) -> bool:
     含「价格日期=」（当日价盯市）或「价格滞后:」（停牌票按最近可得收盘，
     daily.mark_to_market 写入）均算完成——停牌票的残留滞后不得把已完成
     盯市的交易日误判为未完成而陷入重跑循环。
+
+    P2⑬（全量打包批 2026-09-20）有痕降级日自愈：--date 补跑当日时 daily_bar
+    未出，mark_to_market 按最近可得收盘降级盯市（note=价格滞后:…），当晚
+    数据到位后此前无任何节点重跑。新增分支：note 含「价格滞后:」且**滞后
+    代码中至少一个在该交易日已有 daily_bar 行** → 判未完成（conn 为 None
+    时无法核对，维持 W-D2 旧语义算完成）。滞后代码仍全数无该日 bar（真
+    停牌）→ 算完成，不触发重跑循环；愈合重跑后 note 由最新数据重写，仍
+    缺 bar 的停牌票留在滞后段 → 收敛，每波数据到位至多重跑一次。
     """
-    note = ps["note"] if ps is not None else None
-    return bool(ps) and ("价格日期=" in (note or "")
-                         or "价格滞后:" in (note or ""))
+    if not ps:
+        return False
+    note = ps["note"] or ""
+    if "价格日期=" in note:
+        return True
+    if "价格滞后:" not in note:
+        return False
+    if conn is None:
+        return True   # 无连接可核对 bar，维持 W-D2 语义（防停票残留循环）
+    trade_date = ps["date"]
+    for code in _stale_codes_from_note(note):
+        has_bar = conn.execute(
+            "SELECT 1 FROM daily_bar WHERE code=? AND trade_date=? LIMIT 1",
+            (code, trade_date)).fetchone()
+        if has_bar:
+            return False   # 数据已到，降级盯市未完成 → 步骤4 重跑 postclose 愈合
+    return True
 
 
 def catch_up(now: Optional[datetime] = None) -> int:
@@ -284,10 +330,15 @@ def catch_up(now: Optional[datetime] = None) -> int:
         # 当天复盘就一直缺（2026-09-15 实测）。这里闭环：日线到位后重跑 postclose。
         after_close = (now.hour, now.minute) >= (15, 10)
         if trading_day and after_close and latest_td == today_str:
-            state_ok = _mm_done(repo.state_on(conn, today_str))
+            state_ok = _mm_done(repo.state_on(conn, today_str), conn)
             pending_stale = (REPORTS_DIR / ("PENDING-" + today_str + ".md")).is_file()
             # W-D2：补齐判定与重跑解耦——盯市已完成时不再整套重跑 postclose
             #（已补齐则不再重跑），只清残留的 PENDING 兜底文件。
+            # P2⑬（2026-09-20）：--date 降级盯市（价格滞后 note）在当日 bar
+            # 到位后经 _mm_done 愈合分支判未完成 → 此处重跑 postclose 自愈。
+            # P2⑳（留档确认）："盯市成功+日报失败"当日仍不自愈——次日 catchup
+            # 步骤1（历史缺失日）按 has_state+report 缺一补跑，W-D2 刻意收窄，
+            # 行为不变。
             if not state_ok:
                 _say("步骤4 盘后当日补全（日线已到 %s，盯市/日报未完成）→ 重跑 postclose"
                      % today_str)
