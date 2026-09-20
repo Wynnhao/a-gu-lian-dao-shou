@@ -12,7 +12,7 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import sqlite3
 
 from data.fetcher import DDL
@@ -393,6 +393,118 @@ def test_p2c15_realized_pnl_mixed_lots_across_gaps():
         # 全部平仓 → 与净投入现金副口径一致（W-C2 一致性）
         assert abs(b["realized_pnl"] - b["net_cash_outlay"]) < 1e-6, \
             (b["realized_pnl"], b["net_cash_outlay"])
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- 批次6：研究证据参考字段
+
+
+def _seed_pair_series(conn, codes=("600100", "600200"), n=300):
+    """构造 ρ=-1 反相关双票 close_qfq 序列；末日 a 跌 2% / b 涨 2%（触发提示）。"""
+    d0 = date(2025, 1, 1)
+    ca = cb = 100.0
+    for i in range(n):
+        d = (d0 + timedelta(days=i)).isoformat()
+        ra = -0.02 if i == n - 1 else (0.01 if i % 2 == 0 else -0.01)
+        rb = -ra
+        ca *= (1 + ra)
+        cb *= (1 + rb)
+        for code, c in ((codes[0], ca), (codes[1], cb)):
+            conn.execute(
+                "INSERT OR REPLACE INTO daily_bar (code, trade_date, open, high,"
+                " low, close, volume, amount, pct_chg, turnover, source, close_qfq)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (code, d, c, c, c, c, 1e6, c * 1e6, 0.0, 1.0, "em", c))
+    conn.commit()
+
+
+def test_bundle_hedge_evidence_whitelist_and_hint():
+    """批次6：稳定配对清单复用批次1 月度重估（ρ=-1 合成对必入选）；末日
+    A 跌 2%/B 涨 2% → 触发 watch 提示（fall=A, rise=B）。"""
+    conn = make_conn()
+    try:
+        # 配对池=watchlist_core（§3.2）：合成对用真实 core 池前两只票
+        ca, cb = sorted(ai_bundle.core_codes())[:2]
+        _seed_pair_series(conn, codes=(ca, cb))
+        ev = ai_bundle.hedge_evidence(conn, evidence_date="2025-10-15")
+        assert len(ev["pairs"]) == 1, ev
+        a, b = ev["pairs"][0]
+        assert a == ca and b == cb          # a<b 列序
+        assert ev["detail"][0]["rho_250d"] < -0.30
+        assert ev["effective_month"] == "2025-10"
+        assert len(ev["hints"]) == 1, ev["hints"]
+        h = ev["hints"][0]
+        assert h["fall"] == ca and h["rise"] == cb
+        assert h["fall_ret"] <= -0.01 and h["rise_ret"] > 0
+        assert "FAIL" in ev["note"]                      # 研究结论披露在位
+    finally:
+        conn.close()
+
+
+def test_bundle_chan_evidence_lines_accounting():
+    """批次6：缠论单行摘要——有标签行 ≤80 字符且以票代码开头；无数据票计
+    no_label；行数+无标签数 = 票数（口径守恒）。"""
+    from data.fetcher import DDL as _DDL
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(_DDL)
+    try:
+        d0 = date(2025, 1, 1)
+        for i in range(130):
+            d = (d0 + timedelta(days=i)).isoformat()
+            conn.execute("INSERT OR REPLACE INTO trade_calendar (date) VALUES (?)", (d,))
+            c = 10.0 + (i % 3) * 0.1
+            conn.execute(
+                "INSERT OR REPLACE INTO daily_bar (code, trade_date, open, high,"
+                " low, close, volume, amount, pct_chg, turnover, source, close_qfq)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("600300", d, c, c + 0.05, c - 0.05, c, 1e6, c * 1e6, 0.0, 1.0,
+                 "em", c))
+        conn.commit()
+        cs = ai_bundle.chan_evidence_lines(conn, codes=["600300", "600999"])
+        assert len(cs["lines"]) + cs["no_label"] == 2
+        for ln in cs["lines"]:
+            assert len(ln) <= 80 and ln.startswith("600300")
+        assert "归档" in cs["note"]                      # 软证据披露在位
+    finally:
+        conn.close()
+
+
+def test_bundle_markdown_evidence_sections_and_trims():
+    """批次6：渲染节 + 两级降级——evidence_detail=False 折叠明细为计数；
+    include_evidence=False 整节舍弃（降级链末位）。"""
+    b = {"run_date": "2026-09-20", "prompt_version": ai_bundle.PROMPT_VERSION,
+         "hedge_pairs": {"effective_month": "2026-09", "estimated_at": "2026-08-31",
+                         "pairs": [["000895", "002463"]],
+                         "detail": [{"a": "000895", "b": "002463", "rho_250d": -0.353}],
+                         "hints": [{"date": "2026-09-18", "fall": "000895",
+                                    "rise": "002463", "fall_ret": -0.021,
+                                    "rise_ret": 0.012}],
+                         "note": "对冲配对研究批 Gate H0 无分辨率 FAIL 归档"},
+         "chan_structure": {"lines": ["000895 三买持仓(确认2026-06-05,3日前)｜笔:up 分型:顶2日前 中枢:[8.1,9.9]上"],
+                            "no_label": 50, "note": "缠论机械线 R3 已归档"}}
+    md_full = ai_bundle.bundle_to_markdown(b)
+    assert "研究证据参考" in md_full and "000895↔002463" in md_full
+    assert "三买持仓" in md_full and "配对触发观察" in md_full
+    md_fold = ai_bundle.bundle_to_markdown(b, evidence_detail=False)
+    assert "研究证据参考" in md_fold and "预算降级" in md_fold
+    assert "确认2026-06-05" not in md_fold                # 明细已折叠（单行摘要不在）
+    md_none = ai_bundle.bundle_to_markdown(b, include_evidence=False)
+    assert "研究证据参考" not in md_none and "对冲稳定配对" not in md_none
+
+
+def test_build_bundle_evidence_fields_degrade_on_empty():
+    """批次6：空库 build_bundle 不抛异常——对冲节落"无数据"披露，缠论节
+    全计 no_label；渲染含研究证据参考节且对冲节给出降级说明。"""
+    conn = make_conn()
+    try:
+        b = ai_bundle.build_bundle(run_date="2026-09-20", conn=conn)
+        hp = b["hedge_pairs"]
+        assert "pairs" in hp and (hp.get("note") or hp.get("error"))
+        cs = b["chan_structure"]
+        assert "no_label" in cs or "error" in cs
+        md = ai_bundle.bundle_to_markdown(b)
+        assert "研究证据参考" in md
     finally:
         conn.close()
 

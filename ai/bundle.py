@@ -10,8 +10,9 @@
 - 黑名单 PASS 行折叠为一行汇总；数据质量只列核心池（core_codes）滞后票，
   非 core 滞后折叠为一行计数（W-C1：universe800 停更后 730 只滞后票曾把预算吃穿）；
 - 新闻读取侧已做同事件去重与相关性排序（data.news.get_recent_news）；
-- bundle.md 超预算时降级次序（W-C1）：先折叠滞后票明细（先砍墙）、再逐级降
-  新闻正文长度（120→60→0 字）。
+- bundle.md 超预算时降级次序（W-C1 + 批次6）：先折叠滞后票明细（先砍墙）、
+  再折叠缠论/对冲证据节明细、再逐级降新闻正文长度（120→60→0 字）、末位整节
+  舍弃研究证据参考（§3.7：先砍既有证据墙，最后砍本字段）。
 
 已实现盈亏口径（W-C2）：
 - realized_pnl = 移动平均成本配比（卖出按持仓移动成本结转，已平仓口径）；
@@ -46,7 +47,7 @@ PRICE_GUARD_PCT = float(CFG.get("risk", {}).get("price_guard_pct", 0.02))
 MAX_SINGLE_WEIGHT = float(CFG.get("risk", {}).get("max_single_weight", 0.20))
 MAX_TOTAL_WEIGHT = float(CFG.get("risk", {}).get("max_total_weight", 0.80))
 
-PROMPT_VERSION = "2026-09.1"   # 固定文案/输出规则版本，落 decision.prompt_version 供迭代归因
+PROMPT_VERSION = "2026-09.2"   # 固定文案/输出规则版本，落 decision.prompt_version 供迭代归因（2026-09.2：批次6 研究证据参考节合入）
 MD_BUDGET = 45000              # bundle.md 字符数软预算（超限降级新闻正文）
 NAME_OF = {str(w["code"]): str(w.get("name") or "") for w in WATCHLIST}
 
@@ -182,6 +183,139 @@ def _bond_etf_signals(conn: sqlite3.Connection) -> dict:
         out["reason"] = ("index_bond_yield 与 index_etf_share 均为空"
                           "（先跑 data.macro）")
     return out
+
+
+# ---------------------------------------------------------------- 研究证据参考（全量打包批 批次6）
+
+# §3.7（施工方案 2026-09-20）：字段只增——对冲稳定配对清单（批次1 生成函数复用）+
+# 配对触发日 watch 提示 + 缠论结构状态摘要（批次2 标签流）。**决策策略语义零变化**：
+# 字段仅进 LLM 上下文，不进规则引擎；对冲线 gate H0 已 FAIL 归档、缠论机械线已归档，
+# 两节均带研究结论披露防 LLM 高估证据强度。
+
+def _hedge_pair_returns(conn: sqlite3.Connection):
+    """core 池 close_qfq 日收益面板（批次1 stable_pairs_current 的输入口径）。"""
+    import pandas as pd
+
+    codes = core_codes()
+    if not codes:
+        return None, None
+    ph = ",".join("?" * len(codes))
+    rows = conn.execute(
+        f"SELECT code, trade_date, close_qfq FROM daily_bar WHERE code IN ({ph})"
+        " ORDER BY trade_date", codes).fetchall()
+    if not rows:
+        return None, None
+    px = {}
+    for code, d, cq in rows:
+        px.setdefault(d, {})[code] = cq
+    dates = sorted(px)
+    idx = [d for d in dates if len(px[d]) >= 2]
+    df = pd.DataFrame([px[d] for d in idx], index=idx, columns=codes).astype(float)
+    return df.pct_change(), idx
+
+
+def hedge_evidence(conn: sqlite3.Connection, evidence_date: Optional[str] = None) -> dict:
+    """对冲稳定配对清单（月度重估规则复用批次1）+ 最新交易日触发 watch 提示。
+
+    生效月 = evidence_date 所在月；白名单 = 截至上月末 250 日窗重估（月频红线）。
+    触发提示仅观察参考（A 急跌/B 同涨 → watch 参考，**不做机械调权**，§3.7）。
+    """
+    from signals import hedge_pair_research as hpr
+    import pandas as pd
+
+    ret, dates = _hedge_pair_returns(conn)
+    out = {"effective_month": None, "estimated_at": None, "pairs": [],
+           "detail": [], "hints": [], "note": ""}
+    if ret is None or ret.dropna(how="all").empty:
+        out["note"] = "core 池 daily_bar 无数据"
+        return out
+    asof = (evidence_date or dates[-1])
+    cur = hpr.stable_pairs_current(ret, asof_month=str(asof)[:7])
+    if cur is None:
+        out["note"] = "重估窗口不足 250 日（warmup）"
+        return out
+    out["effective_month"] = cur["effective_month"]
+    out["estimated_at"] = cur["estimated_at"]
+    out["pairs"] = [list(p) for p in cur["pairs"]]
+    out["detail"] = cur["detail"]
+    out["note"] = ("对冲配对研究批 Gate H0 无分辨率 FAIL 归档（2026-09-20）；"
+                   "清单与提示仅供 LLM watch 参考，非机械调权信号")
+    # 触发提示：最新交易日（尾盘口径观察）——A 跌 <-1.0% 且 B 涨 >0（双向）
+    last = dates[-1]
+    row = ret.loc[last] if last in ret.index else None
+    if row is not None:
+        for a, b in cur["pairs"]:
+            ra, rb = row.get(a), row.get(b)
+            if ra is None or rb is None or pd.isna(ra) or pd.isna(rb):
+                continue
+            if ra < hpr.TRIGGER_THR and rb > 0:
+                out["hints"].append({"date": last, "fall": a, "rise": b,
+                                     "fall_ret": round(float(ra), 4),
+                                     "rise_ret": round(float(rb), 4)})
+            elif rb < hpr.TRIGGER_THR and ra > 0:
+                out["hints"].append({"date": last, "fall": b, "rise": a,
+                                     "fall_ret": round(float(rb), 4),
+                                     "rise_ret": round(float(ra), 4)})
+    return out
+
+
+def _chan_one_line(lab: dict) -> str:
+    """批次2 规格的单行结构摘要（≤80 字符）：三买状态(附注)｜笔/分型/中枢。"""
+    kind = lab.get("tb_exit_kind")
+    state = str(lab.get("tb_state") or "无")
+    seg = f"{lab.get('code')} {state}"
+    if state == "三买持仓" and lab.get("tb_confirm"):
+        seg += f"(确认{lab['tb_confirm']},{lab.get('tb_days_since_confirm')}日前)"
+    elif state == "三买结束":
+        seg += f"(出场:{kind or '-'})"
+    stroke = lab.get("stroke_dir")
+    fr_type, fr_days = lab.get("last_fractal"), lab.get("last_fractal_days")
+    zd, zg, pos = lab.get("pivot_zd"), lab.get("pivot_zg"), lab.get("pivot_pos")
+    seg += f"｜笔:{stroke or '-'} 分型:{(fr_type + str(fr_days) + '日前') if fr_type else '-'}"
+    if zd is not None and zg is not None:
+        seg += f" 中枢:[{zd:.1f},{zg:.1f}]{pos or '-'}"
+    return seg[:80]
+
+
+def chan_evidence_lines(conn: sqlite3.Connection, codes: Optional[list] = None) -> dict:
+    """core 池逐票缠论结构摘要（批次2 标签流末行；无标签票折叠为计数，W-C1 惯例）。
+
+    返回 {"lines": [单行摘要...], "no_label": N, "note": 披露}。纯内存计算，
+    复用批次2 evidence_pipeline（mode=ro 语义由调用方连接决定，本函数不写任何表）。
+    """
+    from signals import chan_data as cd
+    from signals import chan_evidence as ce
+    import pandas as pd
+
+    codes = list(codes) if codes is not None else cd.core_codes()
+    cal = [str(r[0]) for r in conn.execute(
+        "SELECT date FROM trade_calendar ORDER BY date")]
+    lines, no_label = [], 0
+    for code in codes:
+        rows = conn.execute(
+            "SELECT trade_date, open, high, low, close, close_qfq, high_qfq,"
+            " low_qfq FROM daily_bar WHERE code=? ORDER BY trade_date",
+            (code,)).fetchall()
+        if not rows or not cal:
+            no_label += 1
+            continue
+        df = pd.DataFrame(rows, columns=["trade_date", "open", "high", "low",
+                                         "close", "close_qfq", "high_qfq",
+                                         "low_qfq"])
+        df = cd.with_open_qfq(df)
+        try:
+            r = ce.evidence_pipeline(df, cal, str(code))
+        except Exception:  # noqa: BLE001 — 单票结构失败不阻断整节
+            no_label += 1
+            continue
+        labels = r.get("labels") or []
+        if labels:
+            lines.append(_chan_one_line(labels[-1]))
+        else:
+            no_label += 1
+    return {"lines": lines, "no_label": no_label,
+            "note": ("缠论机械线 R3 已归档（重画率 FAIL）；标签为软证据，"
+                     "首发确认即锁定（批次2 口径）")}
 
 
 # ---------------------------------------------------------------- 组装
@@ -521,6 +655,16 @@ def build_bundle(run_date: Optional[str] = None,
             bundle["data_quality"] = {}
             bundle["data_quality_missing"] = f"行情质量读取失败：{type(e).__name__}: {e}"
 
+        # ---- 研究证据参考（批次6：字段只增，仅进上下文不进规则引擎，§3.7）----
+        try:
+            bundle["hedge_pairs"] = hedge_evidence(c, evidence_date=ev)
+        except Exception as e:  # noqa: BLE001
+            bundle["hedge_pairs"] = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            bundle["chan_structure"] = chan_evidence_lines(c)
+        except Exception as e:  # noqa: BLE001
+            bundle["chan_structure"] = {"error": f"{type(e).__name__}: {e}"}
+
         # ---- 当前可行动空间（W-C3：按 regime/拥挤/黑名单把硬边界显式算给 LLM）----
         # 红线被误读为交易禁令（P1-26）的解法之一：边界数字化，红线语义另行澄清。
         try:
@@ -599,12 +743,15 @@ def _md_table(headers: list, rows: list) -> str:
 
 
 def bundle_to_markdown(bundle: dict, news_content_len: int = 120,
-                       lag_detail: bool = True) -> str:
+                       lag_detail: bool = True, evidence_detail: bool = True,
+                       include_evidence: bool = True) -> str:
     """把 bundle dict 渲染为人话版 markdown（末尾附决策输出要求固定文案）。
 
     news_content_len 供 token 预算降级用（write_bundle 超预算时逐级缩短）；
     lag_detail=False 时数据质量节折叠为一行计数（W-C1 降级次序：先砍滞后票墙，
-    再砍新闻正文）。
+    再砍新闻正文）。批次6 新增：evidence_detail=False 折叠缠论/对冲节明细
+    （滞后墙之后、新闻降级之前）；include_evidence=False 整节舍弃（降级链末位——
+    §3.7 先砍既有证据墙，最后砍本字段）。
     """
     run_date = bundle.get("run_date", "")
     ev = bundle.get("evidence_date", run_date)
@@ -1017,6 +1164,46 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120,
         lines.append(f"- 数据缺失：{bundle.get('data_quality_missing', '无数据')}")
     lines.append("")
 
+    # 研究证据参考（批次6：字段只增，仅进上下文不进规则引擎；预算降级次序
+    # 滞后墙→缠论/对冲折叠→新闻→整节舍弃——先砍既有证据墙，最后砍本字段）
+    if include_evidence:
+        lines += ["## 研究证据参考（仅上下文，非机械调权）", ""]
+        hp = bundle.get("hedge_pairs") or {}
+        if hp.get("error"):
+            lines.append(f"- 对冲配对：生成失败（{hp['error']}）")
+        elif hp.get("pairs"):
+            det = {(r["a"], r["b"]): r for r in (hp.get("detail") or [])}
+            def _rho(v) -> str:
+                return f"{v:.3f}" if isinstance(v, float) else str(v)
+            pair_s = "、".join(
+                f"{a}↔{b}(ρ250={_rho(det.get((a, b), {}).get('rho_250d'))})"
+                for a, b in hp["pairs"])
+            lines.append(f"- 对冲稳定配对（{hp.get('effective_month')} 重估，"
+                         f"截至 {hp.get('estimated_at')}）：{pair_s}")
+            for h in hp.get("hints") or []:
+                lines.append(f"- 配对触发观察（{h['date']}）：{h['fall']} 跌 "
+                             f"{h['fall_ret']:.1%} ↔ {h['rise']} 涨 "
+                             f"{h['rise_ret']:.1%} → 观察 {h['rise']}（watch 参考）")
+        else:
+            lines.append(f"- 对冲配对：当期无生效稳定配对（{hp.get('note', '')}）")
+        if hp.get("note") and not hp.get("error"):
+            lines.append(f"- 对冲披露：{hp['note']}")
+        cs = bundle.get("chan_structure") or {}
+        if cs.get("error"):
+            lines.append(f"- 缠论结构：生成失败（{cs['error']}）")
+        elif evidence_detail:
+            for ln in cs.get("lines") or []:
+                lines.append(f"- {ln}")
+            if cs.get("no_label"):
+                lines.append(f"- 其余 {cs['no_label']} 只无标签（无数据/warmup 不足/结构失败）")
+        else:
+            n_hold = sum(1 for ln in (cs.get("lines") or []) if "三买持仓" in ln)
+            lines.append(f"- （预算降级）缠论结构：{len(cs.get('lines') or [])} 只有标签"
+                         f"（三买持仓 {n_hold}），明细折叠见 bundle.json")
+        if cs.get("note"):
+            lines.append(f"- 缠论披露：{cs['note']}")
+        lines.append("")
+
     # 固定文案
     rg_cap = ((bundle.get("regime") or {}).get("cap"))
     captop = ("无动态约束，静态 %.0f%%" % (MAX_TOTAL_WEIGHT * 100)) if rg_cap is None \
@@ -1058,11 +1245,21 @@ def write_bundle(run_date: Optional[str] = None,
         md = bundle_to_markdown(b, lag_detail=False)
         log.info("bundle.md 超预算（%d 字符），先砍滞后票墙（明细折叠为计数）", len(md))
     if len(md) > MD_BUDGET:
-        md = bundle_to_markdown(b, lag_detail=False, news_content_len=60)
+        md = bundle_to_markdown(b, lag_detail=False, evidence_detail=False)
+        log.info("bundle.md 仍超预算（%d 字符），缠论/对冲证据节折叠（批次6 降级档）", len(md))
+    if len(md) > MD_BUDGET:
+        md = bundle_to_markdown(b, lag_detail=False, evidence_detail=False,
+                                news_content_len=60)
         log.info("bundle.md 仍超预算（%d 字符），新闻正文降级至 60 字", len(md))
     if len(md) > MD_BUDGET:
-        md = bundle_to_markdown(b, lag_detail=False, news_content_len=0)
+        md = bundle_to_markdown(b, lag_detail=False, evidence_detail=False,
+                                news_content_len=0)
         log.info("bundle.md 仍超预算（%d 字符），新闻正文置空", len(md))
+    if len(md) > MD_BUDGET:
+        md = bundle_to_markdown(b, lag_detail=False, evidence_detail=False,
+                                news_content_len=0, include_evidence=False)
+        log.info("bundle.md 仍超预算（%d 字符），研究证据参考整节舍弃（降级链末位）",
+                 len(md))
     json_path = target / "bundle.json"
     md_path = target / "bundle.md"
     json_path.write_text(json.dumps(b, ensure_ascii=False, indent=2), encoding="utf-8")
