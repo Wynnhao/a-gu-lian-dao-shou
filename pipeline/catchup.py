@@ -8,7 +8,8 @@
 
 补跑内容（全部确定性脚本，不含 LLM 决策）：
 - 增量行情（交易时段自动防盘中部分bar，见 fetcher P1-1 防护）；
-- 历史缺失日的盯市 + 日报（+周五周报）——纯 DB/文件操作，可完全自动；
+- 历史缺失日的盯市 + 日报（+周报：补在"本周最后交易日"，短交易周周四即末位，
+  D-0d）——纯 DB/文件操作，可完全自动；
 - 盘中兜底（交易日 9:00-15:00）：盘前 bundle 过期则重跑盘前流水线；
   11:00 后午间包缺失则重跑午评准备；有持仓则跑尾盘级 kill 安全网扫描；
 - 盘后当日补全（交易日 15:10 后）：postclose 因当日日线未出而写 PENDING 退出后，
@@ -218,7 +219,7 @@ def catch_up(now: Optional[datetime] = None) -> int:
                 failures += 1
             latest_td = _latest_trade_date(conn)
 
-        # ---- 1) 历史缺失日：盯市 + 日报（+周五周报）----
+        # ---- 1) 历史缺失日：盯市 + 日报（+周报：本周最后交易日，D-0d）----
         oldest_missing = None
         for td in tds:
             if td >= today_str:
@@ -231,9 +232,12 @@ def catch_up(now: Optional[datetime] = None) -> int:
             try:
                 daily.mark_to_market(td)
                 daily.generate_daily_report(td)
-                w = date.fromisoformat(td)
-                if w.weekday() == 4 and not (REPORTS_DIR / (
-                        "%d-W%02d.md" % (w.isocalendar()[0], w.isocalendar()[1]))).is_file():
+                # D-0d（修复施工方案-2026-09-21）：补跑周报条件由「td 是周五」
+                # 改为「td 是本周最后一个交易日」（中秋/国庆短周周四即末位；日历
+                # 表空时 repo 判据自动退化为周五口径）。产物已存在仍跳过。
+                w_iso = date.fromisoformat(td).isocalendar()
+                if repo.is_last_trading_day_of_week(conn, td) and not (
+                        REPORTS_DIR / ("%d-W%02d.md" % (w_iso[0], w_iso[1]))).is_file():
                     weekly.weekly_report(td)
                 # W-C7（P1-21）：补跑产物校验——此前防覆写守卫把历史日报拦成
                 # PENDING 且不报错，"补跑成功"是假的。现在盯市行与 td.md 缺一

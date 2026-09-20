@@ -117,6 +117,12 @@ def _seed_db(with_today: bool) -> str:
     base = today - timedelta(days=200)
     conn.executemany("INSERT OR IGNORE INTO trade_calendar VALUES (?)",
                      [((base + timedelta(days=i)).isoformat(),) for i in range(400)])
+    # D-0d 适配：黑盒 postclose 在周报触发日（新判据下可能是周日等任何自然日）
+    # 会真跑 weekly_report → ensure_benchmark；index_daily 缺当日行时它走 akshare
+    # 拉沪深300（真实网络，net_guard 记违规）。种一行当日收盘让它短路 "existing"，
+    # 黑盒用例在任何自然日都保持零流量。
+    conn.execute("INSERT OR REPLACE INTO index_daily (index_code, trade_date, close)"
+                 " VALUES ('000300', ?, 3900.0)", (today_str,))
     conn.commit()
     conn.close()
     return today_str
@@ -348,6 +354,127 @@ def test_postclose_idempotent_double_run():
              if p.name.startswith(today_str) and p.name != today_str + ".md"]
     assert dupes == [], "双跑产生重复报告: %s" % dupes
     # 通知已由 AGSICKLE_DISABLE_NOTIFY=1 短路：两次跑均无系统通知副作用（无法断言，语义见 docstring）
+
+
+# ---------------- D-0d：周报触发判据（修复施工方案-2026-09-21） ----------------
+
+# 2026-09~10 真实日历切片（与 tests/test_repo.py CAL_SEED 同源）：09-25(周五)
+# 中秋休市、10-01~07 国庆休市、10-12(周一)
+_CAL_2026_AUTUMN = ["2026-09-21", "2026-09-22", "2026-09-23", "2026-09-24",
+                    "2026-09-28", "2026-09-29", "2026-09-30",
+                    "2026-10-08", "2026-10-09", "2026-10-12"]
+
+
+def test_weekly_due_short_week_normal_week_and_fallback():
+    """_weekly_due 正反用例（D-0d）：中秋短周周四（09-24，周五休市）触发、
+    周中（09-22）不触发、普通周五触发/普通周四不触发、trade_calendar 表空
+    退化为旧 weekday()==4 口径、--weekly 手动旗标任何日期强制。"""
+    import pipeline.postclose as postclose
+
+    def _cal_conn(dates):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(DDL)
+        conn.executemany("INSERT INTO trade_calendar VALUES (?)",
+                         [(d,) for d in dates])
+        return conn
+
+    conn = _cal_conn(_CAL_2026_AUTUMN)
+    try:
+        # 正：短周最后交易日 09-24（周四）→ 触发（W39 补发场景）
+        assert postclose._weekly_due(conn, "2026-09-24") is True
+        # 反：周中 09-22 → 不触发
+        assert postclose._weekly_due(conn, "2026-09-22") is False
+        # 正/反：普通周五 10-09 触发、普通周四 10-08 不触发
+        assert postclose._weekly_due(conn, "2026-10-09") is True
+        assert postclose._weekly_due(conn, "2026-10-08") is False
+        # --weekly 手动旗标：非末位日也强制
+        assert postclose._weekly_due(conn, "2026-09-22", force=True) is True
+    finally:
+        conn.close()
+
+    # 回退：日历表空 → 判据自动退化为"周五触发"（与旧行为一致）
+    conn = _cal_conn([])
+    try:
+        assert postclose._weekly_due(conn, "2026-10-09") is True    # 周五
+        assert postclose._weekly_due(conn, "2026-10-08") is False   # 周四
+    finally:
+        conn.close()
+
+
+def test_postclose_weekly_trigger_main_flow():
+    """D-0d 主流程接线：进程内跑 postclose.main(--date)，weekly/盯市/日报打桩——
+    短周最后交易日 09-24 触发周报且 trade_date 与周报入参一致；周中 09-22 不触发；
+    --weekly 手动旗标仍强制。库/报告/锁文件全走沙箱，不碰生产库与真实 logs/。"""
+    import pipeline.postclose as postclose
+
+    def _seed(td):
+        conn = sqlite3.connect(os.environ["AGSICKLE_DB"])
+        conn.row_factory = sqlite3.Row
+        conn.executescript(DDL)
+        for code in ("600519", "000001"):
+            conn.execute("INSERT INTO stock_info VALUES (?,?,?,?)",
+                         (code, "测试票", "2024-01-02",
+                          datetime.now().isoformat(timespec="seconds")))
+            conn.execute(
+                "INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
+                " volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (code, td, 10.0, 10.0, 10.0, 10.0, 1000, 1000000.0, 0.0, 1.0))
+        conn.executemany("INSERT INTO trade_calendar VALUES (?)",
+                         [(d,) for d in _CAL_2026_AUTUMN])
+        conn.commit()
+        conn.close()
+
+    calls: List[str] = []
+    orig = (weekly_mod.weekly_report, daily_mod.mark_to_market,
+            daily_mod.generate_daily_report, postclose.REPORTS_DIR,
+            postclose.LOCK_FILE)
+
+    def fake_weekly(trade_date=None, *a, **k):
+        calls.append("weekly:%s" % trade_date)
+        return Path(os.environ["AGSICKLE_REPORTS_DIR"]) / "fake-weekly.md"
+
+    def fake_mm(trade_date, *a, **k):
+        return {"trade_date": trade_date, "cash": 0.0, "market_value": 0.0,
+                "total": 0.0, "drawdown": 0.0, "kill_switch": False, "note": ""}
+
+    def fake_dr(trade_date=None, **k):
+        p = Path(os.environ["AGSICKLE_REPORTS_DIR"]) / ("%s.md" % trade_date)
+        p.write_text("# fake daily %s" % trade_date, encoding="utf-8")
+        return p
+
+    weekly_mod.weekly_report = fake_weekly
+    daily_mod.mark_to_market = fake_mm
+    daily_mod.generate_daily_report = fake_dr
+    sandbox = Path(tempfile.mkdtemp(prefix="agsickle_wdue_"))
+    postclose.REPORTS_DIR = sandbox / "reports"   # import 期固化常量 → 显式改指沙箱
+    postclose.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    postclose.LOCK_FILE = sandbox / ".postclose.lock"
+    try:
+        # 正：09-24 中秋短周最后交易日 → 周报触发（W39），入参即触发日
+        _fresh_env("wdue_pos")
+        _seed("2026-09-24")
+        assert postclose.main(["--date", "2026-09-24"]) == 0
+        assert calls == ["weekly:2026-09-24"], calls
+
+        # 反：09-22 周中 → 不触发
+        calls.clear()
+        _fresh_env("wdue_neg")
+        _seed("2026-09-22")
+        assert postclose.main(["--date", "2026-09-22"]) == 0
+        assert calls == [], calls
+
+        # --weekly 手动旗标保留：周中亦强制触发
+        calls.clear()
+        _fresh_env("wdue_force")
+        _seed("2026-09-22")
+        assert postclose.main(["--date", "2026-09-22", "--weekly"]) == 0
+        assert calls == ["weekly:2026-09-22"], calls
+    finally:
+        (weekly_mod.weekly_report, daily_mod.mark_to_market,
+         daily_mod.generate_daily_report, postclose.REPORTS_DIR,
+         postclose.LOCK_FILE) = orig
+        shutil.rmtree(sandbox, ignore_errors=True)
 
 
 # ----------------------- C-ARC-3b/T6：盘中分钟快照录制器 -----------------------

@@ -22,10 +22,13 @@ api_data_status/equity_curve）、signals/macro/trade_cal/universe800/news 领�
 （二期）、kill 查询主体。
 """
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
+
+log = logging.getLogger("data.repo")
 
 # 「有效成交」过滤的唯一定义（此前 paper._EFFECTIVE / daily._TRADE_OK / runner 内联三份）
 TRADE_EFFECTIVE_SQL = ("(status IS NULL OR status NOT IN "
@@ -119,6 +122,112 @@ def day_side_shares(conn: sqlite3.Connection, trade_date: str, code: str,
         "SELECT COALESCE(SUM(shares),0) FROM trade WHERE trade_date=? AND code=? "
         "AND side=? AND " + TRADE_EFFECTIVE_SQL, (trade_date, code, side)).fetchone()
     return int(row[0])
+
+
+# ---------------------------------------------------------------- trade_calendar 域（修复批 D-0a，2026-09-21）
+
+# 降级告警每进程只发一次（catchup/postclose 每 30 分钟一轮，逐次 warning 刷屏）
+_cal_fallback_warned = False
+
+
+def _as_date(d) -> date:
+    if isinstance(d, datetime):
+        return d.date()   # datetime 是 date 子类，isoformat 带时刻会破坏 SQL 字符串比较
+    if isinstance(d, date):
+        return d
+    return date.fromisoformat(str(d)[:10])
+
+
+def _warn_calendar_fallback(reason: str) -> None:
+    global _cal_fallback_warned
+    if not _cal_fallback_warned:
+        _cal_fallback_warned = True
+        log.warning("trade_calendar 不可用（%s），交易日判断降级为周末口径", reason)
+
+
+def _weekend_next(d: date) -> date:
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+def _weekend_prev(d: date) -> date:
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def is_trading_date(conn: sqlite3.Connection, d) -> bool:
+    """d 是否交易日（YYYY-MM-DD 或 date）。
+
+    覆盖年内按表（查无=节假日）；表空/该年无任何日历行（覆盖期外）降级为
+    周末口径并 log.warning 一次（修复批 D-0a：09-25 中秋/10-01~07 国庆
+    全链日历雷的共用底座，与 data/trade_cal.is_trading_day 的年覆盖判据同型）。
+    """
+    d = _as_date(d)
+    key = d.isoformat()
+    if conn.execute("SELECT 1 FROM trade_calendar WHERE date=? LIMIT 1",
+                    (key,)).fetchone():
+        return True
+    covered = conn.execute(
+        "SELECT 1 FROM trade_calendar WHERE date BETWEEN ? AND ? LIMIT 1",
+        ("%d-01-01" % d.year, "%d-12-31" % d.year)).fetchone()
+    if covered:
+        return False
+    _warn_calendar_fallback("%s 超出日历覆盖" % key)
+    return d.weekday() < 5
+
+
+def next_trading_date(conn: sqlite3.Connection, d) -> Optional[str]:
+    """首个不早于 d 的交易日（on-or-after，ISO 串）。
+
+    - 表内命中直接返回（含 d 本身即交易日、以及节假日缺口一次跳过：
+      next(2026-09-30)=2026-10-08）；
+    - 表空 → 降级周末口径（跳过周六日）并告警一次；
+    - 表非空但 d 已越过覆盖末端（数据末端）→ None，调用方自行决断
+      （周报触发视作"本周最后交易日"；应急单回退周末口径）。
+    """
+    d = _as_date(d)
+    row = conn.execute("SELECT MIN(date) FROM trade_calendar WHERE date>=?",
+                       (d.isoformat(),)).fetchone()
+    if row and row[0]:
+        return str(row[0])
+    if conn.execute("SELECT 1 FROM trade_calendar LIMIT 1").fetchone():
+        return None
+    _warn_calendar_fallback("trade_calendar 表空")
+    return _weekend_next(d).isoformat()
+
+
+def last_trading_date_on_or_before(conn: sqlite3.Connection, d) -> Optional[str]:
+    """d（含）之前最近的一个交易日（ISO 串），无则 None。
+
+    表空降级周末口径并告警一次；表非空且 d 早于覆盖起点（理论不可达，
+    防御分支）返回 None。规则3 健康检查的"应有最新数据日"口径（D-0b）。
+    """
+    d = _as_date(d)
+    row = conn.execute("SELECT MAX(date) FROM trade_calendar WHERE date<=?",
+                       (d.isoformat(),)).fetchone()
+    if row and row[0]:
+        return str(row[0])
+    if conn.execute("SELECT 1 FROM trade_calendar LIMIT 1").fetchone():
+        return None
+    _warn_calendar_fallback("trade_calendar 表空")
+    return _weekend_prev(d).isoformat()
+
+
+def is_last_trading_day_of_week(conn: sqlite3.Connection, d) -> bool:
+    """d 是否本周最后一个交易日（D-0d 周报触发口径）。
+
+    比较 d 与其后首个交易日（on-or-after d+1 日）的 ISO (年,周)：不同周即
+    是；后继不存在（日历覆盖末端，数据末端）视作是。日历表空时
+    next_trading_date 降级周末口径，本判据自然退化为"周五触发"——与旧
+    weekday()==4 行为一致（中秋/国庆短周漏发雷的修复不影响无日历退化）。
+    """
+    d = _as_date(d)
+    nd = next_trading_date(conn, d + timedelta(days=1))
+    if nd is None:
+        return True
+    return date.fromisoformat(nd).isocalendar()[:2] != d.isocalendar()[:2]
 
 
 # ---------------------------------------------------------------- daily_bar 域

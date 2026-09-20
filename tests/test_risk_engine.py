@@ -866,6 +866,110 @@ def test_rule9_stale_price_source_warning_not_violation():
     assert not v3.approved and hit(v3, "价格保护")
 
 
+# ---------------- 修复批 D-0b：health_check 交易日历口径（2026-09-21 日历雷） ----------------
+# 雷体：中秋（09-25 周五）/国庆（10-01~07）后首个交易日盘前，旧自然日 lag>3 口径
+# 误报"数据滞后" → 规则3 当天全链降级只出报告；缺 bar 腿对长停牌/退市票永久 poison。
+# 用例锚定 docs/修复施工方案-2026-09-21.md §2 D-0b 验收（正/反/回退）。
+
+from datetime import date as _date  # noqa: E402  health_check today 注入用
+
+# 2026-09~10 真实日历切片（与 tests/test_repo.py 的 CAL_SEED 同源并前推一周）：
+# 09-25(周五)中秋休市、10-01~07 国庆休市、10-12(周一)收尾
+_HL_CAL = [
+    "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18",
+    "2026-09-21", "2026-09-22", "2026-09-23", "2026-09-24",
+    "2026-09-28", "2026-09-29", "2026-09-30",
+    "2026-10-08", "2026-10-09", "2026-10-12",
+]
+
+
+def _hl_conn(calendar=None):
+    """内存库：DDL + trade_calendar 种子 + stock_info 三票——
+    600519 正常（bar 到 09-24）/ 000001 缺最新日（末根 09-23）/
+    600003 停牌 10 个交易日（末根 09-10）/ 688801 从未有过 bar。"""
+    from data.fetcher import DDL
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(DDL)
+    for d in (_HL_CAL if calendar is None else calendar):
+        conn.execute("INSERT INTO trade_calendar VALUES (?)", (d,))
+    for code, name in (("600519", "正常票"), ("000001", "缺票"),
+                       ("600003", "停牌票"), ("688801", "无bar票")):
+        conn.execute("INSERT INTO stock_info VALUES (?,?,?,?)",
+                     (code, name, "2020-01-01", "x"))
+    for code, dates in {
+        "600519": ["2026-09-18", "2026-09-21", "2026-09-22", "2026-09-23",
+                   "2026-09-24"],
+        "000001": ["2026-09-21", "2026-09-22", "2026-09-23"],
+        "600003": ["2026-09-04", "2026-09-09", "2026-09-10"],
+    }.items():
+        for td in dates:
+            conn.execute(
+                "INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
+                " volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (code, td, 10, 10, 10, 10.0, 1000, 1e6, 0.0, 1.0))
+    return conn
+
+
+def _hl_add_bar(conn, code, td):
+    conn.execute(
+        "INSERT INTO daily_bar (code, trade_date, open, high, low, close,"
+        " volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (code, td, 10, 10, 10, 10.0, 1000, 1e6, 0.0, 1.0))
+
+
+def test_health_check_post_holiday_premarket_no_false_lag():
+    """正（不触发）：09-28（周一，中秋后首个交易日）盘前——latest=09-24、
+    expected=昨日(09-27 周日)按日历回溯=09-24 → 不报滞后。
+    旧自然日口径 lag=4 误报，规则3 当天全链瘫痪（日历雷本体）。"""
+    from risk.blacklist import health_check
+    conn = _hl_conn()
+    issues = health_check(conn, today=_date(2026, 9, 28))
+    assert not any("滞后" in s for s in issues), issues
+
+
+def test_health_check_missing_trading_day_reports_lag():
+    """正（触发）：周二盘前缺周一数据——latest=09-24 < expected=09-28（周一）
+    → 报滞后（缺的正是 09-28 这个交易日）。"""
+    from risk.blacklist import health_check
+    conn = _hl_conn()
+    issues = health_check(conn, today=_date(2026, 9, 29))
+    assert any("滞后" in s for s in issues), issues
+    assert "2026-09-28" in [s for s in issues if "滞后" in s][0], issues
+
+
+def test_health_check_fresh_data_clean():
+    """反（不触发）：数据最新（09-28 bar 齐全）→ health_check 全绿 []。"""
+    from risk.blacklist import health_check
+    conn = _hl_conn()
+    _hl_add_bar(conn, "600519", "2026-09-28")
+    _hl_add_bar(conn, "000001", "2026-09-28")
+    issues = health_check(conn, today=_date(2026, 9, 29))
+    assert issues == [], issues
+
+
+def test_health_check_missing_bar_window_semantics():
+    """正：缺 bar 腿窗口语义——窗口地板=全库最近 5 个去重交易日最小值(09-18)：
+    停牌 10 日的 600003（末根 09-10 < 地板）不报（不再永久 poison）；
+    窗口内缺最新 bar 的 000001（末根 09-23）照报；从未有 bar 的 688801 不报。"""
+    from risk.blacklist import health_check
+    conn = _hl_conn()
+    issues = health_check(conn, today=_date(2026, 9, 28))
+    assert len(issues) == 1, issues
+    assert "000001" in issues[0] and "2026-09-24" in issues[0], issues
+    assert not any("600003" in s for s in issues), issues
+    assert not any("688801" in s for s in issues), issues
+
+
+def test_health_check_empty_calendar_weekend_fallback():
+    """回退：trade_calendar 表空 → repo helper 降级周末口径——"周五有数据、
+    周一盘前"（latest=09-18、today=09-21）不报滞后，行为不劣于现状。"""
+    from risk.blacklist import health_check
+    conn = _hl_conn(calendar=[])
+    conn.execute("DELETE FROM daily_bar WHERE trade_date > '2026-09-18'")
+    issues = health_check(conn, today=_date(2026, 9, 21))
+    assert not any("滞后" in s for s in issues), issues
+
+
 # ---------------- 直接运行入口 ----------------
 
 if __name__ == "__main__":

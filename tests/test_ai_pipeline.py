@@ -225,8 +225,10 @@ def test_build_bundle_empty_tables_degrades():
 
 
 def test_build_bundle_with_data():
-    # daily_bar 日期取"昨天"：health_check 的滞后容差是自然日 3 天，
-    # 写死日期会让本用例每周二以后必挂（lag>3 误报数据滞后）
+    # daily_bar 日期取"昨天"：health_check（修复批 D-0b 起）按交易日历判
+    # "应有数据日"，本用例 trade_calendar 为空 → 降级周末口径，自然日昨天的
+    # bar 在任何星期运行都不落后于 expected；写死日期会随时间漂移成滞后误报
+    # （旧自然日 lag>3 容差已移除，注释随之更新）。
     bar_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     conn = make_conn()
     conn.execute("INSERT INTO daily_bar (code, trade_date, open, high, low, close,"

@@ -5,6 +5,7 @@ import sqlite3
 import sys
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Optional
 
 BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
@@ -91,21 +92,47 @@ def check_blacklist(conn: sqlite3.Connection) -> dict:
     return result
 
 
-def health_check(conn: sqlite3.Connection) -> list:
-    """数据健康检查：最新数据是否为最近一个交易日、行数是否异常。"""
+def health_check(conn: sqlite3.Connection, today: Optional[date] = None) -> list:
+    """数据健康检查（修复施工方案-2026-09-21 D-0b / 日历雷）：
+
+    1) 滞后腿：应有数据日 expected = 「昨日（含）之前最近的一个交易日」
+       （repo.last_trading_date_on_or_before，trade_calendar 口径；表空自动
+       降级周末口径）。仅当 latest < expected 报"数据滞后"。旧自然日
+       lag>3 口径的雷：中秋（2026-09-25 周五）/国庆（10-01~07）后首个交易日
+       盘前（如 09-28，latest=09-24）lag=4 → 误报滞后 → 规则3
+       （risk/engine.rule_health 判 health_issues 非空即降级只出报告）
+       当天全链瘫痪。
+    2) 缺 bar 腿：只对「最近 5 个交易日窗口内有过 bar 但缺最新交易日 bar」的
+       票报 issue。窗口地板取 daily_bar 自身最近 5 个去重 trade_date 的最小值
+       （事实日历，不依赖 trade_calendar 覆盖）；末根更老的票（长停牌/退市）
+       不再永久 poison。集合式 SQL 一次取齐，无逐票 N+1。
+
+    today 供测试注入（缺省 date.today()）；两个消费方 execution/runner.py 与
+    pipeline/premarket.py 只传 conn，签名向后兼容。
+    """
     latest = repo.latest_trade_date(conn)
-    issues = []
     if not latest:
         return ["daily_bar 为空"]
-    # 周末容差：最近3个自然日内应有数据
-    from datetime import datetime, timedelta
-    lag = (datetime.today() - datetime.fromisoformat(latest)).days
-    if lag > 3:
-        issues.append(f"数据滞后 {lag} 天（最新 {latest}）")
-    for code, name, *_ in conn.execute(
-            "SELECT code,name FROM stock_info WHERE code NOT IN "
-            "(SELECT code FROM daily_bar WHERE trade_date=?)", (latest,)):
-        issues.append(f"{code} {name} 缺少 {latest} 的数据")
+    today = today or date.today()
+    issues = []
+    expected = repo.last_trading_date_on_or_before(conn, today - timedelta(days=1))
+    if expected and latest < expected:
+        issues.append("数据滞后：最新 %s，%s（交易日）应有数据" % (latest, expected))
+    # 缺 bar 腿：latest 为全库最大日期，last_bar 不可能大于它，故 < 与 != 等价；
+    # stock_info 中从未有过 bar 的票不在「窗口内有过 bar」范畴，同样不报
+    floor = conn.execute(
+        "SELECT MIN(trade_date) FROM (SELECT DISTINCT trade_date FROM daily_bar"
+        " ORDER BY trade_date DESC LIMIT 5)").fetchone()
+    if floor and floor[0]:
+        rows = conn.execute(
+            "SELECT s.code, s.name, b.last_bar FROM stock_info s JOIN"
+            " (SELECT code, MAX(trade_date) AS last_bar FROM daily_bar"
+            "  GROUP BY code) b ON b.code = s.code"
+            " WHERE b.last_bar >= ? AND b.last_bar < ?",
+            (floor[0], latest)).fetchall()
+        for code, name, last_bar in rows:
+            issues.append("%s %s 缺少 %s 的数据（末根 %s）"
+                          % (code, name, latest, last_bar))
     return issues
 
 

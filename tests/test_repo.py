@@ -15,6 +15,7 @@ if str(BASE / "tests") not in sys.path:
     sys.path.insert(0, str(BASE / "tests"))
 
 import json
+import logging
 import os
 import sqlite3
 import tempfile
@@ -316,6 +317,90 @@ def test_transaction_context():
     except RuntimeError:
         pass
     assert not repo.has_state(conn, "2026-09-17")
+
+
+# ---------------- trade_calendar 域（修复批 D-0a） ----------------
+
+# 2026-09~10 真实日历切片：09-25(周五)中秋休市、10-01~07 国庆休市、10-12(周一)
+CAL_SEED = ["2026-09-21", "2026-09-22", "2026-09-23", "2026-09-24",
+            "2026-09-28", "2026-09-29", "2026-09-30",
+            "2026-10-08", "2026-10-09", "2026-10-12"]
+
+
+def _cal_conn(dates=CAL_SEED):
+    conn = fresh_conn()
+    conn.executemany("INSERT INTO trade_calendar VALUES (?)", [(d,) for d in dates])
+    return conn
+
+
+def test_is_trading_date_calendar_hits():
+    """覆盖年内按表：交易日命中、节假日（中秋周五）与周末均 False。"""
+    conn = _cal_conn()
+    assert repo.is_trading_date(conn, "2026-09-24") is True
+    assert repo.is_trading_date(conn, "2026-09-28") is True
+    assert repo.is_trading_date(conn, "2026-09-25") is False   # 中秋调休周五
+    assert repo.is_trading_date(conn, "2026-09-26") is False   # 周六
+
+
+def test_next_trading_date_skips_holidays():
+    """on-or-after 语义：命中本身、跳过中秋、国庆缺口一次跳、周末起点。"""
+    conn = _cal_conn()
+    assert repo.next_trading_date(conn, "2026-09-24") == "2026-09-24"  # 本身即交易日
+    assert repo.next_trading_date(conn, "2026-09-25") == "2026-09-28"  # 跳过 09-25
+    assert repo.next_trading_date(conn, "2026-10-01") == "2026-10-08"  # 缺口一次跳
+    assert repo.next_trading_date(conn, "2026-09-19") == "2026-09-21"  # 周六起点
+    assert repo.next_trading_date(conn, datetime(2026, 9, 25)) == "2026-09-28"  # date 入参
+    # datetime 入参（0c 修复批回归：isoformat 带时刻曾破坏 on-or-after 命中）
+    assert repo.next_trading_date(conn, datetime(2026, 9, 24, 15, 30)) == "2026-09-24"
+    assert repo.last_trading_date_on_or_before(conn, datetime(2026, 9, 27, 9, 0)) == "2026-09-24"
+    assert repo.is_trading_date(conn, datetime(2026, 9, 25, 10, 0)) is False
+
+
+def test_next_trading_date_data_end_returns_none():
+    """覆盖末端之外返回 None（数据末端，不虚构）：调用方（周报/应急单）自行决断。"""
+    conn = _cal_conn()
+    assert repo.next_trading_date(conn, "2026-10-13") is None
+    assert repo.next_trading_date(conn, "2026-12-31") is None
+
+
+def test_last_trading_date_on_or_before():
+    """含当日的最近交易日：周日回溯跳过中秋长周末、早于覆盖起点防御 None。"""
+    conn = _cal_conn()
+    assert repo.last_trading_date_on_or_before(conn, "2026-09-27") == "2026-09-24"
+    assert repo.last_trading_date_on_or_before(conn, "2026-09-24") == "2026-09-24"
+    assert repo.last_trading_date_on_or_before(conn, "2026-10-08") == "2026-10-08"
+    assert repo.last_trading_date_on_or_before(conn, "1990-01-01") is None
+
+
+def test_is_last_trading_day_of_week():
+    """D-0d 触发口径：中秋短周周四即周末、普通周周四是中段、周五触发、
+    数据末端视作触发。"""
+    conn = _cal_conn()
+    assert repo.is_last_trading_day_of_week(conn, "2026-09-24") is True   # 周五休市
+    assert repo.is_last_trading_day_of_week(conn, "2026-09-22") is False
+    assert repo.is_last_trading_day_of_week(conn, "2026-10-09") is True   # 普通周五
+    assert repo.is_last_trading_day_of_week(conn, "2026-10-08") is False  # 普通周四
+    assert repo.is_last_trading_day_of_week(conn, "2026-10-12") is True   # 数据末端
+
+
+def test_calendar_empty_fallback_weekend_and_warn():
+    """表空回退三场景（is/next/last 均降级周末口径）且 warning 只发一次。"""
+    records = []
+    handler = logging.Handler()
+    handler.emit = lambda r: records.append(r)
+    lg = logging.getLogger("data.repo")
+    repo._cal_fallback_warned = False
+    lg.addHandler(handler)
+    try:
+        conn = fresh_conn()  # DDL 建空 trade_calendar
+        assert repo.is_trading_date(conn, "2026-09-26") is False  # 周六
+        assert repo.is_trading_date(conn, "2026-09-25") is True   # 周五
+        assert repo.next_trading_date(conn, "2026-09-26") == "2026-09-28"  # 周六跳周末
+        assert repo.last_trading_date_on_or_before(conn, "2026-09-27") == "2026-09-25"
+        assert len(records) == 1  # 降级告警只发一次
+    finally:
+        lg.removeHandler(handler)
+        repo._cal_fallback_warned = True
 
 
 if __name__ == "__main__":

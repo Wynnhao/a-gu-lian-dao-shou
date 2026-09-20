@@ -1,4 +1,5 @@
-"""盘后流水线（15:30 触发）：补齐当日日线 -> 盯市 -> 每日复盘报告（周五或 --weekly 加跑周报）。"""
+"""盘后流水线（15:30 触发）：补齐当日日线 -> 盯市 -> 每日复盘报告
+（本周最后交易日或 --weekly 加跑周报；触发判据见 _weekly_due / D-0d）。"""
 import sys
 from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
@@ -39,8 +40,29 @@ REPORTS_DIR = Path(os.environ.get("AGSICKLE_REPORTS_DIR") or (BASE / "logs" / "r
 LOCK_FILE = BASE / "logs" / ".postclose.lock"
 
 
+def _weekly_due(conn, trade_date: Optional[str], force: bool = False) -> bool:
+    """步骤3 周报 / 步骤3.6 周度清理的共通触发判据（修复施工方案-2026-09-21 D-0d）。
+
+    旧判据 date.today().weekday()==4 只认"今天是周五"：短交易周（2026-09-25
+    中秋、10-01~07 国庆休市）本周最后交易日落在周四，收盘时非周五 → W39 周报
+    漏发。新判据：trade_date（即即将传给 weekly.weekly_report 的同一变量，保证
+    W 序号与触发日一致）是本周最后一个交易日——repo.is_last_trading_day_of_week；
+    日历表空时该判据自动退化为"周五触发"，与旧 weekday()==4 行为一致。
+    force 对应 --weekly 手动旗标（保留，任何日期强制触发）。
+    """
+    if force:
+        return True
+    if not trade_date:
+        return False
+    try:
+        return repo.is_last_trading_day_of_week(conn, trade_date)
+    except Exception as e:  # noqa: BLE001
+        log.warning("周报触发判据查询 FAIL（退化为周五口径）: %s", repr(e))
+        return date.today().weekday() == 4
+
+
 def _weekly_cleanup(conn, now: Optional[datetime] = None) -> dict:
-    """周度清理（C-ARC-3b/T7，周五或 --weekly 执行）：
+    """周度清理（C-ARC-3b/T7，本周最后交易日或 --weekly 执行，判据 _weekly_due）：
     - minute_snapshot 留 2 年（盘中回放用不了更久，存储 ~100 万行/年量级）；
     - logs/quotes/*.jsonl 留 90 天（录制器不写 jsonl，但 confirm/盯市路径仍写，
       审核发现的存量无清理问题一并纳入）。
@@ -175,7 +197,7 @@ def _clear_pending_today(trade_date: Optional[str] = None) -> bool:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="盘后流水线：盯市 + 每日复盘报告（周五/指定时含周报）")
+    ap = argparse.ArgumentParser(description="盘后流水线：盯市 + 每日复盘报告（本周最后交易日/指定时含周报）")
     ap.add_argument("--date", default=None, dest="trade_date",
                     help="交易日 YYYY-MM-DD（默认 daily_bar 最新交易日）")
     ap.add_argument("--weekly", action="store_true", help="强制加跑周度复盘报告")
@@ -257,6 +279,11 @@ def main(argv=None) -> int:
     stale_note: Optional[str] = None
     try:
         trade_date = args.trade_date or daily.latest_trade_date(conn)
+
+        # D-0d（修复施工方案-2026-09-21）：周报/周度清理触发判据在此一次算定
+        # ——conn 尚在本作用域（只读查询 trade_calendar），步骤3/3.6 复用同一
+        # 布尔保证两处同开关；trade_date 与传给 weekly_report 的是同一变量。
+        weekly_due = _weekly_due(conn, trade_date, force=args.weekly)
 
         # W-D3（P1-18）：带 --date 补跑且目标日 daily_bar 缺行 → 不再无痕放行。
         # 此前守卫 `if trade_date < today_iso and not args.trade_date` 对 --date
@@ -358,16 +385,16 @@ def main(argv=None) -> int:
         print("[postclose] 每日报告生成失败：%r" % e)
         return 1
 
-    # 3. 周五（或 --weekly）加跑周报
+    # 3. 本周最后一个交易日（短交易周如 2026-09-24 周四即末位，D-0d）或 --weekly 加跑周报
     weekly_path: Optional[Path] = None
-    if date.today().weekday() == 4 or args.weekly:
+    if weekly_due:
         try:
             weekly_path = weekly.weekly_report(trade_date)
             log.info("步骤3 周报完成: %s" % weekly_path)
         except Exception as e:
             log.error("步骤3 weekly_report FAIL（不影响日报）: %s", repr(e))
     else:
-        log.info("步骤3 今天非周五且未指定 --weekly，跳过周报")
+        log.info("步骤3 %s 非本周最后交易日且未指定 --weekly，跳过周报", trade_date)
 
     # 3.5 规则 21 跌停应急主动扫描（Fix-4 / D1：扫描 → propose 应急单（run_date=次日）
     # → 通知；confirm 优先，次日 09:14 未确认由 premarket 兜底自动执行）
@@ -379,9 +406,9 @@ def main(argv=None) -> int:
     except Exception as e:
         log.error("步骤3.5 跌停应急扫描 FAIL（继续）: %s", repr(e))
 
-    # 3.6 周度（周五或 --weekly）清理：minute_snapshot 留 2 年、盘中快照审计
-    # jsonl 留 90 天（C-ARC-3b/T7）
-    if date.today().weekday() == 4 or args.weekly:
+    # 3.6 周度（本周最后交易日或 --weekly，判据与步骤3 同开关 weekly_due，D-0d）
+    # 清理：minute_snapshot 留 2 年、盘中快照审计 jsonl 留 90 天（C-ARC-3b/T7）
+    if weekly_due:
         try:
             _conn = fetcher.get_conn()
             try:

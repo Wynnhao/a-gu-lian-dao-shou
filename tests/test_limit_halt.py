@@ -227,17 +227,62 @@ def test_postclose_scan_proposes_and_dedupes(monkeypatch=None):
         conn.close()
 
 
-# ---------------- 3. stuck 计数 + 5 日事件 ----------------
+# ---------------- 3. run_date 生成（D-0c 交易日历导航） + stuck 计数 ----------------
+
+# 2026-09~10 真实日历切片（与 tests/test_repo.py CAL_SEED 同源）：
+# 09-25(周五)中秋休市、10-01~07 国庆休市、10-12(周一)为覆盖末端
+CAL_SEED = ["2026-09-21", "2026-09-22", "2026-09-23", "2026-09-24",
+            "2026-09-28", "2026-09-29", "2026-09-30",
+            "2026-10-08", "2026-10-09", "2026-10-12"]
+
+
+def _cal_conn(dates=None) -> sqlite3.Connection:
+    """种子 trade_calendar 的内存库；dates=None 用 CAL_SEED；[] 为空表。"""
+    conn = _mem_conn()
+    conn.executemany("INSERT INTO trade_calendar VALUES (?)",
+                     [(d,) for d in (CAL_SEED if dates is None else dates)])
+    conn.commit()
+    return conn
 
 
 def test_next_exec_date_skips_weekend():
-    """P2③：_next_exec_date 周末顺延——周五→周一、周六→周一、周日→周一、
-    周中→次日；法定节假日不在职责内（维持 premarket 自然顺延语义）。"""
+    """D-0c 迁移：空日历（表空 → repo 降级周末口径）下 _next_exec_date 行为
+    与修复前周末顺延完全一致——周五→周一、周六→周一、周日→周一、周中→次日。"""
     from signals.limit_halt import _next_exec_date
-    assert _next_exec_date(datetime(2026, 9, 25, 15, 30)) == "2026-09-28"  # 周五→周一
-    assert _next_exec_date(datetime(2026, 9, 26, 15, 30)) == "2026-09-28"  # 周六→周一
-    assert _next_exec_date(datetime(2026, 9, 27, 15, 30)) == "2026-09-28"  # 周日→周一
-    assert _next_exec_date(datetime(2026, 9, 23, 15, 30)) == "2026-09-24"  # 周三→周四
+    conn = _cal_conn(dates=[])   # trade_calendar 空
+    try:
+        assert _next_exec_date(conn, datetime(2026, 9, 25, 15, 30)) == "2026-09-28"  # 周五→周一
+        assert _next_exec_date(conn, datetime(2026, 9, 26, 15, 30)) == "2026-09-28"  # 周六→周一
+        assert _next_exec_date(conn, datetime(2026, 9, 27, 15, 30)) == "2026-09-28"  # 周日→周一
+        assert _next_exec_date(conn, datetime(2026, 9, 23, 15, 30)) == "2026-09-24"  # 周三→周四
+    finally:
+        conn.close()
+
+
+def test_next_exec_date_skips_holidays():
+    """D-0c 核心正例：交易日历导航跳过法定节假日。09-24（周四、中秋前最后
+    交易日）盘后扫描 run_date=09-28 而非休市的 09-25（原死穴：次日无任何
+    节点消费该单）；国庆同理；普通工作日照常次日。"""
+    from signals.limit_halt import _next_exec_date
+    conn = _cal_conn()   # CAL_SEED
+    try:
+        assert _next_exec_date(conn, datetime(2026, 9, 24, 15, 30)) == "2026-09-28"  # 跳中秋 09-25
+        assert _next_exec_date(conn, datetime(2026, 9, 30, 15, 30)) == "2026-10-08"  # 跳国庆 10-01~07
+        assert _next_exec_date(conn, datetime(2026, 10, 8, 15, 30)) == "2026-10-09"  # 周四→周五
+    finally:
+        conn.close()
+
+
+def test_next_exec_date_calendar_end_falls_back_weekend():
+    """D-0c 回退分支：now+1d 越过日历覆盖末端（repo.next_trading_date=None）
+    → 回退周末顺延循环，行为不劣于修复前。种子只到 10-12，now=10-12（周一）
+    → now+1d=10-13（周二，工作日）直接返回。"""
+    from signals.limit_halt import _next_exec_date
+    conn = _cal_conn()
+    try:
+        assert _next_exec_date(conn, datetime(2026, 10, 12, 15, 30)) == "2026-10-13"
+    finally:
+        conn.close()
 
 
 def test_postclose_scan_friday_run_date_is_monday():
@@ -269,6 +314,40 @@ def test_postclose_scan_friday_run_date_is_monday():
             "SELECT run_date FROM decision WHERE emergency_scan=1").fetchone()
         assert row is not None and row[0] == "2026-09-28", \
             "周五盘后应急单 run_date 应顺延到下周一，而非周六"
+    finally:
+        _runner.ORDERS_DIR = orig_orders_dir
+        conn.close()
+
+
+def test_postclose_scan_holiday_eve_uses_calendar():
+    """D-0c 端到端正例（09-24 死穴）：中秋前最后交易日（09-24 周四）盘后扫描，
+    run_date 透传交易日历导航 → 09-28（下一交易日）而非休市的 09-25；
+    _next_exec_date 只此一个调用点，透传断言即覆盖生成端全链。"""
+    from execution import runner as _runner
+    conn = _cal_conn()   # CAL_SEED 含 09-24、无 09-25（中秋休市）
+    code = "600519"
+    conn.execute("INSERT OR REPLACE INTO stock_info VALUES (?,?,?,?)",
+                 (code, "测试票", "2020-01-01", "x"))
+    for d, cl in (("2026-09-23", 100.0), ("2026-09-24", 90.0)):
+        conn.execute(
+            "INSERT OR REPLACE INTO daily_bar (code, trade_date, open, high, low,"
+            " close, volume, amount, pct_chg, turnover) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (code, d, cl, cl, cl, cl, 10_000_000, cl * 10_000_000, 0.0, 1.0))
+    conn.execute(
+        "INSERT OR REPLACE INTO position (code, name, shares, avail_shares, cost,"
+        " updated_at) VALUES (?,?,?,?,?,?)",
+        (code, "测试票", 200, 200, 110.0, "2026-09-24"))
+    conn.commit()
+    orders_dir = Path(tempfile.mkdtemp(prefix="agsickle_lh_orders_"))
+    orig_orders_dir = _runner.ORDERS_DIR
+    _runner.ORDERS_DIR = orders_dir
+    try:
+        r = limit_halt.run_postclose_scan(conn, now=datetime(2026, 9, 24, 15, 30, 0))
+        assert r["proposed"] == ["600519"], r
+        row = conn.execute(
+            "SELECT run_date FROM decision WHERE emergency_scan=1").fetchone()
+        assert row is not None and row[0] == "2026-09-28", \
+            "中秋前最后交易日盘后应急单 run_date 应为节后首个交易日 09-28"
     finally:
         _runner.ORDERS_DIR = orig_orders_dir
         conn.close()

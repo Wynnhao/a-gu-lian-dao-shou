@@ -163,15 +163,25 @@ def _dedupe_emergency(conn: sqlite3.Connection, code: str, run_date: str) -> boo
     return n > 0
 
 
-def _next_exec_date(now: datetime) -> str:
-    """P2③（全量打包批 2026-09-20）：应急单预期执行日 = 自然日次日遇周末顺延。
+def _next_exec_date(conn: sqlite3.Connection, now: datetime) -> str:
+    """D-0c（修复施工方案 2026-09-21）：应急单预期执行日 = 交易日历导航的
+    下一个交易日（on-or-after 自然次日）。
 
-    周五盘后扫描此前给 run_date=周六：周一 09:14 failsafe 按 run_date==today
-    查不到该单、confirm 跨日闸（run_date>=today 放行）同样拒——自愈只剩 stuck
-    计数+周一重扫，连续跌停退出晚 3 天。周六/周日顺延到周一；法定节假日仍由
-    premarket"run_date=今天才执行"语义自然顺延（维持原已知限制：盘后时刻节后
-    首个交易日未必已入日历缓存，不引入交易日历依赖）。
+    P2③ 修好周末（周五盘后 run_date=周六 → 周一 09:14 failsafe 按
+    run_date==today 查不到、confirm 跨日闸同样拒）后仍有节假日死穴：
+    09-24（周四，中秋前最后交易日）盘后按周末口径给 run_date=09-25（休市），
+    次日无任何节点消费该单。现改用 repo.next_trading_date 导航，run_date 恒为
+    真交易日——跨日闸/failsafe 的 run_date==today 查询语义未动、自洽（盘前
+    跑在交易日，与恒为交易日的 run_date 恒可相遇）。表空 repo 内置降级周末
+    口径（行为同修复前）；日历覆盖末端（返回 None）回退周末顺延循环，行为
+    不劣于修复前。
     """
+    # now+1d 须收敛为 date 再入 repo：datetime 是 date 子类，repo._as_date 原样
+    # 放行，isoformat 带时刻（"...T15:30:00"）会使 on-or-after 字符串比较漏掉
+    # "次日恰为交易日"的命中（10-08 盘后会错跳到 10-12）
+    nd = repo.next_trading_date(conn, (now + timedelta(days=1)).date())
+    if nd is not None:
+        return nd
     d = now + timedelta(days=1)
     while d.weekday() >= 5:
         d += timedelta(days=1)
@@ -195,10 +205,10 @@ def run_postclose_scan(conn: Optional[sqlite3.Connection] = None,
         from data.fetcher import get_conn
         c = get_conn()
     now = now or datetime.now()
-    # run_date = 预期执行日（P2③：自然日次日遇周末顺延到周一；跨日闸门按
-    # run_date==today 放行，节假日场景由 premarket 兜底的"run_date=今天才执行"
-    # 语义自然顺延）
-    run_date = run_date or _next_exec_date(now)
+    # run_date = 预期执行日（D-0c：交易日历导航，跳过周末与法定节假日，
+    # run_date 恒为真交易日——中秋 09-24 盘后扫描给 09-28 而非休市的 09-25；
+    # 跨日闸/failsafe 按 run_date==today 放行的查询语义未动，自洽）
+    run_date = run_date or _next_exec_date(c, now)
     try:
         # W-A4②：盘后自拉实时快照（腾讯/东财盘后仍可取，postclose 无现成快照可复用）
         # ——live_quotes 供条件②封单比；price/prev_close 供条件①现价校验与跌停价
