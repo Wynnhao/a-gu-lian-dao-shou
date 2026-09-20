@@ -3,7 +3,9 @@
 施工方案：docs/概念轮动与周期因子施工方案-2026-09-19.md §3.R1。
 纯离线研究：只读 market.db（uri mode=ro），不写任何库表；本脚本 gate pass
 才允许进 R2 生产化，fail 即归档结题。运行：.venv/bin/python3 -m signals.rotation
-退出码：0=pass，1=fail（供未来 CI 挂门）。
+退出码（2026-09-21 三态出口，D-3 增补）：0=pass，1=fail（有分辨率但判据为负），
+3=INSUFFICIENT-DATA（Gate0 分辨率前置未过——无分辨率未裁决，挂起，不进 PASS/FAIL
+二元；三件套判据数字零改动）。
 
 预注册口径（与 2026-09-19 实测一致，跑后不许挪）：
 - 概念日收益：组内 close_qfq 日收益等权平均；当日组内 >=6 只有数据才计，否则 NaN。
@@ -47,6 +49,21 @@ SEG_DEFS = {
     "2025H2": ("2025-07-01", "2025-12-31"),
     "2026": ("2026-01-01", "2026-12-31"),
 }
+
+# ---- Gate0 分辨率前置（三态出口；2026-09-21 修复批 D-3 增补，不在 2026-09-19 预注册内）----
+# 依据：docs/多agent全库审查报告-2026-09-21.md P0-C（归档账本二元出口把"测不了"记成
+# "没过"）+ docs/修复施工方案-2026-09-21.md D-3。白名单非空月/信号数不足时信号腿与
+# 基线腿几乎逐月同腿，年化超额比较趋近 0/0，任何阈值下必 FAIL——与"有分辨率但策略
+# 无效"不可区分。低于任一下限 → 结论 INSUFFICIENT-DATA（无分辨率未裁决，挂起并登记
+# 数据条件），进程退出码 3，不进 PASS/FAIL 二元；下方三件套判据（① +5% ② 2/3 段
+# ③ MDD 2pp）与全部预注册数字零改动。
+# 下限取值：原 R1 预注册无分辨率下限 → 取保守值（白名单非空月>=3、去重信号数>=3，
+# 量级参照 hedge_pair_research Gate H0「月桶中位>=3」），两常量均【待预注册复核】，
+# 复核冻结前仅作挂起判定、不参与 PASS/FAIL。
+GATE0_MIN_WL_MONTHS = 3     # 白名单非空月下限（保守值，待预注册复核）
+GATE0_MIN_SIGNALS = 3       # 去重后信号数下限（保守值，待预注册复核）
+INSUFFICIENT_DATA = "INSUFFICIENT-DATA"   # 三态第三态：无分辨率未裁决（挂起）
+EXIT_INSUFFICIENT = 3                     # INSUFFICIENT-DATA 退出码（0=pass/1=fail/3=挂起）
 
 
 def _connect_ro() -> sqlite3.Connection:
@@ -150,6 +167,19 @@ def momentum_picks(cret: pd.DataFrame) -> dict:
     return picks
 
 
+def gate0_resolution(n_wl_months: int, n_signals: int) -> dict:
+    """Gate0 分辨率前置（2026-09-21 D-3 增补；rotation_x X1/X2 复用同一判据）。
+
+    白名单非空月与去重信号数双下限（常量见 GATE0_*，待预注册复核）：任一不足 →
+    ok=False，调用方以 INSUFFICIENT-DATA / 退出码 3 收场，不得进三件套 PASS/FAIL
+    裁决。本函数只做挂起判定，不改变任何预注册判据。
+    """
+    ok = (n_wl_months >= GATE0_MIN_WL_MONTHS
+          and n_signals >= GATE0_MIN_SIGNALS)
+    return {"ok": ok, "n_wl_months": n_wl_months, "n_signals": n_signals,
+            "min_wl_months": GATE0_MIN_WL_MONTHS, "min_signals": GATE0_MIN_SIGNALS}
+
+
 def build_desired(cret: pd.DataFrame, picks: dict, sigs: list, test_start: str,
                   mode: str) -> dict:
     """每日目标腿。mode: cash / equal / mom / strat。信号窗口最新触发者优先。"""
@@ -222,8 +252,10 @@ def main() -> int:
     cret = concept_returns()
     whitelists = monthly_whitelists(cret)
     if not whitelists:
-        print("FAIL: 无任何月份满足 250 日白名单重估窗口")
-        return 1
+        # 语义合一（D-3）：无任何月份满足重估窗 = 无分辨率，原「FAIL」改记挂起态
+        print("INSUFFICIENT-DATA: 无任何月份满足 250 日白名单重估窗口"
+              "（无分辨率未裁决，挂起）")
+        return EXIT_INSUFFICIENT
     test_start = min(whitelists) + "-01"
     picks = momentum_picks(cret)
     sigs = generate_signals(cret, whitelists)
@@ -238,6 +270,18 @@ def main() -> int:
     print(f"信号数: {len(sigs)}")
     for t0, a, b in sigs:
         print(f"  {t0}  {a} 跌 → {b}")
+
+    # ---- Gate0 分辨率前置（2026-09-21 D-3 增补；先行短路，不过不进三件套裁决）----
+    g0 = gate0_resolution(len(wl_months), len(sigs))
+    if not g0["ok"]:
+        print("\n== Gate0 分辨率前置 ==")
+        print(f"  白名单非空月 {g0['n_wl_months']}（下限 {g0['min_wl_months']}）、"
+              f"去重信号 {g0['n_signals']}（下限 {g0['min_signals']}）→ 分辨率不足")
+        print("  登记数据条件：需更多非空白名单月与信号（外部概念指数全史复测须另立"
+              "预注册批次，多重检验红线）；下限常量待预注册复核")
+        print(f"\nVERDICT: {INSUFFICIENT_DATA}（无分辨率未裁决，挂起——不进 PASS/FAIL"
+              f" 二元；三件套判据数字零改动）")
+        return EXIT_INSUFFICIENT
 
     legs = {}
     info = {}

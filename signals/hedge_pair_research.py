@@ -5,7 +5,9 @@
 sqlite3.connect("file:...market.db?mode=ro", uri=True) 只读，不写任何库表；
 gate fail 即归档该线，禁止调参/换口径重跑，再评估须另立新预注册批次。
 运行：.venv/bin/python3 -m signals.hedge_pair_research
-退出码：0=pass，1=fail（供 CI 挂门）。
+退出码（2026-09-21 三态出口，D-3 增补；见文末增补节）：0=pass，1=fail（有分辨率但
+判据为负），3=INSUFFICIENT-DATA（Gate H0 分辨率不足——无分辨率未裁决，挂起，不进
+PASS/FAIL 二元；H0 60/3 与 H1~H3 判据数字零改动）。
 
 ================================================================================
 §3.2 批次 1 · 对冲配对尾盘口径研究批（预注册 gate）—— 原文逐字冻结
@@ -82,6 +84,19 @@ gate fail 即归档该线，禁止调参/换口径重跑，再评估须另立新
     日信号腿目标 − 底仓目标，r 用 ffill 价格收益（停牌 0）；不含成本与漂移二阶项。
 12. 当期稳定配对清单：生效月 = 数据末日所在月，其白名单 = 截至上月末 250 日窗重估结果；
     落盘 logs/reports/hedge_pairs_current.json（运行时产物，不入仓）+ 报告全文披露。
+
+================================================================================
+Gate H0 三态出口增补（2026-09-21 修复批 D-3；上方 §3.2 预注册原文与消歧 1~12 逐字不动）
+================================================================================
+依据：docs/多agent全库审查报告-2026-09-21.md P0-C + docs/修复施工方案-2026-09-21.md
+D-3（二元出口把"测不了"记成"没过"）。本批只改结果标签与退出码，判据数字零改动：
+- Gate H0 的 60/3 分辨率判据原样保留（gate_h0 谓词与常量未动）；H0 不足 → 结论由
+  「判"无分辨率"直接 FAIL」更正为 **INSUFFICIENT-DATA（无分辨率未裁决，挂起并登记
+  数据条件）**，进程退出码 3，不进 PASS/FAIL 二元；H1~H3 照旧不做超额归因裁决。
+- H0 达标时 H1~H3 判据路径与退出码 0/1 零改动。
+- 「无任何月份满足 250 日重估窗」短路同改 INSUFFICIENT-DATA/退出码 3（语义合一）。
+- 2026-09-20 归档 FAIL 原文（触发 15<60、月桶中位 0.0<3）保留不改；本增补仅约束
+  本脚本此后运行的结论标签（策略库 §10.4 归档原文不动）。
 """
 from __future__ import annotations
 
@@ -100,7 +115,8 @@ BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
-from signals.rotation import SEG_DEFS, metrics, seg_total  # noqa: E402  同源指标
+from signals.rotation import (INSUFFICIENT_DATA, EXIT_INSUFFICIENT, SEG_DEFS,  # noqa: E402
+                              metrics, seg_total)  # 同源指标 + 三态出口常量（D-3）
 
 DB_PATH = BASE / "data" / "market.db"
 CONFIG_PATH = BASE / "config.json"
@@ -443,6 +459,20 @@ def gate_h0(triggers: list, test_months: list) -> dict:
     return {"ok": ok, "n_triggers": len(triggers), "median": med, "counts": counts}
 
 
+def three_state_verdict(h0_ok: bool, gates: dict) -> tuple:
+    """三态裁决（2026-09-21 D-3 增补）：返回 (label, exit_code)。
+
+    - H0 无分辨率 → (INSUFFICIENT-DATA, 3)：挂起，不进 PASS/FAIL 二元（60/3 判据
+      数字零改动）；
+    - H0 达标且判据全过 → ("PASS", 0)；H0 达标但任一 gate 未过 → ("FAIL", 1)
+      （原 H1~H3 判据路径不变）。
+    """
+    if not h0_ok:
+        return (INSUFFICIENT_DATA, EXIT_INSUFFICIENT)
+    ok = all(gates.values())
+    return ("PASS" if ok else "FAIL", 0 if ok else 1)
+
+
 def gate_excess(r_sig: pd.Series, r_base: pd.Series) -> dict:
     """H1/H2/H3 数字：年化超额（算术差）、三段简单收益差、MDD 差。"""
     _, ann_s, mdd_s = metrics(r_sig)
@@ -505,8 +535,10 @@ def main() -> int:
 
     whitelists = monthly_pair_whitelists(ret)
     if not whitelists:
-        print("FAIL: 无任何月份满足 250 日配对白名单重估窗口")
-        return 1
+        # 语义合一（D-3）：无任何月份满足重估窗 = 无分辨率，原「FAIL」改记挂起态
+        print("INSUFFICIENT-DATA: 无任何月份满足 250 日配对白名单重估窗口"
+              "（无分辨率未裁决，挂起）")
+        return EXIT_INSUFFICIENT
     test_month0 = min(whitelists)
     test_start = test_month0 + "-01"
     test_days = [d for d in panel_days if d >= test_start]
@@ -562,7 +594,9 @@ def main() -> int:
 
     gates = {"H0": h0["ok"]}
     if not h0["ok"]:
-        print("  → 判「无分辨率」直接 FAIL，不做超额归因（H1~H3 未裁决）")
+        # 三态出口（D-3）：原「判「无分辨率」直接 FAIL」改记挂起态（判据数字零改动）
+        print("  → 判「无分辨率」→ INSUFFICIENT-DATA（挂起，不进 PASS/FAIL 二元；"
+              "H1~H3 未裁决）")
     else:
         ex = gate_excess(r_sig, r_base)
         print(f"\n== Gate H1~H3（对照受控 momentum 基线腿）==")
@@ -650,10 +684,15 @@ def main() -> int:
         ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"  落盘: {REPORT_JSON}")
 
-    ok = all(gates.values())
+    # ---- 三态裁决（D-3）：H0 无分辨率 → INSUFFICIENT-DATA/3；否则原 PASS/FAIL 路径 ----
+    label, code = three_state_verdict(h0["ok"], gates)
     print(f"\nGate: {gates}")
-    print(f"VERDICT: {'PASS' if ok else 'FAIL'}")
-    return 0 if ok else 1
+    if label == INSUFFICIENT_DATA:
+        print(f"VERDICT: {label}（Gate H0 无分辨率未裁决——挂起，不进 PASS/FAIL 二元；"
+              f"60/3 判据数字零改动；登记数据条件：去重触发 >=60 且月桶中位 >=3）")
+    else:
+        print(f"VERDICT: {label}")
+    return code
 
 
 if __name__ == "__main__":

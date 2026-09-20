@@ -14,12 +14,21 @@ signals/rotation_x.py 的纯函数。
 - evaluate_gate 三件套判据（① +5% ② 2/3 段 ③ MDD 2pp）逐条与 rotation.metrics 手算一致；
 - X2 组收益引擎：等权 + MIN_MEMBERS=6 门槛（不足 6 只有数据当日 = NaN，整组全 NaN 剔除）；
 - fetch_sw_members：假 akshare 装配映射（zfill/行业聚合/覆盖统计）+ 接口失败 →
-  RuntimeError 阻断（不重试不换源）。
+  RuntimeError 阻断（不重试不换源）；
+- D-3 三态出口（2026-09-21）：Gate0 分辨率前置 + INSUFFICIENT-DATA/退出码 3——
+  rotation.main() 用 tmp sqlite（合成 daily_bar）+ tmp config 全合成端到端驱动，
+  正例（数据足 → 原三件套判据路径不变，exit 0/1）与反例（数据不足 → exit 3）各一；
+  rotation_x.aggregate_exit / macro_ratio.gate0_resolution 纯函数矩阵（零 DB 零网络）。
 """
+import io
+import json
 import os
+import sqlite3
 import sys
+import tempfile
 import types
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +40,7 @@ if str(BASE) not in sys.path:
 
 from signals import rotation as r1  # noqa: E402
 from signals import rotation_x as rx  # noqa: E402
+from signals import macro_ratio_research as mr  # noqa: E402  Gate0 纯函数（D-3）
 
 os.environ.setdefault("AGSICKLE_DISABLE_LIVE_QUOTES", "1")
 
@@ -241,6 +251,155 @@ class TestFetchSwMembers(unittest.TestCase):
         with self.assertRaises(RuntimeError) as cm:
             rx.fetch_sw_members(codes=["600519"], sleep_s=0.0)
         self.assertIn("在线取数失败", str(cm.exception))
+
+
+# ---------------- D-3 三态出口（Gate0 分辨率前置 + INSUFFICIENT-DATA/exit 3） ----------------
+
+def _build_rotation_fixture(tmp_dir: Path, n_days: int, switch_day: int) -> tuple:
+    """合成 market.db + config.json（写入 tmp，绝不碰生产库/config）。
+
+    两组各 6 成员（满足 MIN_MEMBERS=6），组内成员同价 → 组日收益 = 单序列：
+    GA 恒 +0.5%/−1.0% 交替（< −0.8% 的日子触发信号），GB 前段与 GA 正相关、
+    第 switch_day 根 bar 起反号（corr=±1），使白名单只可能出现在后段。
+    返回 (db_path, cfg_path)。"""
+    dates = pd.bdate_range("2024-01-01", periods=n_days).strftime("%Y-%m-%d")
+    r_a = np.array([0.005 if i % 2 == 0 else -0.010 for i in range(n_days)])
+    signs = np.array([+1.0 if i < switch_day else -1.0 for i in range(n_days)])
+    pa = 100.0 * np.cumprod(1.0 + r_a)
+    pb = 100.0 * np.cumprod(1.0 + r_a * signs)
+    db = tmp_dir / "market.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("CREATE TABLE daily_bar (code TEXT, trade_date TEXT, close_qfq REAL)")
+        rows = []
+        for j, d in enumerate(dates):
+            for k in range(6):
+                rows.append((f"CA{k}", d, float(pa[j])))
+                rows.append((f"CB{k}", d, float(pb[j])))
+        conn.executemany("INSERT INTO daily_bar VALUES (?,?,?)", rows)
+        conn.commit()
+    finally:
+        conn.close()
+    cfg = tmp_dir / "config.json"
+    wl = ([{"code": f"CA{k}", "name": f"CA{k}", "concepts": ["GA"]} for k in range(6)]
+          + [{"code": f"CB{k}", "name": f"CB{k}", "concepts": ["GB"]} for k in range(6)])
+    cfg.write_text(json.dumps({"watchlist": wl}), encoding="utf-8")
+    return db, cfg
+
+
+class TestGate0ThreeState(unittest.TestCase):
+    """D-3（P0-C）：Gate0 分辨率前置——数据不足 → INSUFFICIENT-DATA + 退出码 3，
+    不进 PASS/FAIL 二元；数据足 → 原三件套判据路径不变。判据/阈值数字零改动。"""
+
+    def _patch_rotation_paths(self, n_days: int, switch_day: int):
+        tmp = Path(tempfile.mkdtemp(prefix="agsickle_gate0_test_"))
+        db, cfg = _build_rotation_fixture(tmp, n_days, switch_day)
+        saved = (r1.DB_PATH, r1.CONFIG_PATH)
+        r1.DB_PATH, r1.CONFIG_PATH = db, cfg
+        self.addCleanup(lambda: (setattr(r1, "DB_PATH", saved[0]),
+                                 setattr(r1, "CONFIG_PATH", saved[1])))
+
+    def test_gate0_helper_and_constants(self):
+        """纯函数正反例 + 红线自查（三态常量与既有预注册判据数字零改动）。"""
+        ok = r1.gate0_resolution(10, 43)               # 数据足（10 非空月/43 信号）
+        self.assertTrue(ok["ok"])
+        bad = r1.gate0_resolution(1, 2)                # 镜像归档 R1：1/20 月非空、2 信号
+        self.assertFalse(bad["ok"])
+        zero_sig = r1.gate0_resolution(20, 0)          # 非空月足但零信号 → 仍无分辨率
+        self.assertFalse(zero_sig["ok"])
+        self.assertEqual(r1.INSUFFICIENT_DATA, "INSUFFICIENT-DATA")
+        self.assertEqual(r1.EXIT_INSUFFICIENT, 3)
+        # 判据数字红线：Gate0 增补不得动原预注册参数
+        self.assertEqual(r1.TRIGGER_THR, -0.008)
+        self.assertEqual(r1.RHO_250_THR, -0.15)
+        self.assertEqual(r1.RHO_60_THR, -0.20)
+        self.assertEqual(r1.COST_PER_SWITCH, 0.001)
+
+    def test_rotation_main_insufficient_exits_3(self):
+        """反例（合成触发 exit 3）：白名单 1 个月非空 + 2 信号（归档 R1 同款分辨率形态）
+        → INSUFFICIENT-DATA / 退出码 3，且不进三件套裁决（无 Gate 行）。"""
+        self._patch_rotation_paths(n_days=400, switch_day=197)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = r1.main()
+        out = buf.getvalue()
+        self.assertEqual(rc, 3)
+        self.assertIn("INSUFFICIENT-DATA", out)
+        self.assertIn("Gate0 分辨率前置", out)
+        self.assertNotIn("Gate（对照 MOM 基线③", out)   # 未进原判据路径
+        # fixture 形态自检：确为 1 非空月 / 2 信号（镜像归档 R1）
+        cret = r1.concept_returns()
+        wl = r1.monthly_whitelists(cret)
+        self.assertEqual(len([v for v in wl.values() if v]), 1)
+        self.assertEqual(len(r1.generate_signals(cret, wl)), 2)
+
+    def test_rotation_main_sufficient_keeps_original_gate_path(self):
+        """正例：10 非空月 / 43 信号 → Gate0 通过 → 进原三件套判据（两腿近同 → ①0%
+        <+5% FAIL）→ 退出码 1（非 3），判据路径与归档口径一致。"""
+        self._patch_rotation_paths(n_days=560, switch_day=160)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = r1.main()
+        out = buf.getvalue()
+        self.assertEqual(rc, 1)
+        self.assertIn("Gate（对照 MOM 基线③", out)      # 原判据路径照常裁决
+        self.assertIn("VERDICT: FAIL", out)
+        self.assertNotIn("INSUFFICIENT-DATA", out)
+
+    def test_rotation_x_run_x1_insufficient_state(self):
+        """run_x1 在分辨率不足的同一合成数据上返回 INSUFFICIENT-DATA 态（不再 FAIL）。"""
+        self._patch_rotation_paths(n_days=400, switch_day=197)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            state = rx.run_x1()
+        self.assertEqual(state, r1.INSUFFICIENT_DATA)
+        self.assertIn("X1 VERDICT: INSUFFICIENT-DATA", buf.getvalue())
+        self.assertIn("Gate0 分辨率前置", buf.getvalue())
+
+    def test_aggregate_exit_matrix(self):
+        """两轴三态聚合：FAIL 强于挂起（exit 1），挂起 exit 3，全 PASS exit 0。"""
+        ins = r1.INSUFFICIENT_DATA
+        self.assertEqual(rx.aggregate_exit(["PASS", "PASS"]), 0)
+        self.assertEqual(rx.aggregate_exit(["PASS", "FAIL"]), 1)
+        self.assertEqual(rx.aggregate_exit(["FAIL", ins]), 1)
+        self.assertEqual(rx.aggregate_exit(["PASS", ins]), 3)
+        self.assertEqual(rx.aggregate_exit([ins, ins]), 3)
+
+    def test_rotation_x_main_exit3_via_state_injection(self):
+        """端到端 exit 3：run_x1/run_x2 注入挂起态 → main() 返回 3（零 DB 零网络）。"""
+        saved = (rx.run_x1, rx.run_x2)
+        rx.run_x1 = lambda: r1.INSUFFICIENT_DATA
+        rx.run_x2 = lambda: r1.INSUFFICIENT_DATA
+
+        def _restore():
+            rx.run_x1, rx.run_x2 = saved
+        self.addCleanup(_restore)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = rx.main()
+        self.assertEqual(rc, 3)
+        self.assertIn(f"X1={r1.INSUFFICIENT_DATA}", buf.getvalue())
+        # 对照：混入 FAIL 轴仍 exit 1（FAIL 强于挂起）
+        rx.run_x1, rx.run_x2 = saved
+        rx.run_x1 = lambda: "FAIL"
+        rx.run_x2 = lambda: r1.INSUFFICIENT_DATA
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            self.assertEqual(rx.main(), 1)
+
+    def test_macro_gate0_resolution(self):
+        """M1 Gate0（events 版）：任一比值两 horizon 事件数均达下限才可裁决。"""
+        self.assertTrue(mr.gate0_resolution(
+            {"铜油比": {"n20": 300, "n60": 280}})["ok"])
+        self.assertFalse(mr.gate0_resolution(
+            {"铜油比": {"n20": 100, "n60": 280}})["ok"])   # n20 不足 → 挂起
+        # 油金比不足但铜油比足 → 至少一个比值可裁决 → 整体 ok
+        self.assertTrue(mr.gate0_resolution(
+            {"铜油比": {"n20": 300, "n60": 300},
+             "油金比": {"n20": 10, "n60": 10}})["ok"])
+        self.assertEqual(mr.INSUFFICIENT_DATA, "INSUFFICIENT-DATA")
+        self.assertEqual(mr.EXIT_INSUFFICIENT, 3)
+        self.assertEqual(mr.GATE0_MIN_EVENTS, 250)          # 保守值常量在位（待预注册复核）
 
 
 if __name__ == "__main__":

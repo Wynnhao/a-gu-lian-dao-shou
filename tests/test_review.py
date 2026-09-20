@@ -813,5 +813,48 @@ def test_profile_verdict_compat_with_weekly():
         conn.close()
 
 
+def test_profile_verdict_abstain_reason_corrected_2c():
+    """2c（2026-09-21 P0-B 复核）：A/D 弃权理由不得再引用已失实的「momentum 无 signal
+    表 score 行」——momentum 在 signal 表有 score 行（生产只读实测 55,418 行），维持
+    弃权的真实原因 = v1.4「B+C 两维」框架设计。理由文本必须带更正标注，且本更正不改
+    投票逻辑（verdict/votes 字段语义与既有用例一致）。"""
+    from review import signal_eval
+    bt = _write_bt(_Path(tempfile.mkdtemp()),
+                   cur_ann=0.30, alt_ann=0.30,     # B gap=0 → 不投（基准 0.1169）
+                   cur_mdd=-0.10, alt_mdd=-0.25)   # C 维 v2 取中位 -0.175 → gap=+7.5pp 不投；红线不触发
+    conn = make_conn()
+    old = os.environ.get("AGSICKLE_SIGNALS_PROFILE")
+    os.environ["AGSICKLE_SIGNALS_PROFILE"] = "momentum"
+    try:
+        # 种 momentum score 行（生产形态：momentum 有 score 行 → 旧理由失实）
+        for i in range(5):
+            conn.execute(
+                "INSERT OR REPLACE INTO signal (code, as_of, signals, score, profile)"
+                " VALUES (?,?,?,?,?)",
+                (f"60000{i}", f"2026-09-0{i + 1}", "{}", 0.5 + i, "momentum"))
+        conn.commit()
+        v = signal_eval.profile_verdict(conn, bt_path=bt)
+        # 旧失实文案必须消失
+        assert "无 signal 表 score 行，A/D 仅 current 可算" not in v["abstain_reason"], \
+            v["abstain_reason"]
+        assert "A/D 因 momentum 无 signal 行弃权" not in v["note"], v["note"]
+        # 新文案：框架设计定性 + 动态 score 行数 + 更正标注
+        assert "框架设计，非数据缺失" in v["abstain_reason"], v["abstain_reason"]
+        assert "score 行 5 行" in v["abstain_reason"], v["abstain_reason"]
+        assert "2026-09-21 复核更正" in v["abstain_reason"], v["abstain_reason"]
+        assert "已于 2026-09-21 复核证伪" in v["note"], v["note"]
+        # 投票逻辑零变化：B/C 双不投 → keep、无弃权维度
+        assert v["verdict"] == "keep", v["verdict"]
+        assert v["abstains"] == [], v["abstains"]
+        assert v["votes"]["votes_switch"] == 0, v["votes"]
+    finally:
+        conn.close()
+        if old is None:
+            os.environ.pop("AGSICKLE_SIGNALS_PROFILE", None)
+        else:
+            os.environ["AGSICKLE_SIGNALS_PROFILE"] = old
+        _restore_env()
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())

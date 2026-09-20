@@ -29,6 +29,11 @@ if str(BASE) not in sys.path:
 MIN_SAMPLES = 100
 FACTORS = ("mom_5d", "mom_20d", "atr_pct", "turnover_pct", "turn20", "rsi_14")
 HORIZONS = (1, 5, 10)
+# P1-8（批次3b，2026-09-21）：回测宇宙守卫阈值——最新交易日有 bar 的宇宙票数
+# 低于该值时 B/C 判据弃权（verdict 不产 switch/keep）。审查实测 730/816 票最新
+# bar 停在 09-11/09-14、全库仅 86 票每日更新：断粮宇宙上跑出的 B/C 数字
+# "判据形式有效实质不可执行"。**300 为建议值，待用户拍板**（施工方案 §5.3）。
+VERDICT_MIN_UNIVERSE = 300
 # profile 切换判据（v1.4 起：B+C 两维投票 + MDD 红线 override；A/D 弃权）
 # 见 docs/决策策略与工作流.md §7 与 docs/优化修复纪要.md Sprint 1 验收条目
 IC_KEEP = 0.02          # 旧 IC 单维判据，保留常量供历史 verdict 对照，不参与 v1.4 投票
@@ -197,6 +202,21 @@ OTHER_PROFILES = {
 }
 
 
+def _universe_fresh_codes(conn: sqlite3.Connection) -> int:
+    """最新交易日有 bar 的宇宙票数（P1-8 断粮度量，批次3b 守卫用）。
+
+    用 `COUNT(DISTINCT code) WHERE trade_date = MAX(trade_date)` 而非全库 distinct：
+    停更票永远留在 daily_bar 里，全库计数对断粮不敏感（实测全库 816、最新交易日
+    仅 86）。空表/查询异常返回 0（0 视为"无数据"而非"断粮"，走原路径——空库
+    场景由 MIN_SAMPLES 等既有样本不足标注兜底）。"""
+    try:
+        return int(conn.execute(
+            "SELECT COUNT(DISTINCT code) FROM daily_bar WHERE trade_date ="
+            " (SELECT MAX(trade_date) FROM daily_bar)").fetchone()[0])
+    except sqlite3.Error:
+        return 0
+
+
 def profile_verdict(conn: sqlite3.Connection, bt_path=None) -> dict:
     """profile 切换判据（v1.5：B+C 两维投票 ≥1 票即建议 + MDD 红线 override；不自动切）。
 
@@ -211,6 +231,12 @@ def profile_verdict(conn: sqlite3.Connection, bt_path=None) -> dict:
       C = MDD                    —— 同 B
       D = 五分位多空价差 Q4-Q0    —— 同 A，弃权
 
+      【2026-09-21 复核更正（P0-B / 修复批 2c）】A/D 弃权理由「momentum 无 signal 表
+      score 行」已失实——只读核实（file:...market.db?mode=ro）momentum 在 signal 表有
+      55,418 行 score（2024-01-02~2026-09-17），A/D 读数（factor_ic / score_quintiles）
+      在 evaluate() 输出中照常计算与披露。A/D 维持不参与投票的原因仅为 v1.4「B+C 两维」
+      框架设计本身（非数据缺失），弃权待人工复议；本更正不改投票逻辑与 verdict 行为。
+
     备选（Fix-5）：OTHER_PROFILES[prof] 枚举；备选多于一票时 B/C 各取备选中
     较优者作为对比基准（B 取年化超额最高者，C 取 MDD 最接近 0 者）。
 
@@ -222,6 +248,10 @@ def profile_verdict(conn: sqlite3.Connection, bt_path=None) -> dict:
 
     红线 override：C_cur < −30% → verdict=hold（无条件），并写 risk_event 一条
     （rule='profile_verdict_red_line'，同日去重）。
+
+    P1-8 宇宙守卫（批次3b）：最新交易日有 bar 的宇宙票数 N 满足 0<N<VERDICT_MIN_UNIVERSE
+    （300，待拍板）→ B/C 判据弃权（abstains 增 INSUFFICIENT-UNIVERSE 条目，
+    verdict=hold，不产 switch/keep；B/C 数字照常透出，红线 override 不受影响）。
 
     只输出建议——切换需人工确认后改 config.signals.profile 并留痕
     （docs/决策策略与工作流.md §7 v1.5），不做自动切换。
@@ -292,12 +322,24 @@ def profile_verdict(conn: sqlite3.Connection, bt_path=None) -> dict:
     if C_cur is None or C_alt is None:
         abstains.append("C (MDD)")
 
-    if B_cur is not None and B_alt is not None:
+    # ---- P1-8 宇宙守卫（批次3b）：0 < 最新交易日票数 < VERDICT_MIN_UNIVERSE → 判据弃权 ----
+    # 弃权语义：B/C 数字出自断粮宇宙，判据不产 switch/keep（verdict=hold），
+    # 但 B/C 数字照常透出供人工参考；红线 override 不受影响（存档产物的客观披露）。
+    uni_n = _universe_fresh_codes(conn)
+    universe_insufficient = 0 < uni_n < VERDICT_MIN_UNIVERSE
+    if universe_insufficient:
+        abstains.append(
+            "universe (INSUFFICIENT-UNIVERSE: 回测宇宙断粮——最新交易日仅 %d 票有 bar "
+            "< 守卫阈值 %d，B/C 判据弃权；阈值待用户拍板)" % (uni_n, VERDICT_MIN_UNIVERSE))
+        log.warning("profile_verdict: 宇宙守卫触发（最新交易日 %d 票 < %d），B/C 判据弃权",
+                    uni_n, VERDICT_MIN_UNIVERSE)
+
+    if B_cur is not None and B_alt is not None and not universe_insufficient:
         b_gap = B_cur - B_alt
         b_vote_switch = b_gap < B_GAP_SWITCH
     else:
         b_vote_switch = False
-    if C_cur is not None and C_alt is not None:
+    if C_cur is not None and C_alt is not None and not universe_insufficient:
         c_gap_better = (C_cur - C_alt) < -C_GAP_SWITCH  # 当前比备选更负 → 投切换
     else:
         c_gap_better = False
@@ -320,6 +362,11 @@ def profile_verdict(conn: sqlite3.Connection, bt_path=None) -> dict:
     # 置信度标注（v1.5）：2/2 → high；1/2 → low（提示人工复核权重）
     confidence = {2: "high", 1: "low"}.get(votes_switch, None)
 
+    # ---- A/D 维只读重算（2026-09-21 复核 2c）：读数照常计算并披露，供人工复议 ----
+    # factor_ic 按 _signal_frame（当前 profile）取数——momentum 现有 score 行，
+    # 「无 score 行」的旧弃权理由已失实（P0-B）；samples 数随 verdict 一并透出。
+    ic_pack = factor_ic(conn)
+
     # W-D6 承接 W-C3：红线数字引用必须带数据版本（bundle 读 backtest_generated_at/
     # data_version；缺失时 bundle 按"数据版本未知"渲染）。兼容两种产物形态：
     # 顶层平铺键或 W-D6⑦ 的 metadata 块
@@ -341,14 +388,26 @@ def profile_verdict(conn: sqlite3.Connection, bt_path=None) -> dict:
             "c_gap_switch": C_GAP_SWITCH,
         },
         "votes": {
-            "b_switch": b_vote_switch if B_cur is not None and B_alt is not None else None,
-            "c_switch": c_gap_better if C_cur is not None and C_alt is not None else None,
+            "b_switch": (b_vote_switch if (B_cur is not None and B_alt is not None
+                                           and not universe_insufficient) else None),
+            "c_switch": (c_gap_better if (C_cur is not None and C_alt is not None
+                                          and not universe_insufficient) else None),
             "votes_switch": votes_switch,
             "votes_total": votes_total,
         },
+        # P1-8 宇宙守卫透出：insufficient=True 时 verdict 必为 hold（判据弃权）
+        "universe": {"codes_on_latest": uni_n, "min_required": VERDICT_MIN_UNIVERSE,
+                     "insufficient": universe_insufficient},
         "abstains": abstains,
-        "abstain_reason": ("momentum 无 signal 表 score 行，A/D 仅 current 可算"
-                           if "A" not in abstains else None),
+        # 2c（2026-09-21 复核更正）：原理由「momentum 无 signal 表 score 行」已失实
+        # （momentum 现有 55,418 行 score，只读核实）。维持 A/D 不参与投票的真实原因
+        # = v1.4「B+C 两维」框架设计；A/D 读数见 factor_ic/score_quintiles（照算披露）。
+        "abstain_reason": (
+            f"A/D 不参与 v1.4 B+C 投票（框架设计，非数据缺失；当前 profile={prof} "
+            f"signal 表 score 行 {ic_pack.get('samples', 0)} 行"
+            + ("" if ic_pack.get("sufficient") else "（< MIN_SAMPLES，样本不足仅披露）")
+            + "）。2026-09-21 复核更正：原弃权理由「momentum 无 signal 表 score 行」"
+              "已失实（P0-B），A/D 读数照算披露、弃权待人工复议"),
         "B": {"current": B_cur, "alt": B_alt,
               "gap": (B_cur - B_alt) if (B_cur is not None and B_alt is not None) else None},
         "C": {"current": C_cur, "alt": C_alt,
@@ -363,12 +422,14 @@ def profile_verdict(conn: sqlite3.Connection, bt_path=None) -> dict:
                               else _bt_uni),
         "data_version": bt_meta.get("data_version") or _bt_md.get("data_version"),
         "backtest_path": str(bt_path),
-        # 兼容 v1.3 周报消费方：保留旧 IC 单维字段
-        "score_ic_h5": (factor_ic(conn).get("ic") or {}).get("h5", {}).get("score"),
+        # 兼容 v1.3 周报消费方：保留旧 IC 单维字段（ic_pack 见上方 A/D 只读重算注）
+        "score_ic_h5": (ic_pack.get("ic") or {}).get("h5", {}).get("score"),
         "ic_thresholds_v13": {"keep_ge": IC_KEEP, "switch_le": IC_SWITCH},
         "note": ("建议需人工确认后改 config.signals.profile（不自动切换）；"
                  "v1.5 起 ≥1 票即建议 switch（2/2=high、1/2=low，low 提示人工复核权重）；"
-                 "投票仅 B/C 两维有效（A/D 因 momentum 无 signal 行弃权）"),
+                 "投票仅 B/C 两维有效（A/D 不参与投票系 v1.4 框架设计，非数据缺失——"
+                 "原弃权理由 momentum 无 signal 表 score 行 已于 2026-09-21 复核证伪，"
+                 "A/D 读数照算披露、弃权待复议）"),
     }
     return out
 

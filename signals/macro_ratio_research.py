@@ -3,7 +3,9 @@
 施工方案：docs/概念轮动与周期因子施工方案-2026-09-19.md §3.M1。
 纯离线：akshare 拉三源（不写库）+ 只读 market.db（concept_returns 内部 mode=ro）。
 运行：.venv/bin/python3 -m signals.macro_ratio_research
-退出码：0=pass，1=fail（供未来 CI 挂门）。
+退出码（2026-09-21 三态出口，D-3 增补）：0=pass，1=fail（有分辨率但判据为负），
+3=INSUFFICIENT-DATA（Gate0 有效事件不足——无分辨率未裁决，挂起，不进 PASS/FAIL
+二元；检验① |Spearman|>=0.2 与检验② |corr|>0.7 判据数字零改动）。
 
 预注册口径（跑后不许挪）：
 - 比值：铜油比 = 沪铜主力CU0收盘 / 布伦特OIL收盘；油金比 = 布伦特OIL / 黄金收盘。
@@ -29,7 +31,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from signals.rotation import concept_returns
+from signals.rotation import (INSUFFICIENT_DATA, EXIT_INSUFFICIENT,  # noqa: E402
+                              concept_returns)
 
 BASE = Path(__file__).resolve().parent.parent
 
@@ -37,6 +40,26 @@ GROWTH = ["半导体", "AI", "新能源", "苹果", "政策军工"]
 DEFENSE = ["消费", "生物医药", "厄尔尼诺"]
 GATE_COLLINEAR = 0.7
 GATE_SPEARMAN = 0.2
+
+# ---- Gate0 分辨率前置（三态出口；2026-09-21 修复批 D-3 增补，不在 2026-09-19 预注册内）----
+# 依据：docs/多agent全库审查报告-2026-09-21.md P0-C + docs/修复施工方案-2026-09-21.md
+# D-3。原 M1 预注册无样本量下限——三源交集/有效事件不足时 250 日滚动分位无从计算或
+# 仅由窗口边沿决定，属"测不了"而非"FAIL"。有效事件数低于下限 → 结论 INSUFFICIENT-DATA
+# （无分辨率未裁决，挂起并登记数据条件），退出码 3；检验①/② 判据数字零改动。
+# 下限取保守值 250（≈一个完整 250 日滚动分位窗的日事件量），【待预注册复核】。
+GATE0_MIN_EVENTS = 250      # 单比值单 horizon 有效事件数下限（保守值，待预注册复核）
+
+
+def gate0_resolution(events: dict) -> dict:
+    """Gate0（M1 版，2026-09-21 D-3 增补）：events = {比值名: {"n20": n, "n60": n}}。
+
+    任一比值在 20/60 两个 horizon 的有效事件数均达 GATE0_MIN_EVENTS 才可进检验①
+    PASS/FAIL 裁决；否则 ok=False → INSUFFICIENT-DATA / 退出码 3（挂起）。只做挂起
+    判定，不改任何预注册判据。"""
+    per = {name: (v.get("n20", 0) >= GATE0_MIN_EVENTS
+                  and v.get("n60", 0) >= GATE0_MIN_EVENTS)
+           for name, v in events.items()}
+    return {"ok": any(per.values()), "per_ratio": per, "min_events": GATE0_MIN_EVENTS}
 
 
 def _fetch_cu() -> pd.Series:
@@ -126,6 +149,7 @@ def main() -> int:
 
     print("\n== 检验① 分辨率（比值 250 日滚动分位四分桶 × 未来收益）==")
     spear = {}
+    ev_counts = {}   # Gate0：每比值每 horizon 的有效事件数（D-3 增补）
     for rname, series in ratios.items():
         pct = roll_pct(series, 250).reindex(cret.index, method="ffill")
         for n in (20, 60):
@@ -134,6 +158,7 @@ def main() -> int:
                 "g": fwd_ret(growth, n),
                 "d": fwd_ret(defense, n),
             }).dropna()
+            ev_counts.setdefault(rname, {})[f"n{n}"] = int(len(ev))
             ev["bucket"] = pd.cut(ev["pct"], [0, 0.25, 0.5, 0.75, 1.0], labels=False)
             ev["spread"] = ev["g"] - ev["d"]
             gmean = ev.groupby("bucket")["spread"].mean()
@@ -173,8 +198,18 @@ def main() -> int:
                   f"价差 {q.loc[m,'g'].mean() - q.loc[m,'d'].mean():+.2%}")
 
     print("\n== Gate 汇总 ==")
+    # ---- Gate0 分辨率前置（2026-09-21 D-3 增补；未过 → 挂起，不进 PASS/FAIL 二元）----
+    g0 = gate0_resolution(ev_counts)
+    print(f"  Gate0 分辨率前置（有效事件/比值/horizon >= {GATE0_MIN_EVENTS}）: "
+          + ("PASS" if g0["ok"] else
+             f"未过 {ev_counts} → INSUFFICIENT-DATA（挂起）"))
     print(f"  检验① 分辨率: {'PASS' if c1_ok else 'FAIL'}")
     print(f"  检验② 共线性: {'PASS' if c2_ok else 'FAIL'}")
+    if not g0["ok"]:
+        print(f"\nVERDICT: {INSUFFICIENT_DATA}（无分辨率未裁决，挂起——登记数据条件："
+              f"三源交集/有效事件需每比值每 horizon >= {GATE0_MIN_EVENTS}；"
+              f"检验①/② 判据数字零改动）")
+        return EXIT_INSUFFICIENT
     ok = c1_ok and c2_ok
     print(f"\nVERDICT: {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1

@@ -349,5 +349,45 @@ class TestGates(unittest.TestCase):
         self.assertAlmostEqual(ex["mdd_gap"], 0.0, places=12)
 
 
+# ---------------- D-3 三态出口（H0 无分辨率 → INSUFFICIENT-DATA/exit 3） ----------------
+
+class TestThreeStateVerdict(unittest.TestCase):
+    """D-3（P0-C，2026-09-21）：Gate H0 无分辨率 → (INSUFFICIENT-DATA, 3)，不进
+    PASS/FAIL 二元；H0 达标 → 原 H1~H3 判据路径与退出码 0/1 零改动。
+    60/3 判据数字红线由常量断言锁定。"""
+
+    def test_h0_constants_unchanged(self):
+        """判据数字红线：三态出口增补不得动 H0 预注册阈值。"""
+        self.assertEqual(hp.GATE_H0_MIN_TRIGGERS, 60)
+        self.assertEqual(hp.GATE_H0_MIN_MEDIAN, 3)
+        self.assertEqual(hp.GATE_H1_MIN_EXCESS, 0.05)
+        self.assertEqual(hp.GATE_H2_MIN_POS_SEGS, 2)
+        self.assertEqual(hp.GATE_H3_MAX_MDD_GAP, 0.02)
+
+    def test_h0_insufficient_routes_insufficient_data_exit3(self):
+        """反例（合成触发 exit 3）：触发 2<60 → H0 无分辨率 → 挂起态 + 退出码 3。"""
+        months = ["2025-01", "2025-02", "2025-03", "2025-04"]
+        few = [hp.Trigger("2025-01-0%d" % (i + 1), "A", "B") for i in range(2)]
+        h0 = hp.gate_h0(few, months)
+        self.assertFalse(h0["ok"])
+        label, code = hp.three_state_verdict(h0["ok"], {"H0": h0["ok"]})
+        self.assertEqual(label, "INSUFFICIENT-DATA")
+        self.assertEqual(code, 3)
+
+    def test_h0_pass_keeps_original_pass_fail_path(self):
+        """正例：H0 达标（既有 spread 触发集）→ 判据全过 (PASS, 0) / 任一未过
+        (FAIL, 1)——原二元路径不变，不出现挂起态。"""
+        months = ["2025-01", "2025-02", "2025-03", "2025-04"]
+        spread = ([hp.Trigger("2025-0%d-01" % m, "A", "B") for m in (1, 2, 3)
+                   for _ in range(3)]
+                  + [hp.Trigger("2025-04-01", "A", "B") for _ in range(61)])
+        h0 = hp.gate_h0(spread, months)
+        self.assertTrue(h0["ok"])
+        self.assertEqual(hp.three_state_verdict(
+            True, {"H0": True, "H1": True, "H2": True, "H3": True}), ("PASS", 0))
+        self.assertEqual(hp.three_state_verdict(
+            True, {"H0": True, "H1": False, "H2": True, "H3": True}), ("FAIL", 1))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

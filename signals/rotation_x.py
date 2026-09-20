@@ -6,8 +6,10 @@ R1 原文：docs/概念轮动与周期因子施工方案-2026-09-19.md §3.R1（
 **不改 signals/rotation.py（R1 冻结脚本）**，白名单/组收益/触发信号/动量选组逻辑全部
 import 复用。X2 申万映射经 akshare 在线取、只进内存（不落库、不 Mock；失败即阻断上报）。
 运行：.venv/bin/python3 -m signals.rotation_x
-退出码：0 = X1/X2 两轴全过；1 = 任一轴 fail（含 X2 申万映射在线取数被阻断——阻断即
-如实上报并停止该轴，不换非申万源替代、不用硬编码映射）。
+退出码（2026-09-21 三态出口，D-3 增补）：0 = X1/X2 两轴全过；1 = 任一轴 fail（含 X2
+申万映射在线取数被阻断——阻断即如实上报并停止该轴，不换非申万源替代、不用硬编码映射；
+含组收益引擎一致性自检失败）；3 = 无 fail 轴但任一轴 INSUFFICIENT-DATA（Gate0 分辨率
+前置未过——无分辨率未裁决，挂起，不进 PASS/FAIL 二元；三件套判据数字零改动）。
 
 【§3.4 预注册原文（逐字）】
 - X1 尾盘口径轴：R1 白名单规则（ρ_250d < -0.15 且前后半窗同负 且 ρ_60d < -0.20、月度
@@ -138,13 +140,18 @@ def _print_gate(g: dict) -> None:
     print(f"  ③ MDD 差 {g['mdd_gap']:+.2%}  （劣于基线 <=2pp? {'PASS' if g['c3'] else 'FAIL'}）")
 
 
-def run_x1() -> bool:
-    """X1 尾盘口径轴：R1 概念组数据/白名单/信号逐字复用，唯一变更 = 执行与成本框架。"""
+def run_x1() -> str:
+    """X1 尾盘口径轴：R1 概念组数据/白名单/信号逐字复用，唯一变更 = 执行与成本框架。
+
+    返回三态（D-3）："PASS" / "FAIL" / r1.INSUFFICIENT_DATA（Gate0 分辨率前置未过，
+    挂起不裁决）。"""
     cret = r1.concept_returns()
     whitelists = r1.monthly_whitelists(cret)
     if not whitelists:
-        print("X1 FAIL: 无任何月份满足 250 日白名单重估窗口")
-        return False
+        # 语义合一（D-3）：原「X1 FAIL」短路改记挂起态
+        print("X1 INSUFFICIENT-DATA: 无任何月份满足 250 日白名单重估窗口"
+              "（无分辨率未裁决，挂起）")
+        return r1.INSUFFICIENT_DATA
     test_start = min(whitelists) + "-01"
     picks = r1.momentum_picks(cret)
     sigs = r1.generate_signals(cret, whitelists)
@@ -162,6 +169,18 @@ def run_x1() -> bool:
         print(f"  {t0}  {a} 跌 → {b}")
     print(f"成本框架: 每次换腿 {COST_SWITCH_X1:.1%}（换腿 0.1% + 尾盘乐观偏差 0.3%），"
           f"基线同框架")
+
+    # ---- Gate0 分辨率前置（2026-09-21 D-3 增补；判据复用 r1.gate0_resolution）----
+    g0 = r1.gate0_resolution(len(wl_months), len(sigs))
+    if not g0["ok"]:
+        print("\n== Gate0 分辨率前置 ==")
+        print(f"  白名单非空月 {g0['n_wl_months']}（下限 {g0['min_wl_months']}）、"
+              f"去重信号 {g0['n_signals']}（下限 {g0['min_signals']}）→ 分辨率不足")
+        print("  登记数据条件：需更多非空白名单月与信号（另立预注册批次）；"
+              "下限常量待预注册复核")
+        print(f"\nX1 VERDICT: {r1.INSUFFICIENT_DATA}（无分辨率未裁决，挂起——"
+              f"不进 PASS/FAIL 二元；三件套判据数字零改动）")
+        return r1.INSUFFICIENT_DATA
 
     desired_mom = {d: picks.get(d[:7]) for d in cret.index if d >= test_start}
     legs = {}
@@ -197,7 +216,7 @@ def run_x1() -> bool:
         tag = "主口径" if hold == 1 else "变体"
         print(f"T+{hold} 持有({tag}){total:>10.1%}{ann:>9.1%}{mdd:>8.1%}"
               f"{gv['exc_ann']:>9.2%}{sw:>6}")
-    return g["ok"]
+    return "PASS" if g["ok"] else "FAIL"
 
 
 # ---------------------------------------------------------------- X2 行业粒度轴
@@ -270,8 +289,11 @@ def fetch_sw_members(codes=None, sleep_s: float = SW_SLEEP_S) -> tuple:
     return members, stats
 
 
-def run_x2() -> bool:
-    """X2 行业粒度轴：白名单/触发/执行与 R1 逐字相同，唯一变更 = 组成员换申万一级行业。"""
+def run_x2() -> str:
+    """X2 行业粒度轴：白名单/触发/执行与 R1 逐字相同，唯一变更 = 组成员换申万一级行业。
+
+    返回三态（D-3）：同 run_x1。阻断/复刻走样按预注册原文仍计 "FAIL"（阻断即如实
+    上报停止该轴），不改挂起态。"""
     print("\n[X2 行业粒度轴] 申万映射在线取数（akshare，只进内存）……")
     members, stats = fetch_sw_members()
     eligible = {g: v for g, v in members.items() if len(v) >= r1.MIN_MEMBERS}
@@ -288,14 +310,16 @@ def run_x2() -> bool:
     ref = r1.concept_returns()
     if not mine.equals(ref):
         print("X2 阻断: 组收益引擎与 R1 不一致（复刻走样），gate 前必须修复")
-        return False
+        return "FAIL"
     print("组收益引擎一致性自检: 与 R1 concept_returns 逐位一致")
 
     cret = group_returns_from_px(px, members)
     whitelists = r1.monthly_whitelists(cret)
     if not whitelists:
-        print("X2 FAIL: 无任何月份满足 250 日白名单重估窗口")
-        return False
+        # 语义合一（D-3）：原「X2 FAIL」短路改记挂起态
+        print("X2 INSUFFICIENT-DATA: 无任何月份满足 250 日白名单重估窗口"
+              "（无分辨率未裁决，挂起）")
+        return r1.INSUFFICIENT_DATA
     test_start = min(whitelists) + "-01"
     picks = r1.momentum_picks(cret)
     sigs = r1.generate_signals(cret, whitelists)
@@ -312,6 +336,18 @@ def run_x2() -> bool:
         print(f"  {t0}  {a} 跌 → {b}")
     print(f"成本框架: 每次换腿 {r1.COST_PER_SWITCH:.1%}（与 R1 逐字相同，接力窗口 "
           f"T+1..T+{r1.WINDOW_DAYS}）")
+
+    # ---- Gate0 分辨率前置（2026-09-21 D-3 增补；判据复用 r1.gate0_resolution）----
+    g0 = r1.gate0_resolution(len(wl_months), len(sigs))
+    if not g0["ok"]:
+        print("\n== Gate0 分辨率前置 ==")
+        print(f"  白名单非空月 {g0['n_wl_months']}（下限 {g0['min_wl_months']}）、"
+              f"去重信号 {g0['n_signals']}（下限 {g0['min_signals']}）→ 分辨率不足")
+        print("  登记数据条件：需更多非空白名单月与信号（另立预注册批次）；"
+              "下限常量待预注册复核")
+        print(f"\nX2 VERDICT: {r1.INSUFFICIENT_DATA}（无分辨率未裁决，挂起——"
+              f"不进 PASS/FAIL 二元；三件套判据数字零改动）")
+        return r1.INSUFFICIENT_DATA
 
     legs = {}
     info = {}
@@ -331,19 +367,30 @@ def run_x2() -> bool:
     g = evaluate_gate(legs["STRAT(信号腿)"], legs["MOM(基线③)"])
     _print_gate(g)
     print(f"\nX2 VERDICT: {'PASS' if g['ok'] else 'FAIL'}")
-    return g["ok"]
+    return "PASS" if g["ok"] else "FAIL"
+
+
+def aggregate_exit(states: list) -> int:
+    """两轴三态聚合（2026-09-21 D-3 增补）：任一轴 FAIL → 退出码 1（FAIL 是有分辨率
+    的负结论，强于挂起）；无 FAIL 但任一轴 INSUFFICIENT-DATA → 退出码 3；全 PASS → 0。
+    """
+    if any(s == "FAIL" for s in states):
+        return 1
+    if any(s == r1.INSUFFICIENT_DATA for s in states):
+        return r1.EXIT_INSUFFICIENT
+    return 0
 
 
 def main() -> int:
-    ok1 = run_x1()
+    s1 = run_x1()
     try:
-        ok2 = run_x2()
+        s2 = run_x2()
     except RuntimeError as e:
         print(f"\nX2 阻断上报: {e}")
         print("按 §5-6 红线如实报告阻断点并停止该轴（不换非申万源、不硬编码、不落库）")
-        ok2 = False
-    print(f"\n总 VERDICT: X1={'PASS' if ok1 else 'FAIL'}  X2={'PASS' if ok2 else 'FAIL'}")
-    return 0 if (ok1 and ok2) else 1
+        s2 = "FAIL"   # 预注册原文：阻断即 fail（语义不变）
+    print(f"\n总 VERDICT: X1={s1}  X2={s2}")
+    return aggregate_exit([s1, s2])
 
 
 if __name__ == "__main__":
