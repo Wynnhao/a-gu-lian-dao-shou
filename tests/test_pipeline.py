@@ -485,10 +485,12 @@ def test_recorder_wal_concurrent_writer():
         conn = get_conn()
         seed_market(conn)
         conn.close()
-        # 连接 A：预写一行（另一进程语义）
+        # 连接 A：预写一行（另一进程语义）。ts 用 _BASE 同源（原硬编码 2026-09-18
+        # 与 --now 的 _BASE 混用，_BASE 随真实日期走到非 09-18 的工作日后查询
+        # 前缀错位——2026-09-21 周一午夜首曝）
         a = get_conn()
         a.execute("INSERT OR REPLACE INTO minute_snapshot VALUES (?,?,?,?,?,?)",
-                  ("999999", "2026-09-18T10:05:00", 1.0, None, None, "other"))
+                  ("999999", _BASE.isoformat() + "T10:05:00", 1.0, None, None, "other"))
         a.commit()
         orig = _patch_fetch_snapshot(lambda codes, index_codes=None: {
             "600519": {"price": 1500.0, "volume": None, "amount": None,
@@ -499,7 +501,8 @@ def test_recorder_wal_concurrent_writer():
             rec.quotes.fetch_snapshot = orig
         b = get_conn()
         rows = {r[0] for r in b.execute(
-            "SELECT code FROM minute_snapshot WHERE ts LIKE '2026-09-18T10:%'")}
+            "SELECT code FROM minute_snapshot WHERE ts LIKE ?",
+            (_BASE.isoformat() + "T10:%",))}
         assert "999999" in rows and "600519" in rows   # 两连接的行都健在
         b.close()
         a.close()
