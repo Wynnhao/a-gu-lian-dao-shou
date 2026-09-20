@@ -396,6 +396,88 @@ def test_em_seal_rate_none_when_zhaban_pool_fails():
         conn.close()
 
 
+# ---------------- P2-⑪（批次4b）：legu 统计日期校验 ----------------
+
+@test
+def test_legu_fallback_rejects_stale_or_missing_stats_date():
+    """P2-⑪：legu 兜底档统计日期≠目标日（盘前=昨日快照）或缺失 → 整档 raise，
+    绝不把昨日活跃度写成目标日行（fail-closed）。"""
+    import pandas as pd
+    orig = breadth_mod.call_ak
+
+    def _mk(stats_date):
+        rows = {"item": ["上涨", "涨停", "下跌", "跌停"],
+                "value": [3937.0, 79.0, 1109.0, 1.0]}
+        if stats_date is not None:
+            rows["item"].append("统计日期")
+            rows["value"].append(stats_date)
+        return lambda source, fn, *a, **kw: pd.DataFrame(rows)
+
+    breadth_mod.call_ak = _mk("2026-09-17 15:00:00")   # 昨日快照
+    try:
+        try:
+            breadth_mod._fetch_legu_breadth("20260918")
+            raise AssertionError("统计日期为昨日时应 raise 走下一档")
+        except RuntimeError as e:
+            assert "统计日期" in str(e)
+    finally:
+        breadth_mod.call_ak = orig
+    breadth_mod.call_ak = _mk(None)                    # 接口缺统计日期行
+    try:
+        try:
+            breadth_mod._fetch_legu_breadth("20260918")
+            raise AssertionError("统计日期缺失时应 raise（无法核验不采用）")
+        except RuntimeError as e:
+            assert "统计日期" in str(e)
+    finally:
+        breadth_mod.call_ak = orig
+
+
+@test
+def test_legu_fallback_accepts_matching_stats_date():
+    """P2-⑪ 正向：统计日期=目标日 → 正常返回（含时间后缀的日期串可解析）。"""
+    import pandas as pd
+    orig = breadth_mod.call_ak
+    breadth_mod.call_ak = lambda source, fn, *a, **kw: pd.DataFrame({
+        "item": ["上涨", "涨停", "下跌", "跌停", "统计日期"],
+        "value": [3937.0, 79.0, 1109.0, 1.0, "2026-09-18 15:00:00"]})
+    try:
+        out = breadth_mod._fetch_legu_breadth("20260918")
+        assert out["source"] == "legu"
+        assert out["limit_up_count"] == 79
+        assert abs(out["advance_decline_ratio"] - 3937.0 / 1109.0) < 1e-4
+    finally:
+        breadth_mod.call_ak = orig
+
+
+@test
+def test_em_source_legu_adr_gated_by_stats_date():
+    """P2-⑪：em 主源内 legu 涨跌家数同样过统计日期闸——快照为昨日时
+    advance_decline_ratio=None、source 保持 em（不标 em+legu）。"""
+    import pandas as pd
+    from data import fetcher as fetcher_mod
+    orig = fetcher_mod.call_ak
+
+    def _mock(source, fn, *a, **kw):
+        if source == "zt_pool_em":
+            return pd.DataFrame({"代码": ["1", "2"]})
+        if source == "dt_pool_em":
+            return pd.DataFrame({"代码": ["8"]})
+        if source == "legu":
+            return pd.DataFrame({"item": ["上涨", "下跌", "统计日期"],
+                                 "value": [3000.0, 1500.0, "2026-09-17 16:00:01"]})
+        return None
+
+    fetcher_mod.call_ak = _mock
+    try:
+        out = breadth_mod._fetch_em_breadth("20260918")
+        assert out["source"] == "em", out
+        assert out["advance_decline_ratio"] is None, out
+        assert out["limit_up_count"] == 2   # em 自身计数不受影响
+    finally:
+        fetcher_mod.call_ak = orig
+
+
 def main() -> int:
     import traceback
     failed = 0

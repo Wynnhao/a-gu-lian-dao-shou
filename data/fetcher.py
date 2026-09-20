@@ -54,6 +54,11 @@ _DATA_CFG = CFG.get("data", {})
 START_DATE = _DATA_CFG.get("start_date", "20240101")
 SOURCE_COOLDOWN_MIN = _DATA_CFG.get("source_cooldown_min", 30)
 SOURCE_MAX_FAIL = _DATA_CFG.get("source_max_fail", 5)
+# P2-⑨（2026-09-20）：qfq 全史重刷冷却窗（天）。加法型（tx）口径下窗边界
+# 不变量闸对高 d/价票结构性不可收敛（除权+大跌日 qfq 环比天然深于 raw），
+# 无冷却窗则每个 fetcher 周期（30 分钟）都触发一次全史重刷。冷却窗内命中
+# 不变量即放弃重刷、保留增量窗（详见 backfill_qfq 注释与 ADR 附记 F）。
+REBRUSH_COOLDOWN_DAYS = int(_DATA_CFG.get("qfq_rebrush_cooldown_days", 7))
 
 DDL = """
 CREATE TABLE IF NOT EXISTS daily_bar (
@@ -624,7 +629,15 @@ def recalc_tx_pct(conn: sqlite3.Connection, code: Optional[str] = None,
     复权下，除权段内的正常日 qfq 环比与 raw 环比天然不同（低价高 adj 票可达
     数 pp），全量按 qfq 环比重写会污染正常行——实测全库仅 ~7k 行是真除权错行。
 
-    - 行自身或其前一行无 close_qfq → 跳过并计数（调用方汇报）；
+    P2-⑦（2026-09-20）："前一行"取**上一日历行**（任意 source），不再是过滤集
+    （tx/NULL）内上一条。混源缺口（中间夹 em 行）时过滤集上一条与目标行差
+    多个交易日：除权跳变落在缺口内 → d_jump 误触发且 qfq 环比是**多日收益**，
+    写进去等于把多日收益伪装成当日涨跌幅（反向漏检：真除权错行的前行是 em 行
+    时过滤集口径看不到跳变，audit --fix 收敛不到——生产实测该口径残存
+    141 行/9 票，全在非 watchlist 票上）。日历行口径与 audit.check_db 的
+    tx_pct_divergent 判定（prev_qfq/prev_close 全表滚动）对齐。
+
+    - 行自身或其上一日历行无 close_qfq → 跳过并计数（调用方汇报）；
     - code=None 时扫全表（存量重算 / audit --fix），指定 code 时只处理该票
       （backfill_qfq 每次增量后调用，"未来行有 qfq 即用 qfq 环比"的落地路径）。
 
@@ -632,15 +645,26 @@ def recalc_tx_pct(conn: sqlite3.Connection, code: Optional[str] = None,
     """
     where, args = ("WHERE code=? AND (source='tx' OR source IS NULL)", (str(code),)) if code \
         else ("WHERE source='tx' OR source IS NULL", ())
-    rows = conn.execute(
+    targets = conn.execute(
         f"SELECT code, trade_date, pct_chg, close, close_qfq FROM daily_bar {where} "
         "ORDER BY code, trade_date", args).fetchall()
     fixed = skipped = 0
+    if not targets:
+        return fixed, skipped
+    pct_of = {(str(cd), str(td)): pct for cd, td, pct, _c, _cq in targets}
+    cal_where, cal_args = ("WHERE code=?", (str(code),)) if code else ("", ())
     prev = {}
     updates = []
-    for cd, td, pct, c, cq in rows:
+    # 全表（或单票）日历序单遍扫描：非 tx/NULL 行只作"上一日历行"锚，不参与检测
+    for cd, td, c, cq in conn.execute(
+            f"SELECT code, trade_date, close, close_qfq FROM daily_bar {cal_where} "
+            "ORDER BY code, trade_date", cal_args):
+        cd, td = str(cd), str(td)
         pc, pcq = prev.get(cd, (None, None))
         prev[cd] = (c, cq)
+        if (cd, td) not in pct_of:
+            continue
+        pct = pct_of[(cd, td)]
         if cq is None or pcq is None or pct is None or c is None or pc is None:
             skipped += 1
             continue
@@ -656,6 +680,21 @@ def recalc_tx_pct(conn: sqlite3.Connection, code: Optional[str] = None,
         log.info("tx pct 重算（除权跳变日 qfq 环比口径）: %d 行%s", fixed,
                  f"（code={code}）" if code else "")
     return fixed, skipped
+
+
+def _recent_full_rebrush(conn: sqlite3.Connection, code: str,
+                         days: Optional[int] = None) -> bool:
+    """P2-⑨：该票 days 天内是否已有 qfq_full_rebrush 留痕（fetch_log 冷却窗）。
+
+    run_at 为 isoformat 秒级字符串，与截止串按字典序比较（同格式单调）。
+    只认 status='qfq_full_rebrush' 行——那是唯一会整段重锚的写路径。
+    """
+    d = REBRUSH_COOLDOWN_DAYS if days is None else days
+    cutoff = (datetime.now() - timedelta(days=d)).isoformat(timespec="seconds")
+    row = conn.execute(
+        "SELECT 1 FROM fetch_log WHERE code=? AND status='qfq_full_rebrush' "
+        "AND run_at >= ? LIMIT 1", (code, cutoff)).fetchone()
+    return row is not None
 
 
 def rebrush_qfq_full(code: str, conn: sqlite3.Connection) -> tuple:
@@ -736,6 +775,12 @@ def backfill_qfq(code: str, conn: sqlite3.Connection) -> int:
     锚点漂移（某行差 > max(0.01, 0.1%)）即判定发生除权重锚 → 该票自动全史重刷；
     写窗后再对窗边界做一次库内不变量校验（qfq 环比深于 raw 环比 >0.3pp 非法）
     兜底，命中同样触发全史重刷。
+
+    P2-⑧/⑨（2026-09-20）：不变量命中后的两条新分支——重刷失败时回滚本次
+    窗写入后放弃（SAVEPOINT，与漂移路径"放弃写入"对称，坏窗不再落库）；
+    冷却窗（REBRUSH_COOLDOWN_DAYS，fetch_log qfq_full_rebrush 留痕）内命中
+    不变量时跳过重刷、保留增量窗（加法型口径不可收敛，防每 30 分钟反复
+    全史重刷；语义变化见 ADR 附记 F）。
     """
     last_qfq = repo.latest_bar_date(conn, code, qfq_only=True)
     start = START_DATE
@@ -809,6 +854,9 @@ def backfill_qfq(code: str, conn: sqlite3.Connection) -> int:
                      code, d))
     if not rows:
         return 0
+    # P2-⑧：窗写入包进 SAVEPOINT——不变量命中且全史重刷失败时整体回滚本次
+    # 窗写入（与上方漂移路径的"放弃写入"对称；此前坏窗照样落库 commit）。
+    conn.execute("SAVEPOINT qfq_win")
     _write_qfq_rows(conn, rows, _qfq_has_open_col(conn))
     # 窗边界不变量校验：任一相邻对 qfq 环比深于 raw 环比 >0.3pp → 伪跳变，全史重刷
     # （含窗前一日：伪跳变恰出现在"旧锚末行 → 新锚首行"的边界对上）
@@ -819,12 +867,28 @@ def backfill_qfq(code: str, conn: sqlite3.Connection) -> int:
         "SELECT MAX(trade_date) FROM daily_bar WHERE code=? AND trade_date < ? "
         "AND close_qfq IS NOT NULL", (code, start)).fetchone()[0]
     if _qfq_invariant_violated(conn, code, ([edge] if edge else []) + got_dates):
-        log.warning("%s 增量窗边界伪跳变（qfq 环比深于 raw >0.3pp），转全史重刷", code)
-        n, real_src = rebrush_qfq_full(code, conn)
-        if n:
-            recalc_tx_pct(conn, code=code)
-            conn.commit()
-            return n
+        # P2-⑨：冷却窗内已全史重刷过——加法型（tx）口径下该不变量对高 d/价票
+        # 结构性不可收敛（除权+大跌日 qfq 环比天然深于 raw），重刷也清不掉；
+        # 无冷却窗会每个 fetcher 周期（30 分钟）全史重刷一次。此时放弃重刷、
+        # 保留增量窗（语义变化见 ADR 附记 F）。
+        if _recent_full_rebrush(conn, code):
+            log.warning("%s 增量窗边界伪跳变命中，但 %d 天内已全史重刷"
+                        "（加法型口径不可收敛），跳过重刷保留增量窗",
+                        code, REBRUSH_COOLDOWN_DAYS)
+        else:
+            log.warning("%s 增量窗边界伪跳变（qfq 环比深于 raw >0.3pp），转全史重刷", code)
+            n, real_src = rebrush_qfq_full(code, conn)
+            if n:
+                recalc_tx_pct(conn, code=code)
+                conn.commit()
+                return n
+            # P2-⑧：重刷失败 → 回滚窗写入后放弃（防伪跳变入库；重刷失败前
+            # rebrush_qfq_full 内部未产生任何已提交写入）
+            conn.execute("ROLLBACK TO qfq_win")
+            conn.execute("RELEASE qfq_win")
+            log.error("%s 全史重刷失败，放弃本次增量窗写入（防伪跳变入库）", code)
+            return 0
+    conn.execute("RELEASE qfq_win")
     recalc_tx_pct(conn, code=code)
     conn.commit()
     log.info("%s qfq via %s: %d rows", code, src, len(rows))

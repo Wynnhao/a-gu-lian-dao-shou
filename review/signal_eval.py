@@ -60,6 +60,9 @@ def _signal_frame(conn: sqlite3.Connection) -> pd.DataFrame:
     Fix-5：按 config.signals.profile 过滤——v1/v2 双 profile 行并存后，IC 评估
     必须只看当前口径的 score（混口径会稀释甚至反转 IC 结论）。
     老行（迁移前）profile='reversal_lowvol'。
+    P2-⑫（2026-09-20）：删除 `OR profile IS NULL` 兼容条款——迁移已完成且
+    生产 NULL 行=0，该条款是潜伏混算闸（与 signals.py:_write_factor_crowding
+    同步删除，各自附负向用例）。
     """
     try:
         from signals.signals import profile as _profile
@@ -68,7 +71,7 @@ def _signal_frame(conn: sqlite3.Connection) -> pd.DataFrame:
         prof = "reversal_lowvol"
     rows = conn.execute(
         "SELECT code, as_of, signals, score FROM signal"
-        " WHERE profile = ? OR profile IS NULL", (prof,)).fetchall()
+        " WHERE profile = ?", (prof,)).fetchall()
     if not rows:
         return pd.DataFrame()
     rec = []

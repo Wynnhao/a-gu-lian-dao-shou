@@ -666,12 +666,14 @@ def _write_factor_crowding(conn: sqlite3.Connection, event_note: str = "") -> di
         _persist_factor_crowding(out)
 
     try:
-        # W-B1：只取当前 profile 的分（profile IS NULL 兼容迁移前旧行，
-        # 写法与 review/signal_eval.py:_signal_frame 同款）
+        # W-B1：只取当前 profile 的分。P2-⑫（2026-09-20）删除 `OR profile IS NULL`
+        # 兼容条款——Fix-5 迁移把旧行全部归入 'reversal_lowvol' 且生产 NULL 行=0，
+        # 该条款是潜伏混算闸（一旦再出现 NULL 行即静默混入当前口径）；写法与
+        # review/signal_eval.py:_signal_frame 同款
         cur_prof = profile()
         rows = conn.execute(
             "SELECT code, as_of, score FROM signal WHERE score IS NOT NULL"
-            " AND (profile = ? OR profile IS NULL)", (cur_prof,)).fetchall()
+            " AND profile = ?", (cur_prof,)).fetchall()
         if not rows:
             out["reason"] = (f"signal 表为空或无 profile={cur_prof} 行"
                              "（保留旧 state）")

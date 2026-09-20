@@ -369,7 +369,10 @@ def test_wb6_em_source_uses_legu_for_adr():
         if source == "dt_pool_em":
             return pd.DataFrame({"代码": ["8"]})
         if source == "legu":
-            return pd.DataFrame({"item": ["上涨", "下跌"], "value": [3000.0, 1500.0]})
+            # P2-⑪ 后接口契约含统计日期行（akshare stock_market_activity_legu
+            # 恒附 item='统计日期'）；快照日期≠目标日时 em 档不采用其涨跌家数
+            return pd.DataFrame({"item": ["上涨", "下跌", "统计日期"],
+                                 "value": [3000.0, 1500.0, "2026-09-18 15:00:00"]})
         return None
 
     # _fetch_em_breadth 函数内 `from data.fetcher import call_ak` 重导入 → 须 patch

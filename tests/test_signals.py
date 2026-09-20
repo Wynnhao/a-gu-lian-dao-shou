@@ -459,6 +459,35 @@ def test_factor_crowding_empty_signal_returns_no_crowd():
         _restore_signal_eval_dir(old)
 
 
+def test_p2g12_null_profile_rows_not_consumed_by_crowding():
+    """P2-⑫ 负向（预注册要求）：profile IS NULL 兼容条款已删——NULL 行不得
+    被 _write_factor_crowding 消费（混算闸）；同一批行置回当前 profile 后
+    恢复消费（对照证明"空"不是别的原因）。"""
+    from signals import signals as sig
+    old, _sandbox = _sandbox_signal_eval_dir()
+    old_prof = os.environ.get("AGSICKLE_SIGNALS_PROFILE")
+    os.environ["AGSICKLE_SIGNALS_PROFILE"] = "reversal_lowvol"
+    conn = _synth_signal_bar_env()
+    try:
+        conn.execute("UPDATE signal SET profile=NULL")
+        conn.commit()
+        out = sig._write_factor_crowding(conn)
+        assert out["n_buckets"] == 0, out
+        assert "为空" in out["reason"], out
+        # 对照：同一批行显式置回当前 profile → 恢复消费
+        conn.execute("UPDATE signal SET profile='reversal_lowvol'")
+        conn.commit()
+        out2 = sig._write_factor_crowding(conn)
+        assert out2["n_buckets"] >= 4, out2
+    finally:
+        conn.close()
+        _restore_signal_eval_dir(old)
+        if old_prof is None:
+            os.environ.pop("AGSICKLE_SIGNALS_PROFILE", None)
+        else:
+            os.environ["AGSICKLE_SIGNALS_PROFILE"] = old_prof
+
+
 def test_rule20_factor_crowding_caps_buy_weight():
     """任务 5 风控 case：factor_crowding.json 标记 crowded=True →
     buy + target_weight=0.20 → 自动压回 5%（按 equity 重算股数）。"""

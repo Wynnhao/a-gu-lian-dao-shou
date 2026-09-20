@@ -476,5 +476,226 @@ class TestGate0BApply(unittest.TestCase):
         conn.close()
 
 
+class TestP2Batch4b(unittest.TestCase):
+    """批次 4b（P2 数据域清债）回归：⑦recalc 前行=上一日历行 / ⑧重刷失败
+    弃窗 / ⑨重刷冷却窗 / ⑩ audit --fix 收敛混源残存（临时库合成验证，
+    生产库执行留档待授权——见 commit 与批次报告）。"""
+
+    def setUp(self):
+        import data.fetcher as fetcher
+        self.fetcher = fetcher
+
+    def _seed(self, conn, code, td, close, cq, pct, src):
+        conn.execute(
+            "INSERT INTO daily_bar (code, trade_date, open, high, low, close, "
+            "volume, amount, pct_chg, turnover, source, close_qfq)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (code, td, close, close * 1.01, close * 0.99, close,
+             1e6, close * 1e8, pct, 0.0, src, cq))
+
+    # ---------------- ⑦ recalc_tx_pct：前一行 = 上一日历行 ----------------
+
+    def test_p2g7_recalc_uses_prev_calendar_row_across_mixed_gap(self):
+        """混源缺口（tx 之间夹 em 行）+ 缺口内除权：
+        - 错行（pct 存 0.0）→ 按上一日历行(em) 的 qfq 日环比重算（旧口径会把
+          过滤集内跨缺口的多日收益 -3.43% 写进去）；
+        - 正确行（pct 已= qfq 日环比）→ 不动（旧口径会误改，证明负向也收敛）。"""
+        _p, conn = make_db()
+        try:
+            qfq_daily = round((9.56 / 9.68 - 1) * 100, 4)     # 日环比 -1.2397
+            qfq_multiday = round((9.56 / 9.90 - 1) * 100, 4)  # 跨缺口多日 -3.4343
+            self.assertNotAlmostEqual(qfq_daily, qfq_multiday, places=2)
+            # 票 A（错行）：d1(tx) --gap-- d2(em) --除权-- d3(tx, pct=0)
+            self._seed(conn, "000034", "2024-01-02", 10.0, 9.90, 0.0, "tx")
+            self._seed(conn, "000034", "2024-01-10", 9.80, 9.68, -2.02, "em")
+            self._seed(conn, "000034", "2024-01-11", 9.70, 9.56, 0.0, "tx")
+            # 票 B（正确行）：同结构但 d3 的 pct 已是 qfq 日环比
+            self._seed(conn, "600517", "2024-01-02", 10.0, 9.90, 0.0, "tx")
+            self._seed(conn, "600517", "2024-01-10", 9.80, 9.68, -2.02, "em")
+            self._seed(conn, "600517", "2024-01-11", 9.70, 9.56, qfq_daily, "tx")
+            conn.commit()
+            fixed, _skipped = self.fetcher.recalc_tx_pct(conn)
+            self.assertEqual(fixed, 1, "只有票 A 的错行应被重算")
+            got_a = conn.execute(
+                "SELECT pct_chg FROM daily_bar WHERE code='000034'"
+                " AND trade_date='2024-01-11'").fetchone()[0]
+            self.assertAlmostEqual(got_a, qfq_daily, places=6,
+                                   msg="应写日环比而非跨缺口多日收益")
+            got_b = conn.execute(
+                "SELECT pct_chg FROM daily_bar WHERE code='600517'"
+                " AND trade_date='2024-01-11'").fetchone()[0]
+            self.assertAlmostEqual(got_b, qfq_daily, places=6,
+                                   msg="已正确的行不得被改写")
+            # 幂等
+            fixed2, _ = self.fetcher.recalc_tx_pct(conn)
+            self.assertEqual(fixed2, 0)
+        finally:
+            conn.close()
+
+    def test_p2g7_recalc_code_scoped_uses_calendar_prev(self):
+        """code= 模式（backfill_qfq 增量路径）同样取上一日历行。"""
+        _p, conn = make_db()
+        try:
+            self._seed(conn, "300394", "2024-01-02", 10.0, 9.90, 0.0, "tx")
+            self._seed(conn, "300394", "2024-01-10", 9.80, 9.68, 0.0, "em")
+            self._seed(conn, "300394", "2024-01-11", 9.70, 9.56, 0.0, "tx")
+            # 另一票不受影响
+            self._seed(conn, "688778", "2024-01-11", 9.70, 9.56, 0.0, "tx")
+            conn.commit()
+            fixed, _ = self.fetcher.recalc_tx_pct(conn, code="300394")
+            self.assertEqual(fixed, 1)
+            other = conn.execute(
+                "SELECT pct_chg FROM daily_bar WHERE code='688778'").fetchone()[0]
+            self.assertEqual(other, 0.0)
+        finally:
+            conn.close()
+
+    # -------- ⑧⑨ backfill_qfq 不变量分支：弃窗 / 冷却窗 --------
+
+    def _seed_invariant_fixture(self, conn, code="600519"):
+        """edge 行（旧锚 cq=10.0）+ 无 qfq 行；假 em_qfq 给新锚 9.0 →
+        边界对 qfq 环比 -10% 深于 raw 0% >0.3pp → 不变量必命中。"""
+        self._seed(conn, code, "2024-01-02", 10.0, 10.0, 0.0, "em")
+        self._seed(conn, code, "2024-01-03", 10.0, None, 0.0, "em")
+        conn.commit()
+        df = pd.DataFrame({"date": pd.to_datetime(["2024-01-03"]),
+                           "close_qfq": [9.0]})
+        return lambda c, s, e: df
+
+    def test_p2g8_invariant_hit_rebrush_fail_discards_window(self):
+        """⑧：不变量命中且重刷失败 → 窗写入整体回滚（close_qfq 保持 NULL），
+        返回 0——与漂移路径"放弃写入"对称（此前坏窗照样 commit）。"""
+        _p, conn = make_db()
+        old_qfq, old_rebrush = (self.fetcher._hist_em_qfq,
+                                self.fetcher.rebrush_qfq_full)
+        self.fetcher._hist_em_qfq = self._seed_invariant_fixture(conn)
+        self.fetcher.rebrush_qfq_full = lambda code, conn: (0, "")
+        try:
+            n = self.fetcher.backfill_qfq("600519", conn)
+            self.assertEqual(n, 0)
+            cq = conn.execute("SELECT close_qfq FROM daily_bar WHERE "
+                              "trade_date='2024-01-03'").fetchone()[0]
+            self.assertIsNone(cq, "重刷失败时增量窗写入必须被回滚")
+            edge = conn.execute("SELECT close_qfq FROM daily_bar WHERE "
+                                "trade_date='2024-01-02'").fetchone()[0]
+            self.assertEqual(edge, 10.0, "已提交的旧行不受影响")
+            # 连接仍可继续正常写入（SAVEPOINT 已清理）
+            conn.execute("INSERT INTO fetch_log VALUES ('x','t','ok',0,'')")
+            conn.commit()
+        finally:
+            self.fetcher._hist_em_qfq = old_qfq
+            self.fetcher.rebrush_qfq_full = old_rebrush
+            conn.close()
+
+    def test_p2g8_invariant_hit_rebrush_ok_commits(self):
+        """⑧ 对照：重刷成功 → 返回重刷行数且窗写入一并提交。"""
+        _p, conn = make_db()
+        old_qfq, old_rebrush = (self.fetcher._hist_em_qfq,
+                                self.fetcher.rebrush_qfq_full)
+        self.fetcher._hist_em_qfq = self._seed_invariant_fixture(conn)
+        self.fetcher.rebrush_qfq_full = lambda code, conn: (7, "tx_qfq")
+        try:
+            n = self.fetcher.backfill_qfq("600519", conn)
+            self.assertEqual(n, 7)
+            cq = conn.execute("SELECT close_qfq FROM daily_bar WHERE "
+                              "trade_date='2024-01-03'").fetchone()[0]
+            self.assertEqual(cq, 9.0)
+        finally:
+            self.fetcher._hist_em_qfq = old_qfq
+            self.fetcher.rebrush_qfq_full = old_rebrush
+            conn.close()
+
+    def test_p2g9_cooldown_skips_rebrush_keeps_window(self):
+        """⑨：冷却窗内已有 qfq_full_rebrush 留痕 → 不变量命中不再重刷
+        （加法型不可收敛，防每 30 分钟全史重刷），增量窗保留。"""
+        from datetime import datetime
+        _p, conn = make_db()
+        old_qfq, old_rebrush = (self.fetcher._hist_em_qfq,
+                                self.fetcher.rebrush_qfq_full)
+
+        def _must_not_rebrush(code, conn):
+            raise AssertionError("冷却窗内不应触发全史重刷")
+
+        self.fetcher._hist_em_qfq = self._seed_invariant_fixture(conn)
+        self.fetcher.rebrush_qfq_full = _must_not_rebrush
+        conn.execute(
+            "INSERT INTO fetch_log VALUES (?,?, 'qfq_full_rebrush', 655, "
+            "'source=tx_qfq')",
+            ("600519", datetime.now().isoformat(timespec="seconds")))
+        conn.commit()
+        try:
+            n = self.fetcher.backfill_qfq("600519", conn)
+            self.assertGreaterEqual(n, 1)
+            cq = conn.execute("SELECT close_qfq FROM daily_bar WHERE "
+                              "trade_date='2024-01-03'").fetchone()[0]
+            self.assertEqual(cq, 9.0, "冷却窗分支应保留增量窗")
+        finally:
+            self.fetcher._hist_em_qfq = old_qfq
+            self.fetcher.rebrush_qfq_full = old_rebrush
+            conn.close()
+
+    def test_p2g9_cooldown_expires_then_rebrush_attempted(self):
+        """⑨ 负向：留痕早于冷却窗（REBRUSH_COOLDOWN_DAYS+1 天前）→ 重刷照常
+        触发（重刷失败路径回归：返回 0 且窗被弃）。"""
+        from datetime import datetime, timedelta
+        _p, conn = make_db()
+        old_qfq, old_rebrush = (self.fetcher._hist_em_qfq,
+                                self.fetcher.rebrush_qfq_full)
+        self.fetcher._hist_em_qfq = self._seed_invariant_fixture(conn)
+        self.fetcher.rebrush_qfq_full = lambda code, conn: (0, "")
+        stale = (datetime.now() - timedelta(
+            days=self.fetcher.REBRUSH_COOLDOWN_DAYS + 1)
+        ).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO fetch_log VALUES (?,?, 'qfq_full_rebrush', 655, "
+            "'source=tx_qfq')", ("600519", stale))
+        conn.commit()
+        try:
+            n = self.fetcher.backfill_qfq("600519", conn)
+            self.assertEqual(n, 0)
+            cq = conn.execute("SELECT close_qfq FROM daily_bar WHERE "
+                              "trade_date='2024-01-03'").fetchone()[0]
+            self.assertIsNone(cq)
+        finally:
+            self.fetcher._hist_em_qfq = old_qfq
+            self.fetcher.rebrush_qfq_full = old_rebrush
+            conn.close()
+
+    # -------- ⑩ audit --fix 收敛混源残存（临时库合成验证） --------
+
+    def test_p2g10_audit_fix_converges_residual_mixed_rows(self):
+        """⑩：合成"生产 141 行/9 票"同型数据（非 watchlist 混源票、跨缺口
+        除权、pct 与日环比背离>1pp）→ check_db 报 tx_pct_divergent；
+        audit.fix_tx_pct（= --fix 的 W-B3 步）收敛后复检为 0。生产库执行
+        留档待授权，本用例只证代码路径可收敛。"""
+        from data.audit import check_db, fix_tx_pct
+        _p, conn = make_db()
+        try:
+            for i, code in enumerate(("300394", "688778", "000034")):
+                self._seed(conn, code, "2024-01-02", 10.0, 9.90, 0.0, "tx")
+                self._seed(conn, code, "2024-01-10", 9.80, 9.68, -2.02, "em")
+                self._seed(conn, code, f"2024-01-1{i + 1}", 9.70, 9.56,
+                           0.0, "tx")
+            conn.commit()
+            issues, _total = check_db(conn)
+            flagged = [i for i in issues if i["kind"] == "tx_pct_divergent"]
+            self.assertEqual(len(flagged), 3, flagged)
+            fixed, skipped = fix_tx_pct(conn)
+            self.assertEqual(fixed, 3)
+            self.assertEqual(skipped, 3)  # 每票首行无上一日历行 → 计入 skipped
+            issues2, _ = check_db(conn)
+            self.assertEqual(
+                [i for i in issues2 if i["kind"] == "tx_pct_divergent"], [])
+            expect = round((9.56 / 9.68 - 1) * 100, 4)
+            for code in ("300394", "688778", "000034"):
+                pct = conn.execute(
+                    "SELECT pct_chg FROM daily_bar WHERE code=? AND "
+                    "trade_date LIKE '2024-01-1_' AND source='tx' AND "
+                    "close=9.70", (code,)).fetchone()[0]
+                self.assertAlmostEqual(pct, expect, places=6)
+        finally:
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

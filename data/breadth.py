@@ -38,6 +38,21 @@ log.propagate = False
 
 # ---------------------------------------------------------------- 数据源
 
+def _legu_stats_date_matches(kv: dict, date_compact: str) -> bool:
+    """P2-⑪：legu 快照统计日期校验。
+
+    stock_market_activity_legu 只回「当前快照」且自带统计日期行（item='统计日期'）。
+    盘前（<9:25）/跨日补跑时快照仍是上一交易日的活跃度——不校验就会把昨日
+    涨跌家数写成今日行。统计日期缺失同样视为不匹配（fail-closed，绝不把
+    无法核验的快照写成目标日数据）。date_compact 为 YYYYMMDD。
+    """
+    raw = kv.get("统计日期")
+    if raw is None or not str(raw).strip():
+        return False
+    digits = "".join(ch for ch in str(raw) if ch.isdigit())[:8]
+    return digits == str(date_compact)
+
+
 def _fetch_em_breadth(date_str: str) -> dict:
     """em 源：拉涨停股池+跌停股池+涨跌平家数。
 
@@ -86,8 +101,15 @@ def _fetch_em_breadth(date_str: str) -> dict:
             kv = {str(r["item"]): r["value"] for _, r in df_legu.iterrows()}
             up, dn = kv.get("上涨"), kv.get("下跌")
             if up is not None and dn is not None and float(dn) > 0:
-                out["advance_decline_ratio"] = round(float(up) / float(dn), 4)
-                out["source"] = "em+legu"
+                # P2-⑪：统计日期≠目标日（盘前/跨日快照）→ 不采用其涨跌家数，
+                # 否则昨日活跃度会经 em+legu 组合写成今日 advance_decline_ratio
+                if _legu_stats_date_matches(kv, date_str):
+                    out["advance_decline_ratio"] = round(float(up) / float(dn), 4)
+                    out["source"] = "em+legu"
+                else:
+                    out["advance_decline_ratio"] = None
+                    log.warning("legu 统计日期=%s ≠ 目标日 %s（盘前/跨日快照），"
+                                "不采用其涨跌家数", kv.get("统计日期"), date_str)
             else:
                 out["advance_decline_ratio"] = None
         else:
@@ -116,6 +138,11 @@ def _fetch_legu_breadth(date_str: str) -> dict:
     zt, dt = kv.get("涨停"), kv.get("跌停")
     if up is None or dn is None:
         raise RuntimeError(f"legu activity 缺上涨/下跌行: {list(kv)[:6]}")
+    # P2-⑪：统计日期≠目标日 → 整档判失败（raise 走兜底链下一档）。legu 只回
+    # 当前快照：盘前拿到的是昨日涨停/跌停/涨跌家数，写成今日行就是整行错数据。
+    if not _legu_stats_date_matches(kv, date_str):
+        raise RuntimeError(f"legu 统计日期 {kv.get('统计日期')!r} ≠ 目标日 {date_str}"
+                           "（盘前/跨日快照，不能写成目标日行）")
     out["advance_decline_ratio"] = round(float(up) / float(dn), 4) if float(dn) > 0 else None
     out["limit_up_count"] = int(float(zt)) if zt is not None else None
     out["limit_down_count"] = int(float(dt)) if dt is not None else None
