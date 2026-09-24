@@ -29,11 +29,13 @@ if str(BASE) not in sys.path:
 MIN_SAMPLES = 100
 FACTORS = ("mom_5d", "mom_20d", "atr_pct", "turnover_pct", "turn20", "rsi_14")
 HORIZONS = (1, 5, 10)
-# P1-8（批次3b，2026-09-21）：回测宇宙守卫阈值——最新交易日有 bar 的宇宙票数
+# P1-8（批次3b，2026-09-21 拍板）：回测宇宙守卫阈值——最新交易日有 bar 的宇宙票数
 # 低于该值时 B/C 判据弃权（verdict 不产 switch/keep）。审查实测 730/816 票最新
 # bar 停在 09-11/09-14、全库仅 86 票每日更新：断粮宇宙上跑出的 B/C 数字
-# "判据形式有效实质不可执行"。**300 为建议值，待用户拍板**（施工方案 §5.3）。
-VERDICT_MIN_UNIVERSE = 300
+# "判据形式有效实质不可执行"。300 → 86 是 2026-09-21 用户拍板路径1（与切 profile
+# 到 reversal_lowvol_v2 同步执行）；阈值匹配 watchlist 池实际规模，B/C 判据
+# 可在 v2 红线之上（C=-25.27%）正常投票。
+VERDICT_MIN_UNIVERSE = 86
 # profile 切换判据（v1.4 起：B+C 两维投票 + MDD 红线 override；A/D 弃权）
 # 见 docs/决策策略与工作流.md §7 与 docs/优化修复纪要.md Sprint 1 验收条目
 IC_KEEP = 0.02          # 旧 IC 单维判据，保留常量供历史 verdict 对照，不参与 v1.4 投票
@@ -249,9 +251,9 @@ def profile_verdict(conn: sqlite3.Connection, bt_path=None) -> dict:
     红线 override：C_cur < −30% → verdict=hold（无条件），并写 risk_event 一条
     （rule='profile_verdict_red_line'，同日去重）。
 
-    P1-8 宇宙守卫（批次3b）：最新交易日有 bar 的宇宙票数 N 满足 0<N<VERDICT_MIN_UNIVERSE
-    （300，待拍板）→ B/C 判据弃权（abstains 增 INSUFFICIENT-UNIVERSE 条目，
-    verdict=hold，不产 switch/keep；B/C 数字照常透出，红线 override 不受影响）。
+    P1-8 宇宙守卫（批次3b，2026-09-21 拍板 300→86）：最新交易日有 bar 的宇宙票数 N
+    满足 0<N<VERDICT_MIN_UNIVERSE → B/C 判据弃权（abstains 增 INSUFFICIENT-UNIVERSE
+    条目，verdict=hold，不产 switch/keep；B/C 数字照常透出，红线 override 不受影响）。
 
     只输出建议——切换需人工确认后改 config.signals.profile 并留痕
     （docs/决策策略与工作流.md §7 v1.5），不做自动切换。

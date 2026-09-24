@@ -4,7 +4,7 @@
 > **基线**：main 工作树（结构性重构全案 + Sprint 1/2/3 全部落地）；v1.4 momentum profile 已切生产。
 > **预计总工时**：~1.5 人日（§-1 前置快速回测，先做）+ ~4 人日（§1-§5 实施，不含前置回测）。阶段 2 在 Sprint 4 单独排期。
 > **启动条件**：① §-1 前置快速回测通过（用历史数据校准 §1-§5 默认值 + 筛掉无效项） + ② v1.4 momentum profile 跑出 ≥2 周数据（实盘归因清晰，避免与 profile 切换混淆）。
-> **执行环境**：项目根 `/Users/xuwenhao/Desktop/A股镰刀手`，一律用 `.venv/bin/python3`。
+> **执行环境**：项目根 `<REPO_ROOT>`，一律用 `.venv/bin/python3`。
 > **关联文档**：`docs/策略库借鉴-cloddsbot.md`（三方调研档案 + ADR）/ `CONSTRAINTS.md`（项目约束章程）/ `技术方案.md` §8（顶层排期）。
 
 ---

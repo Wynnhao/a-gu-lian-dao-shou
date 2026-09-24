@@ -256,6 +256,12 @@ def test_backfill_history_synthetic_db():
     import sqlite3
     import signals.signals as sig
     from data.fetcher import DDL
+    # 2026-09-21 路径1 切 profile 到 reversal_lowvol_v2 后全局默认非 momentum——
+    # momentum 时序打分"全缺 → 0.5"有默认值；v2 截面打分"全缺 → score=None"会被
+    # P2-4 护栏跳过。本测试是 backfill 机器的回归（写入行数 / 幂等 / 分数合法），
+    # 与 profile 选择无关，必须显式锁定 momentum 才能跑 80 行预期。
+    _orig_profile = sig.profile
+    sig.profile = lambda: "momentum"
     conn = sqlite3.connect(":memory:")
     conn.executescript(DDL)
     from datetime import date, timedelta
@@ -285,6 +291,7 @@ def test_backfill_history_synthetic_db():
     lo, hi = conn.execute("SELECT MIN(score), MAX(score) FROM signal").fetchone()
     assert 0.0 <= lo <= 1.0 and 0.0 <= hi <= 1.0
     conn.close()
+    sig.profile = _orig_profile
 
 
 def test_factor_close_prefers_qfq():
@@ -701,7 +708,10 @@ def test_crowding_weight_downgrade_changes_scores():
         # 用例可能已向沙箱写入拥挤状态）
         sig.read_factor_crowding = lambda: {"crowded": False, "reason": "基线：非拥挤"}
         rows = _rows()
-        sig._score_cross_section(rows)
+        # 显式 prof=reversal_lowvol：v2 五因子打分拥挤降权表未定义（hardcoded False），
+        # 2026-09-21 切 profile 后全局默认 = reversal_lowvol_v2，本测试设计的是 v1
+        # 降权路径——必须显式注入 v1 才能走 FC_DEGRADED_WEIGHTS 分支。
+        sig._score_cross_section(rows, prof="reversal_lowvol")
         sc = {r["code"]: r["score"] for r in rows}
         assert sc["A"] > sc["C"] > sc["B"], sc
         assert abs(sc["A"] - sc["B"]) > 0.04
@@ -710,7 +720,7 @@ def test_crowding_weight_downgrade_changes_scores():
         # active：降级 → A=B=C，低波票上位
         sig.read_factor_crowding = lambda: {"state": "active", "crowded": True}
         rows = _rows()
-        sig._score_cross_section(rows)
+        sig._score_cross_section(rows, prof="reversal_lowvol")
         sc2 = {r["code"]: r["score"] for r in rows}
         assert abs(sc2["A"] - sc2["B"]) < 1e-9, sc2
         assert abs(sc2["A"] - sc2["C"]) < 1e-9, sc2
@@ -719,7 +729,7 @@ def test_crowding_weight_downgrade_changes_scores():
         # cooling：crowded 仍 True（规则 20 仓位压制）但权重已恢复
         sig.read_factor_crowding = lambda: {"state": "cooling", "crowded": True}
         rows = _rows()
-        sig._score_cross_section(rows)
+        sig._score_cross_section(rows, prof="reversal_lowvol")
         sc3 = {r["code"]: r["score"] for r in rows}
         assert sc3 == sc
         assert all(r["signals"]["score_parts"]["crowding_downgraded"] is False

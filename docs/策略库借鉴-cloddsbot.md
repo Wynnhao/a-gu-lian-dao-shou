@@ -1,7 +1,7 @@
 # A股镰刀手 · 借鉴 CloddsBot 策略库 · 三方讨论档案
 
 > - **版本**：v1.0（2026-09-17）
-> - **来源**：CloddsBot 策略汇总 `/Users/xuwenhao/Desktop/Cloddsbot/STRATEGIES.md`
+> - **来源**：CloddsBot 策略汇总 `<外部项目>/STRATEGIES.md`
 > - **触发**：用户提交 CloddsBot 策略库 → 是否借鉴 / 可行性 / 有机结合 三方 agent 调研结论固化
 > - **状态**：三项共识（采纳 4 项、拒绝/暂缓 3 项、组合化学反应 3 项）已通过用户拍板，进入实施排期（见 §6）
 

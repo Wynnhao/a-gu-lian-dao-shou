@@ -616,6 +616,13 @@ def test_profile_verdict_both_lost_switch(tmp_path=None):
 
     W-D5：合成回测产物经 bt_path 注入，全程不触碰生产 backtest_result.json。"""
     from review import signal_eval
+    import signals.signals as sig_mod
+    _orig_profile = sig_mod.profile
+    # 2026-09-21 路径1 切 profile 到 reversal_lowvol_v2 后全局默认非 momentum——
+    # 本 fixture cur/alt 是按 momentum 设计的（cur_mdd=-0.10、alt_mdd=-0.03）；
+    # v2 块在 fixture 里是 (cur+alt)/2 中间值，会让 C_gap 偏离测试预期。
+    # 显式 monkeypatch 强制 momentum，本测试是 v1 fixture 设计的回归点。
+    sig_mod.profile = lambda: "momentum"
     bt = _write_bt(_Path(tempfile.mkdtemp()),
                    cur_ann=-0.10, alt_ann=0.30,    # B_cur − B_alt = -0.40 → 投切换
                    cur_mdd=-0.10, alt_mdd=-0.03)   # C_cur − C_alt = -0.07 → 投切换
@@ -635,6 +642,7 @@ def test_profile_verdict_both_lost_switch(tmp_path=None):
         assert str(bt) == v["backtest_path"], v
     finally:
         conn.close()
+        sig_mod.profile = _orig_profile
 
 
 def test_profile_verdict_only_c_vote_switch_low_confidence(tmp_path=None):
@@ -682,6 +690,11 @@ def test_profile_verdict_env_injection(tmp_path=None):
 def test_profile_verdict_red_line_overrides(tmp_path=None):
     """投票 case3：MDD 破 -30% → 无条件 hold，suggest_profile 保持现状（v1.7 不再自动建议切换）。"""
     from review import signal_eval
+    import signals.signals as sig_mod
+    _orig_profile = sig_mod.profile
+    # 同 test_profile_verdict_both_lost_switch：fixture 按 momentum 设计
+    # cur_mdd=-0.40 触发红线（v2 块的 mdd=(cur+alt)/2 不会破红线）。
+    sig_mod.profile = lambda: "momentum"
     bt = _write_bt(_Path(tempfile.mkdtemp()),
                    cur_ann=-0.10, alt_ann=0.30,    # B 投切换
                    cur_mdd=-0.40, alt_mdd=-0.10)  # C 也投切换 + 触发红线
@@ -715,6 +728,7 @@ def test_profile_verdict_red_line_overrides(tmp_path=None):
         assert "2026-09-19 12:00:00" in (row[0] or ""), row
     finally:
         conn.close()
+        sig_mod.profile = _orig_profile
 
 
 def test_profile_verdict_three_profile_alts_pick_best():
@@ -782,6 +796,11 @@ def test_profile_verdict_bt_file_not_touched():
     """W-D5 回归护栏：verdict 全路径（含红线 override）不得写/删注入的 bt 文件，
     更不得触碰生产 backtest_result.json 位。"""
     from review import signal_eval
+    import signals.signals as sig_mod
+    _orig_profile = sig_mod.profile
+    # 同 test_profile_verdict_both_lost_switch：fixture 按 momentum 设计
+    # cur_mdd=-0.40 触发红线，必须显式注入 momentum 才能取到 fixture 的 cur 块。
+    sig_mod.profile = lambda: "momentum"
     bt = _write_bt(_Path(tempfile.mkdtemp()),
                    cur_ann=-0.10, alt_ann=0.30,
                    cur_mdd=-0.40, alt_mdd=-0.10)  # 触发红线 override
@@ -794,6 +813,7 @@ def test_profile_verdict_bt_file_not_touched():
         assert v["red_line_triggered"] is True
     finally:
         conn.close()
+        sig_mod.profile = _orig_profile
     assert bt.read_bytes() == before, "注入的 bt 文件被改动"
     assert (prod.read_bytes() if prod.exists() else None) == prod_before, \
         "生产 backtest_result.json 被测试触碰"

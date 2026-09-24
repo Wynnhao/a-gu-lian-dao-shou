@@ -684,7 +684,7 @@
     "source_max_fail": 5
   },
   "signals": {
-    "profile": "momentum"
+    "profile": "reversal_lowvol_v2"
   },
   "bond_yield": {
     "delta_bp_threshold": -15,

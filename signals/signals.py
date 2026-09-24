@@ -149,7 +149,9 @@ def _clip01(x: float) -> float:
 
 def _rank01(s: pd.Series) -> pd.Series:
     """min-max rank 归一 0~1（截面打分基元）：最小→0，最大→1，并列取平均秩；
-    截面仅 1 个有效值时按中性 0.5 处理（单元素截面无排序信息）。"""
+    截面仅 1 个有效值时按中性 0.5 处理（单元素截面无排序信息）。
+    NaN 行 dropna 后退出排序（与 v1 行为一致）；全空截面返回空 Series。
+    caller（如 _score_cross_section）需自行处理 scores 为空的兜底。"""
     s = s.dropna()
     n = len(s)
     if n == 0:
@@ -391,6 +393,14 @@ def _score_cross_section(rows: list, prof: Optional[str] = None) -> None:
         part_names = {"rev": "rev_rank", "vol": "lowvol_rank",
                       "turn": "lowturn_rank"}
     for r in rows:
+        # 2026-09-21 修复（切 profile 到 reversal_lowvol_v2 后触发）：
+        # _rank01 dropna 可能让 scores/parts 在某些票（甚至全部）上无索引——
+        # 早于窗口的日期 + 无 HS300 基准时所有因子 NaN→rank 空→scores 空。
+        # 原先走 _score_momentum 时序分支绕过 cross-section 长期未暴露。
+        # 现在的行为：scores/parts 缺该票 → 保留 r["score"] = None 让调用方跳过
+        # （backfill line 805 P2-4 护栏 / compute_all warning）。
+        if r["code"] not in scores.index:
+            continue
         r["score"] = round(float(scores[r["code"]]), 4)
         sp = {name: _f(parts.loc[r["code"], key])
               for key, name in part_names.items()}

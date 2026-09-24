@@ -738,6 +738,73 @@ def test_midday_live_override_prices_and_equity():
     assert "10.00 | 1500.00" in bundle_md or "| 1500.00 |" in bundle_md
 
 
+def test_afternoon_review_bundle():
+    """方案B（13:30 下午复核）：与 midday 同样的实时价/对冲计算，但 since 窗口
+    12:30、产物写 afternoon_bundle.md/json、LLM 输出要求新增"不要重提中午已被
+    规则4 拒绝的 buy"。回放注入 2 条决策（盘前 + 午评），验证全天决策清单覆盖
+    上午+午评两批。"""
+    import pipeline.afternoon as afternoon_mod
+    _fresh_env("afternoon")
+    _seed_db(with_today=True)
+    conn = sqlite3.connect(os.environ["AGSICKLE_DB"])
+    now_real = datetime.now()
+    # 注入 2 条当日决策：盘前 11:04（premarket hold）+ 午评 12:26（midday buy
+    # 被规则4 rejected——模拟 09-21 真实场景）
+    conn.execute(
+        "INSERT INTO decision (run_date, trade_date, code, action, target_weight,"
+        " confidence, reasons, risk_notes, status, created_at, prompt_version)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (now_real.strftime("%Y-%m-%d"), now_real.strftime("%Y-%m-%d"),
+         "300750", "hold", 0.0, 0.70, '["r1","r2"]', "[]", "approved",
+         "2026-09-21T11:04:42", "2026-09.2"))
+    conn.execute(
+        "INSERT INTO decision (run_date, trade_date, code, action, target_weight,"
+        " confidence, reasons, risk_notes, status, created_at, prompt_version)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (now_real.strftime("%Y-%m-%d"), now_real.strftime("%Y-%m-%d"),
+         "000333", "buy", 0.05, 0.72, '["r1","r2"]', "[]", "rejected",
+         "2026-09-21T12:26:59", "2026-09.2"))
+    conn.commit()
+    conn.close()
+    # SESSION_DIR 等目录常量为 import 期固化 → 指向 _fresh_env 的隔离目录
+    afternoon_mod.SESSION_DIR = Path(os.environ["AGSICKLE_SESSION_DIR"])
+
+    now = datetime.combine(_BASE, time(13, 30, 0))   # 冻结下午复核时点（13:30）
+    old_argv = sys.argv
+    sys.argv = ["afternoon.py", "--now", now.isoformat(timespec="seconds")]
+    try:
+        rc = afternoon_mod.main()   # --now 回放 → 产物写 SESSION_DIR/test
+    finally:
+        sys.argv = old_argv
+    assert rc == 0
+    bundle_json = afternoon_mod.SESSION_DIR / "test" / "afternoon_bundle.json"
+    bundle_md = afternoon_mod.SESSION_DIR / "test" / "afternoon_bundle.md"
+    assert bundle_json.is_file(), "afternoon_bundle.json 必须落盘"
+    assert bundle_md.is_file(), "afternoon_bundle.md 必须落盘"
+    # 关键：不要与 midday 产物重名（同名会让会话读错决策包）
+    assert not (afternoon_mod.SESSION_DIR / "test" / "midday_bundle.md").exists() \
+        or "afternoon" in (afternoon_mod.SESSION_DIR / "test").glob("afternoon*md")[0].name
+
+    blob = json.loads(bundle_json.read_text(encoding="utf-8"))
+    # 决策清单覆盖全天：盘前 hold + 午评 buy rejected 两条都要出现
+    codes_in_blob = [d["code"] for d in blob["all_decisions"]]
+    assert "300750" in codes_in_blob, "全天决策清单必须含盘前 hold"
+    assert "000333" in codes_in_blob, "全天决策清单必须含午评 buy（即使已 rejected）"
+    statuses_in_blob = {d["code"]: d["status"] for d in blob["all_decisions"]}
+    assert statuses_in_blob["000333"] == "rejected", "000333 状态必须是 rejected"
+
+    md_text = bundle_md.read_text(encoding="utf-8")
+    # 标题与 LLM 文案校验
+    assert "# 下午复核输入包" in md_text
+    assert "12:30 以来" in md_text, "since 窗口必须是 12:30（非 midday 的 09:00）"
+    assert "不要重提中午已被规则4" in md_text, \
+        "LLM 输出要求第 2 条必须显式提示规则4 已拒绝的 buy 不要重提"
+    assert "13:30~14:50" in md_text, "LLM 输出要求必须给出可执行窗口"
+    assert "全天决策执行情况" in md_text, "决策展示节标题必须叫『全天』而非『上午』"
+    assert "#43" in md_text or "#2" in md_text, \
+        "全天决策清单至少显示一条决策 id"
+
+
 # ---------------- 批次3a（多agent审查 2026-09-21 P2/P1 清债）：执行域修复 ----------------
 
 def test_recorder_single_instance_lock():

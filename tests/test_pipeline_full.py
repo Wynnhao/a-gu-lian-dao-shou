@@ -439,9 +439,9 @@ def test_webapp_confirm_reject_e2e():
                     method="POST")
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     return resp.status, json.loads(resp.read())
-            st, body = post("/api/confirm", {"decision_id": 7, "by": "许文昊"})
+            st, body = post("/api/confirm", {"decision_id": 7, "by": "tester"})
             assert st == 200 and body["ok"] is True and "模拟 runner" in body["output"]
-            assert calls[-1] == ["confirm", "--decision-id", "7", "--by", "许文昊"]
+            assert calls[-1] == ["confirm", "--decision-id", "7", "--by", "tester"]
             st, body = post("/api/reject", {"decision_id": 9, "reason": "逻辑不符"})
             assert st == 200 and body["ok"] is True
             assert calls[-1][0] == "reject" and "--decision-id" in calls[-1]

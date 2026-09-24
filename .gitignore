@@ -64,3 +64,11 @@ Thumbs.db
 *.bak
 *.tmp
 *.pid
+*.invalid
+
+# ---------- 数据备份与损坏库留证（不入仓） ----------
+data/*.db.corrupted*
+data/*.db.bak*
+data/agent.db
+logs/promo/
+logs/signal_eval/
