@@ -47,7 +47,7 @@ PRICE_GUARD_PCT = float(CFG.get("risk", {}).get("price_guard_pct", 0.02))
 MAX_SINGLE_WEIGHT = float(CFG.get("risk", {}).get("max_single_weight", 0.15))
 MAX_TOTAL_WEIGHT = float(CFG.get("risk", {}).get("max_total_weight", 0.80))
 
-PROMPT_VERSION = "2026-10.1"   # 固定文案/输出规则版本，落 decision.prompt_version 供迭代归因（2026-10.1：出手率打磨批——规则8拥挤期 buy conf 0.7→0.65；批次3将再 bump 加第 12 条表态纪律）
+PROMPT_VERSION = "2026-10.2"   # 固定文案/输出规则版本，落 decision.prompt_version 供迭代归因（2026-10.2：批次3 观察期机制——新增规则 12 表态纪律 + 连续性提醒补充 + 观察池两节）
 MD_BUDGET = 45000              # bundle.md 字符数软预算（超限降级新闻正文）
 NAME_OF = {str(w["code"]): str(w.get("name") or "") for w in WATCHLIST}
 
@@ -94,6 +94,81 @@ def _f(v) -> Optional[float]:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+# 出手率打磨批（2026-10-08 裁决#3/#10）：观察期机制——表态线 3 个决策日、
+# watch_pool 实体容量上限。
+WATCH_STREAK_LINE = 3
+WATCH_POOL_CAP = 20
+
+
+def _watch_streaks(conn: sqlite3.Connection) -> list:
+    """watch 观察连击统计（decision 表全史口径，批次3b）。
+
+    每票统计：观察决策日数（DISTINCT run_date，同日多条计 1）、首次/最近
+    watch 日期、期间累计涨幅（daily_bar qfq 优先，首末收盘比）、距表态线
+    （WATCH_STREAK_LINE=3 个决策日）剩余。episode 边界：该票最后一个
+    buy/sell 决策日（升级/退出表态）之后的 watch 才计入——升级或移出后
+    streak 重计。存量数据不回填、历史 status 不改（事件流不改史），
+    本统计只读 decision 表，覆盖 observing 出现前的 approved/report_only
+    旧 watch 行。返回按 streak 降序的 list[dict]。
+    """
+    rows = conn.execute(
+        "SELECT code, run_date FROM decision WHERE action='watch' AND run_date"
+        " IS NOT NULL ORDER BY code, run_date").fetchall()
+    if not rows:
+        return []
+    last_trade = {r[0]: r[1] for r in conn.execute(
+        "SELECT code, MAX(run_date) FROM decision WHERE action IN ('buy','sell')"
+        " AND run_date IS NOT NULL GROUP BY code").fetchall()}
+    by_code: dict = {}
+    for code, rd in rows:
+        by_code.setdefault(str(code), set()).add(str(rd))
+    out = []
+    for code, dayset in by_code.items():
+        cut = last_trade.get(code)
+        days = sorted(d for d in dayset if cut is None or d > cut)
+        if not days:
+            continue
+        streak = len(days)
+        first_d, last_d = days[0], days[-1]
+        cum = None
+        try:
+            b0 = conn.execute(
+                "SELECT close_qfq, close FROM daily_bar WHERE code=? AND"
+                " trade_date>=? ORDER BY trade_date LIMIT 1",
+                (code, first_d)).fetchone()
+            b1 = conn.execute(
+                "SELECT close_qfq, close FROM daily_bar WHERE code=?"
+                " ORDER BY trade_date DESC LIMIT 1", (code,)).fetchone()
+            if b0 and b1:
+                p0 = b0[0] if b0[0] is not None else b0[1]
+                p1 = b1[0] if b1[0] is not None else b1[1]
+                if p0:
+                    cum = float(p1) / float(p0) - 1
+        except Exception:  # noqa: BLE001
+            cum = None
+        out.append({"code": code, "streak_days": streak,
+                    "first_watch": first_d, "last_watch": last_d,
+                    "cum_ret": round(cum, 4) if cum is not None else None,
+                    "deadline_left": WATCH_STREAK_LINE - streak})
+    out.sort(key=lambda x: (-x["streak_days"], x["code"]))
+    return out
+
+
+def _watch_pool_active(conn: sqlite3.Connection) -> list:
+    """watch_pool 实体 active 行（批次3e；表未建/为空 → []）。"""
+    try:
+        rows = conn.execute(
+            "SELECT code, first_date, last_date, count, thesis, catalyst,"
+            " deadline FROM watch_pool WHERE status='active'"
+            " ORDER BY count DESC, code LIMIT ?", (WATCH_POOL_CAP,)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [{"code": r[0], "first_date": r[1], "last_date": r[2],
+             "count": int(r[3]), "thesis": r[4] or "", "catalyst": r[5] or "",
+             "deadline": r[6] or "",
+             "days_left": WATCH_STREAK_LINE - int(r[3])} for r in rows]
 
 
 def _money(v) -> str:
@@ -657,6 +732,18 @@ def build_bundle(run_date: Optional[str] = None,
             bundle["recent_decisions"] = []
             bundle["recent_decisions_error"] = f"决策历史读取失败：{type(e).__name__}: {e}"
 
+        # ---- 观察池状态（出手率打磨批 3b：watch streak）+ 当前观察池（3e 实体）----
+        try:
+            bundle["watch_streaks"] = _watch_streaks(c)
+        except Exception as e:
+            bundle["watch_streaks"] = []
+            bundle["watch_streaks_error"] = f"观察连击统计失败：{type(e).__name__}: {e}"
+        try:
+            bundle["watch_pool"] = _watch_pool_active(c)
+        except Exception as e:
+            bundle["watch_pool"] = []
+            bundle["watch_pool_error"] = f"观察池读取失败：{type(e).__name__}: {e}"
+
         # ---- 数据质量（W-C1：只统计 core 池；非 core 滞后折叠为计数）----
         # universe800 回补停更后全库 730 只"滞后票"≈1.4 万字符，把 45000 预算吃穿
         # 导致新闻正文连续三天被降级清零（P1-19），且滞后告警常态化淹没真异常。
@@ -751,7 +838,11 @@ _OUTPUT_RULES = """## 决策输出要求（prompt_version={pv}）
 11. **红线数据缺失**：bundle 无 profile_verdict、或其中无回测 B/C（MDD）数字时，
    按"无红线信息"处理，并在 risk_notes 中注明"红线数据缺失"；**严禁臆造任何
    回测/MDD 数字**；引用红线数字必须同时带其数据版本（backtest 元数据），
-   版本未知时须注明"数据版本未知"。"""
+   版本未知时须注明"数据版本未知"。
+12. **观察期表态纪律（出手率打磨批 2026-10-08）**：连续 watch ≥3 个决策日的标的
+   （见"观察池状态"节），当日必须表态：或升级 buy（reasons 引用累计证据，仍受
+   全部门槛/风控/人工闸门约束），或输出 hold 并在 reasons 首条写明
+   『移出观察：<失效原因>』。watch 不是终态，无限期观察视为放弃判断。"""
 
 
 def _md_table(headers: list, rows: list) -> str:
@@ -1167,9 +1258,60 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120,
             lines.append(f"- #{d.get('id')} {d.get('run_date')} {d.get('code')} "
                          f"{d.get('action')} status={d.get('status')} "
                          f"conf={d.get('confidence')}{fb}｜{d.get('reason_preview', '')}")
-        lines.append("- 提醒：保持决策连续性，无新证据不要反复打脸自己的昨日判断。")
+        # 出手率打磨批 3c（裁决#10）：连续观察=证据积累中，须评估出手阈值
+        lines.append("- 提醒：保持决策连续性，无新证据不要反复打脸自己的昨日判断；"
+                     "但连续观察 ≥3 日的标的属证据积累中，必须评估是否达到出手阈值，"
+                     "不得无限期观察。")
     else:
         lines.append("- （decision 表为空，暂无历史决策）")
+    lines.append("")
+
+    # 观察池状态（出手率打磨批 3b：watch streak，表态线 3 个决策日）
+    ws = bundle.get("watch_streaks") or []
+    lines += [f"## 观察池状态（watch streak，表态线 {WATCH_STREAK_LINE} 个决策日）", ""]
+    if bundle.get("watch_streaks_error"):
+        lines.append(f"- 统计失败：{bundle['watch_streaks_error']}")
+    elif ws:
+        due = [x for x in ws if x["deadline_left"] <= 0]
+        lines.append(f"- 观察中 {len(ws)} 票，其中**今日须表态 {len(due)} 票**"
+                     + ("：" + "、".join(f"{x['code']}(已{x['streak_days']}日)"
+                                        for x in due) if due else ""))
+        lines.append("")
+        lines.append("| 代码 | 观察日数 | 首次观察 | 最近观察 | 期间涨幅 | 距表态线 |")
+        lines.append("|---|---|---|---|---|---|")
+        for x in ws[:10]:
+            lines.append("| %s | %d | %s | %s | %s | %s |" % (
+                x["code"], x["streak_days"], x["first_watch"], x["last_watch"],
+                _pct(x["cum_ret"]) if x["cum_ret"] is not None else "n/a",
+                ("%d 日" % x["deadline_left"]) if x["deadline_left"] > 0
+                else "**今日须表态**"))
+        lines.append("")
+        lines.append("- watch 不是终态：连续观察 ≥3 日的标的必须表态（升级 buy"
+                     " 或输出 hold 并写明移出观察原因），无限期观察视为放弃判断。")
+    else:
+        lines.append("- 暂无观察中的标的")
+    lines.append("")
+
+    # 当前观察池（出手率打磨批 3e：watch_pool 实体，含催化剂与剩余天数）
+    wp = bundle.get("watch_pool") or []
+    lines += ["## 当前观察池（watch_pool 实体）", ""]
+    if wp:
+        lines.append("| 代码 | 观察日数 | 剩余 | 首日 | 催化剂 | 期限 | 逻辑 |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for x in wp:
+            lines.append("| %s | %d | %s | %s | %s | %s | %s |" % (
+                x["code"], x["count"],
+                ("%d 日" % x["days_left"]) if x["days_left"] > 0
+                else "**须表态**",
+                x["first_date"],
+                (x["catalyst"][:24] or "—"), (x["deadline"] or "—"),
+                (x["thesis"][:40] or "—")))
+        if len(wp) >= WATCH_POOL_CAP:
+            lines.append("")
+            lines.append(f"- ⚠️ 观察池已满（{len(wp)}/{WATCH_POOL_CAP}）："
+                         "新票入池前必须先移出一票（先出后进）。")
+    else:
+        lines.append("- 观察池为空（watch 决策落库时自动维护）")
     lines.append("")
 
     # 数据质量（W-C1：只列核心池滞后票；非 core 折叠计数；预算降级时整体折叠）

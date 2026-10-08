@@ -2,7 +2,8 @@
 
 流程：
 - build_context：从 position/portfolio_state/trade/daily_bar/黑名单/健康检查组装 RiskContext；
-- propose：跑 risk check，decision.status → approved/rejected/report_only；manual_gate 开启时
+- propose：跑 risk check，decision.status → approved/rejected/report_only/observing
+  （watch 无交易动作直通 observing，出手率打磨批 2026-10-08 裁决#4）；manual_gate 开启时
   不直接成交，写 logs/orders/<date>/pending_<decision_id>.json 等待人工确认；
 - confirm：重跑风控后 PaperBroker.buy/sell 成交 + readback 回读，status → executed；
 - reject：人工否决；kill_trigger 联动：kill_orders 逐条 paper 卖出 + apply_kill_switch。
@@ -1085,9 +1086,16 @@ def _propose_locked(conn: sqlite3.Connection, decision: dict,
             exec_cfg.get("emergency_direct_exec", False)
         direct_exec = gate_off or emergency_direct
         if decision.get("action") in ("hold", "watch"):
-            _set_status(conn, decision_id, "approved")
-            print("[propose] decision#%d 状态 -> approved（%s 无交易动作，无需确认）"
-                  % (decision_id, decision.get("action")))
+            # 出手率打磨批（裁决#4）：watch 终态=observing（观察态非待确认态，
+            # 不转 approved——approved 会被 postclose 过期单 sweeper 语义波及，
+            # 且 observing 让日报/周报可区分"观察中"与"已处理"）；hold 保持 approved。
+            _set_status(conn, decision_id,
+                        "observing" if decision.get("action") == "watch"
+                        else "approved")
+            print("[propose] decision#%d 状态 -> %s（%s 无交易动作，无需确认）"
+                  % (decision_id,
+                     "observing" if decision.get("action") == "watch"
+                     else "approved", decision.get("action")))
         elif not direct_exec:
             path = _write_pending(conn, decision_id, decision, v, now, orders_dir,
                                   run_date=run_date)

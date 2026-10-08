@@ -9,6 +9,7 @@ import argparse
 import json
 import logging
 import logging.handlers
+import re
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
@@ -235,6 +236,49 @@ def _dump_raw(run_date: str, data, failed: List[Tuple[int, List[str]]]) -> Optio
         return None
 
 
+def _extract_watch_meta(reasons: list) -> Tuple[str, str, str]:
+    """从 watch reasons 首条结构化提取 (thesis, catalyst, deadline)（3e）。
+
+    catalyst 匹配「催化剂：…」；deadline 匹配首个 YYYY-MM-DD；thesis 取首条
+    前 80 字符。提不出留空字符串（watch_pool 允许空）。
+    """
+    if not reasons:
+        return "", "", ""
+    first = str(reasons[0])
+    m = re.search(r"催化剂[:：]\s*([^；;。]+)", first)
+    catalyst = m.group(1).strip() if m else ""
+    m2 = re.search(r"(20\d{2}-\d{2}-\d{2})", first)
+    deadline = m2.group(1) if m2 else ""
+    return first[:80], catalyst, deadline
+
+
+def _maintain_watch_pool(conn: sqlite3.Connection, d: dict, run_date: str) -> None:
+    """watch_pool 观察池维护（出手率打磨批 3e，裁决#10）。
+
+    watch 落库 → upsert（同日幂等计 1）；buy → upgraded 终结本期；
+    hold 且 reasons 首条含「移出观察」→ removed 终结本期。
+    表不存在时自动建（ensure 幂等，授权=施工方案裁决#10）。失败由调用方
+    捕获 warning，不阻断决策入库。
+    """
+    from data.fetcher import (close_watch_pool, ensure_watch_pool_table,
+                              upsert_watch_pool)
+    ensure_watch_pool_table(conn)
+    action = d.get("action")
+    code = str(d.get("code") or "")
+    if not code:
+        return
+    if action == "watch":
+        thesis, catalyst, deadline = _extract_watch_meta(d.get("reasons") or [])
+        upsert_watch_pool(conn, code, run_date, thesis=thesis,
+                          catalyst=catalyst, deadline=deadline)
+    elif action == "buy":
+        close_watch_pool(conn, code, "upgraded")
+    elif action == "hold":
+        reasons = d.get("reasons") or []
+        if reasons and "移出观察" in str(reasons[0]):
+            close_watch_pool(conn, code, "removed")
+
+
 def save_decisions(conn: sqlite3.Connection, decisions, input_snapshot: str,
                    run_date: str, trade_date: Optional[str] = None,
                    model: str = "", prompt_version: str = PROMPT_VERSION,
@@ -296,6 +340,15 @@ def save_decisions(conn: sqlite3.Connection, decisions, input_snapshot: str,
                      run_date, d["code"], d["action"])
             continue
         status = "proposed" if float(d["confidence"]) >= MIN_CONFIDENCE else "report_only"
+        # 出手率打磨批（2026-10-08 裁决#3/#4）：hold/watch 均免 conf 降级——
+        # watch 一律 status=observing（观察态，非待确认态；不进 propose_db、
+        # 不被过期单 sweeper 扫描），hold 用 proposed（无交易动作，
+        # propose_db 直通 approved）。此前低 conf watch 被降级 report_only，
+        # 观察证据链断裂（watch 死状态根因之一）。
+        if d["action"] == "watch":
+            status = "observing"
+        elif d["action"] == "hold":
+            status = "proposed"
         if d["action"] in ("buy", "sell") and bundle_text \
                 and not _reason_anchored(d["reasons"], bundle_text):
             status = "report_only"
@@ -305,6 +358,12 @@ def save_decisions(conn: sqlite3.Connection, decisions, input_snapshot: str,
             conn, d, run_date, status=status, input_snapshot=input_snapshot,
             trade_date=trade_date, model=model, prompt_version=prompt_version,
             created_at=now)
+        # 观察池维护（3e）：watch→upsert / buy→upgraded / hold+移出观察→removed。
+        # 失败只 warning 不阻断决策入库（观察池是增强元数据，非交易链路）。
+        try:
+            _maintain_watch_pool(conn, d, run_date)
+        except Exception as e:  # noqa: BLE001
+            log.warning("watch_pool 维护失败（不阻断）: %s", repr(e))
         ids.append(new_id)
         log.info("decision#%d run_date=%s trade_date=%s %s %s weight=%s conf=%.2f "
                  "status=%s model=%s pv=%s",

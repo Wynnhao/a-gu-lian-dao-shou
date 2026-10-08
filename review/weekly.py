@@ -419,6 +419,35 @@ def _sec_decision_quality(conn: sqlite3.Connection, start: str, end: str) -> str
                      f"平均次日收益 {'n/a' if avg_ret3 is None else '%+.2f%%' % (avg_ret3 * 100)}"
                      f"，上涨占比 {pos3 / n3:.0%}")
 
+    # 观察票模拟收益 vs 实际持仓收益对比（出手率打磨批 3e，裁决#10 §五.4：
+    # 每周末对照观察池模拟收益 vs 持仓收益 vs 沪深300）
+    try:
+        from ai.bundle import _watch_streaks
+        streaks = [x for x in _watch_streaks(conn) if x.get("cum_ret") is not None]
+        if streaks:
+            sim_avg = sum(x["cum_ret"] for x in streaks) / len(streaks)
+            bench = conn.execute(
+                "SELECT close FROM index_daily WHERE index_code='000300'"
+                " AND trade_date>=? ORDER BY trade_date LIMIT 1", (start,)).fetchone()
+            bench_last = conn.execute(
+                "SELECT close FROM index_daily WHERE index_code='000300'"
+                " ORDER BY trade_date DESC LIMIT 1").fetchone()
+            bench_ret = None
+            if bench and bench_last and bench[0]:
+                bench_ret = float(bench_last[0]) / float(bench[0]) - 1
+            lines.append(
+                f"- 观察票模拟收益（watch_pool/streak 票，首观察日→最新收盘）："
+                f"{len(streaks)} 票平均 {_fmt_pct(sim_avg)}；"
+                f"同期沪深300 {'n/a' if bench_ret is None else _fmt_pct(bench_ret)}"
+                f"——『选票眼光』与『出手纪律』分开复盘：模拟收益显著为正而持仓"
+                f"未受益 → 出手通道问题；模拟收益为负 → 观察票质量问题")
+            top3 = sorted(streaks, key=lambda x: -x["cum_ret"])[:3]
+            lines.append("  - 模拟收益 top3：" + "、".join(
+                f"{x['code']} {_fmt_pct(x['cum_ret'])}（观察{x['streak_days']}日）"
+                for x in top3))
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"- （观察票模拟收益对比生成失败：{type(e).__name__}: {e}）")
+
     # rejected：不计入胜率分母，单独计数（W-C4）
     rej_dec = conn.execute(
         "SELECT COUNT(*) FROM decision WHERE trade_date BETWEEN ? AND ? "

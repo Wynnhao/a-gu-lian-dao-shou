@@ -251,6 +251,92 @@ def _migrate_signal_profile(conn: sqlite3.Connection) -> None:
 _MIGRATED_FOR: Optional[str] = None  # 进程级：该库路径已完成 DDL+迁移（换库自动重跑）
 
 
+def ensure_watch_pool_table(conn: sqlite3.Connection) -> bool:
+    """出手率打磨批批次3e（裁决#10）：watch_pool 显式幂等建表。
+
+    观察池实体表：code 主键 / first_date 首次观察日 / last_date 最近观察日 /
+    count 本期观察决策日数（DISTINCT run_date 语义，同日多条计 1）/
+    thesis 观察逻辑 / catalyst 催化剂 / deadline 表态期限 / status
+    （active 观察|removed 移出|upgraded 升级）/ updated_at。
+
+    **刻意不进 DDL/自动迁移**——生产库 schema 变更须显式授权（施工方案批次3
+    授权=出手率打磨施工方案裁决#10，commit 信息注明）；授权前仅测试在临时库调用。
+    返回是否实际建表。
+    """
+    have = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='watch_pool'"
+    ).fetchone()
+    if have:
+        return False
+    conn.executescript("""
+CREATE TABLE IF NOT EXISTS watch_pool (
+    code TEXT PRIMARY KEY,
+    first_date TEXT NOT NULL,
+    last_date TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 1,
+    thesis TEXT DEFAULT '',
+    catalyst TEXT DEFAULT '',
+    deadline TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    updated_at TEXT NOT NULL
+);
+""")
+    conn.commit()
+    log.info("watch_pool 表已创建（出手率打磨批 3e，观察池实体）")
+    return True
+
+
+def upsert_watch_pool(conn: sqlite3.Connection, code: str, day: str,
+                      thesis: str = "", catalyst: str = "",
+                      deadline: str = "") -> dict:
+    """watch 决策落库时的观察池 upsert（幂等，3e）。
+
+    - 无行或 status != 'active' → 新观察 episode（first_date=day, count=1,
+      status='active'）；
+    - active 且 last_date < day → count+1，last_date=day（同日重复 watch 只计 1）；
+    - active 且 last_date == day → 幂等 no-op（同日第二条 watch 不重复计数）；
+    thesis/catalyst/deadline 仅在 episode 首日写入（后续 watch 不覆盖首日判断）。
+    返回 {"code", "count", "status", "transition"}。
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    row = conn.execute(
+        "SELECT first_date, last_date, count, status FROM watch_pool"
+        " WHERE code=?", (code,)).fetchone()
+    if row is None or row[3] != "active":
+        conn.execute(
+            "INSERT OR REPLACE INTO watch_pool (code, first_date, last_date,"
+            " count, thesis, catalyst, deadline, status, updated_at)"
+            " VALUES (?,?,?,1,?,?,?,'active',?)",
+            (code, day, day, thesis, catalyst, deadline, now))
+        conn.commit()
+        return {"code": code, "count": 1, "status": "active",
+                "transition": "new_episode" if row is None else "reopened"}
+    first, last, cnt, _st = row
+    if last == day:
+        return {"code": code, "count": int(cnt), "status": "active",
+                "transition": "noop_same_day"}
+    conn.execute(
+        "UPDATE watch_pool SET last_date=?, count=count+1, updated_at=?"
+        " WHERE code=?", (day, now, code))
+    conn.commit()
+    return {"code": code, "count": int(cnt) + 1, "status": "active",
+            "transition": "extended"}
+
+
+def close_watch_pool(conn: sqlite3.Connection, code: str, status: str) -> bool:
+    """观察 episode 终结：升级 buy → 'upgraded'；hold+移出观察 → 'removed'。
+
+    无 active 行返回 False；已是终态幂等 no-op 返回 False。
+    """
+    assert status in ("upgraded", "removed")
+    now = datetime.now().isoformat(timespec="seconds")
+    cur = conn.execute(
+        "UPDATE watch_pool SET status=?, updated_at=? WHERE code=?"
+        " AND status='active'", (status, now, code))
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def ensure_valuation_mode_column(conn: sqlite3.Connection) -> bool:
     """P1-9（批次3b）：index_valuation 显式幂等加列 valuation_mode TEXT。
 

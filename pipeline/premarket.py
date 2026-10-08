@@ -263,6 +263,26 @@ def main(argv=None) -> int:
             log.error("步骤7 write_bundle FAIL: %s", repr(e))
             print("[premarket] 决策输入包落盘失败：%r" % e)
             return 1
+
+        # 7.5 观察期到期检测（出手率打磨批 3d，裁决#10）：streak≥3 的观察票
+        # 今日必须表态（升级 buy 或 hold+移出观察）——盘前推送提醒，收盘后
+        # 由日报做「观察纪律失守」标注（只标注不改状态）。
+        try:
+            _bj = json.loads(Path(json_path).read_text(encoding="utf-8"))
+            due = [x for x in (_bj.get("watch_streaks") or [])
+                   if x.get("deadline_left", 99) <= 0]
+            if due:
+                _msg = ("今日 %d 只观察票到期须表态：%s（连续 watch ≥3 决策日，"
+                        "升级 buy 或 hold+移出观察；watch 不是终态）"
+                        % (len(due), "、".join("%s(%d日)" % (x["code"],
+                                                             x["streak_days"])
+                                               for x in due)))
+                print("[premarket] ⚠️ 观察期到期: " + _msg)
+                notify("盘前体检：观察票到期须表态", _msg)
+            else:
+                print("[premarket] 观察期到期检测：今日无到期观察票")
+        except Exception as e:  # noqa: BLE001
+            log.warning("步骤7.5 观察期到期检测失败（不阻断）: %r", e)
     finally:
         conn.close()
 

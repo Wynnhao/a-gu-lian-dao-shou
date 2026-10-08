@@ -99,9 +99,10 @@ def api_workflow(conn: sqlite3.Connection, qs: dict) -> dict:
     stages.append(_stage(
         "risk", "规则裁决", "15条硬规则：仓位/价格/T+1/涨跌停/kill",
         "ok" if decs else "idle",
-        "风控事件 %d 条；approved=%d rejected=%d report_only=%d"
+        "风控事件 %d 条；approved=%d rejected=%d report_only=%d observing=%d"
         % (rk["n"], st_cnt.get("approved", 0) + st_cnt.get("executed", 0),
-           st_cnt.get("rejected", 0), st_cnt.get("report_only", 0)), rk["ts"]))
+           st_cnt.get("rejected", 0), st_cnt.get("report_only", 0),
+           st_cnt.get("observing", 0)), rk["ts"]))
     pend = sorted(_srv.ORDERS_DIR.glob(str(run_date) + "/pending_*.json")) if run_date else []
     p_ts = datetime.fromtimestamp(pend[0].stat().st_mtime) if pend else None
     stages.append(_stage(

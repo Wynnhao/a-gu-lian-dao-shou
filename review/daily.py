@@ -319,6 +319,52 @@ def backfill_decision_outcomes(conn: sqlite3.Connection,
 
 # ---------------------------------------------------------------- 报告生成
 
+def _sec_watch_discipline(conn: sqlite3.Connection, trade_date: str) -> str:
+    """观察纪律标注（出手率打磨批 3d，裁决#10）：streak≥3 到期票当日未表态
+    → 「观察纪律失守」标注（只标注不改状态）。
+
+    表态口径：当日存在 action='buy' 决策，或 action='hold' 且 reasons 首条
+    含「移出观察」。统计口径与 bundle 观察池状态节同源（ai.bundle._watch_streaks）。
+    """
+    try:
+        from ai.bundle import _watch_streaks, WATCH_STREAK_LINE
+        streaks = {x["code"]: x for x in _watch_streaks(conn)}
+    except Exception as e:  # noqa: BLE001
+        return f"（观察连击统计失败：{type(e).__name__}: {e}）"
+    due_codes = sorted(c for c, x in streaks.items()
+                       if x["streak_days"] >= WATCH_STREAK_LINE)
+    if not due_codes:
+        return f"- 今日无观察期到期票（streak≥{WATCH_STREAK_LINE} 个决策日）"
+    acted: dict = {}
+    for code in due_codes:
+        rows = conn.execute(
+            "SELECT action, reasons FROM decision WHERE run_date=? AND code=?"
+            " ORDER BY id", (trade_date, code)).fetchall()
+        for action, reasons in rows:
+            first = ""
+            try:
+                arr = json.loads(reasons) if reasons else []
+                first = str(arr[0]) if arr else ""
+            except (ValueError, TypeError):
+                first = str(reasons or "")
+            if action == "buy" or (action == "hold" and "移出观察" in first):
+                acted[code] = f"{action}（{first[:40]}）"
+                break
+    breached = [c for c in due_codes if c not in acted]
+    lines = []
+    if breached:
+        lines.append(
+            "- ⚠️ **观察纪律失守**：%s（连续 watch ≥%d 个决策日，当日未表态——"
+            "只标注不改状态，累计次数供复盘）"
+            % ("、".join(breached), WATCH_STREAK_LINE))
+    for c in due_codes:
+        if c in acted:
+            lines.append(f"- ✓ {c} 已表态：{acted[c]}")
+    if not lines:
+        lines.append("- 今日无观察期到期票")
+    return "\n".join(lines)
+
+
 def _sec_decisions(conn: sqlite3.Connection, trade_date: str) -> str:
     rows = conn.execute(
         "SELECT id, code, action, target_weight, confidence, reasons, status, created_at, "
@@ -500,6 +546,7 @@ def generate_daily_report(trade_date: Optional[str] = None,
             ("持仓与当日盈亏", lambda: _sec_positions(conn, trade_date)),
             ("基准对比", lambda: _sec_benchmark(conn, trade_date, pnl.get("day_pnl"), pnl.get("prev_total"))),
             ("AI自我评估", lambda: _sec_self_review(conn, trade_date)),
+            ("观察纪律", lambda: _sec_watch_discipline(conn, trade_date)),
         ]:
             try:
                 sections.append((title, fn()))
