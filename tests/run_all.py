@@ -38,8 +38,9 @@ FILES = [
     # 批次 2 交付 test_chan_evidence；批次 3 交付 test_rotation_x
     "test_qfq_rebuild.py", "test_hedge_pair.py", "test_chan_evidence.py",
     "test_rotation_x.py",
-    # 出手率打磨批（2026-10-08）：批次 3 交付 test_observing（观察期机制全量）
-    "test_observing.py",
+    # 出手率打磨批（2026-10-08）：批次 3 交付 test_observing（观察期机制全量）；
+    # 批次 5 交付 test_promote（热门池晋升，ADR-OT-7）
+    "test_observing.py", "test_promote.py",
 ]
 
 

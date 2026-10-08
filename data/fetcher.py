@@ -337,6 +337,198 @@ def close_watch_pool(conn: sqlite3.Connection, code: str, status: str) -> bool:
     return cur.rowcount > 0
 
 
+# ----------------------------------------------------------------
+# 热门池晋升（出手率打磨批批次5，裁决#8 完整版②；ADR-OT-7）
+# ----------------------------------------------------------------
+
+PROMOTED_POOL_CAP = 3        # 晋升容量上限（满了先降后升）
+PROMOTED_SINGLE_CAP = 0.10   # 晋升票单票权重上限（比 core 的 0.15 更严）
+PROMOTE_STRENGTH_MIN = 6.0   # movers 强度路门槛（五规则口径上限约 7.2）
+PROMOTE_HOT_DAYS = 3         # hot_stock 连续上榜日数
+DEMOTE_GAP_DAYS = 5          # 连续 N 个交易日跌出榜 → 自动降级
+
+
+def ensure_promoted_pool_table(conn: sqlite3.Connection) -> bool:
+    """批次5b（ADR-OT-7 §2）：promoted_pool 显式幂等建表。
+
+    **刻意不进 DDL/自动迁移**——生产 schema 变更须显式授权（授权=施工方案
+    裁决#8 完整版②，commit 信息注明）。返回是否实际建表。
+    """
+    have = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+        " AND name='promoted_pool'").fetchone()
+    if have:
+        return False
+    conn.executescript("""
+CREATE TABLE IF NOT EXISTS promoted_pool (
+    code TEXT PRIMARY KEY,
+    name TEXT DEFAULT '',
+    promoted_since TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    demote_reason TEXT DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+""")
+    conn.commit()
+    log.info("promoted_pool 表已创建（出手率打磨批 5b，热门池晋升临时宇宙）")
+    return True
+
+
+def promoted_active_codes(conn: sqlite3.Connection) -> list:
+    """晋升宇宙白名单（active 行，决策宇宙 = core ∪ 本清单）。表未建 → []。"""
+    try:
+        return [r[0] for r in conn.execute(
+            "SELECT code FROM promoted_pool WHERE status='active'"
+            " ORDER BY promoted_since").fetchall()]
+    except sqlite3.OperationalError:
+        return []
+
+
+def promote_candidate(conn: sqlite3.Connection, code: str, name: str,
+                      source: str, day: str,
+                      verify_fn=None) -> dict:
+    """晋升一只热门/异动票进临时宇宙（ADR-OT-7 §1/§3；幂等）。
+
+    风控核（全过才晋升）：
+    - 非 core/extended 既有池成员（已在 watchlist 的票无需晋升）；
+    - 非 promoted_pool active 重复（幂等 no-op）；
+    - 容量：active < PROMOTED_POOL_CAP；
+    - verify_fn(code)（缺省腾讯核名）：可交易 + 名称无 ST/N/C 前缀——生产
+      注入 data.quotes.get_live_prices 包装；测试注入 mock；
+    - blacklist.check_blacklist 全绿。
+
+    返回 {"code", "outcome", "detail"}（outcome ∈ promoted / skip_in_watchlist
+    / skip_already_active / skip_cap_full / skip_verify / skip_blacklist）。
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    from common.config import core_codes, load
+    cfg = load()
+    wl = set(core_codes(cfg)) | {
+        str(w["code"]) for w in (cfg.get("watchlist_extended") or [])}
+    if code in wl:
+        return {"code": code, "outcome": "skip_in_watchlist"}
+    cur_status = conn.execute(
+        "SELECT status FROM promoted_pool WHERE code=?",
+        (code,)).fetchone() if conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+        " AND name='promoted_pool'").fetchone() else None
+    if cur_status and cur_status[0] == "active":
+        return {"code": code, "outcome": "skip_already_active"}
+    n_active = conn.execute(
+        "SELECT COUNT(*) FROM promoted_pool WHERE status='active'").fetchone()[0]
+    if n_active >= PROMOTED_POOL_CAP:
+        return {"code": code, "outcome": "skip_cap_full",
+                "detail": "active=%d" % n_active}
+    # 腾讯核名（ADR §1 风控核①）
+    if verify_fn is None:
+        def verify_fn(c):
+            from data.quotes import get_live_prices
+            q = get_live_prices([c], force=True).get(c)
+            if not q:
+                return False, "无实时行情"
+            nm = str(q.get("name") or "")
+            if "ST" in nm.upper() or nm.startswith(("N", "C")):
+                return False, f"名称异常 {nm!r}"
+            return True, nm
+    ok, detail = verify_fn(code)
+    if not ok:
+        return {"code": code, "outcome": "skip_verify", "detail": detail}
+    try:
+        from risk.blacklist import check_blacklist
+        bl = check_blacklist(conn).get(code)
+        if bl is not None and not bl[0]:
+            return {"code": code, "outcome": "skip_blacklist",
+                    "detail": bl[1][:80]}
+    except Exception as e:  # noqa: BLE001
+        return {"code": code, "outcome": "skip_blacklist",
+                "detail": f"blacklist 检查失败 {type(e).__name__}"}
+    conn.execute(
+        "INSERT OR REPLACE INTO promoted_pool (code, name, promoted_since,"
+        " source, status, demote_reason, updated_at)"
+        " VALUES (?,?,?,?, 'active', '', ?)",
+        (code, name or detail, day, source, now))
+    conn.commit()
+    return {"code": code, "outcome": "promoted", "detail": name or detail}
+
+
+def demote_promoted(conn: sqlite3.Connection, code: str, reason: str,
+                    status: str = "demoted") -> bool:
+    """晋升票降级/除名（ADR-OT-7 §4）：自动降级 demoted、止损/黑名单 removed。
+
+    无 active 行返回 False（幂等）。
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    cur = conn.execute(
+        "UPDATE promoted_pool SET status=?, demote_reason=?, updated_at=?"
+        " WHERE code=? AND status='active'",
+        (status, reason[:200], now, code))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def promote_candidates_from_pools(conn: sqlite3.Connection, day: str,
+                                  verify_fn=None) -> list:
+    """从 dynamic_pool 榜单历史扫描晋升候选（ADR-OT-7 §1，日频）。
+
+    - 连续性路：hot_stock DISTINCT added_date >= PROMOTE_HOT_DAYS；
+    - 强度路：movers 当日（最新 added_date）strength >= PROMOTE_STRENGTH_MIN。
+    候选按 连续日数/strength 降序逐只尝试晋升（容量 3 封顶）。
+    返回 promote_candidate 结果 list。
+    """
+    out = []
+    have = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+        " AND name='dynamic_pool'").fetchone()
+    if not have:
+        return out
+    # 连续路新鲜窗：MAX(added_date) 距最新交易日 > PROMOTE_HOT_DAYS 个交易日
+    # 的票不再入候选——否则 demoted 票的老榜历史会被反复捞出重新晋升
+    #（修复：2026-10-08 test_promote_exit_paths 实证）。
+    latest_td = conn.execute(
+        "SELECT MAX(date) FROM trade_calendar").fetchone()[0]
+    min_fresh = None
+    if latest_td:
+        row = conn.execute(
+            "SELECT date FROM trade_calendar WHERE date<=?"
+            " ORDER BY date DESC LIMIT 1 OFFSET ?",
+            (latest_td, PROMOTE_HOT_DAYS)).fetchone()
+        min_fresh = row[0] if row else None
+    hot_sql = ("SELECT code, MAX(name) AS nm, COUNT(DISTINCT added_date) AS days"
+               " FROM dynamic_pool WHERE pool='hot_stock'"
+               " GROUP BY code HAVING days >= ?")
+    hot_args = [PROMOTE_HOT_DAYS]
+    if min_fresh:
+        hot_sql += " AND MAX(added_date) >= ?"
+        hot_args.append(min_fresh)
+    hot_sql += " ORDER BY days DESC LIMIT 5"
+    hot = conn.execute(hot_sql, hot_args).fetchall()
+    latest_movers = conn.execute(
+        "SELECT MAX(added_date) FROM dynamic_pool WHERE pool='movers'"
+    ).fetchone()[0]
+    mv = []
+    if latest_movers:
+        mv = conn.execute(
+            "SELECT code, MAX(name), strength FROM dynamic_pool"
+            " WHERE pool='movers' AND added_date=? AND strength>=?"
+            " GROUP BY code ORDER BY strength DESC LIMIT 5",
+            (latest_movers, PROMOTE_STRENGTH_MIN)).fetchall()
+    seen = set()
+    for code, nm, days in hot:
+        if code in seen:
+            continue
+        seen.add(code)
+        out.append(promote_candidate(conn, code, nm or "", "hot", day,
+                                     verify_fn=verify_fn))
+    for code, nm, strength in mv:
+        if code in seen:
+            continue
+        seen.add(code)
+        out.append(promote_candidate(conn, code, nm or "", "movers", day,
+                                     verify_fn=verify_fn))
+    return out
+
+
 def ensure_valuation_mode_column(conn: sqlite3.Connection) -> bool:
     """P1-9（批次3b）：index_valuation 显式幂等加列 valuation_mode TEXT。
 

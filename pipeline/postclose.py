@@ -241,6 +241,145 @@ def _sweep_expired_decisions(conn, now: Optional[datetime] = None,
     return {"expired": len(rows), "codes": codes}
 
 
+def _promote_exit_check(conn, out: dict) -> None:
+    """晋升票退出检测（ADR-OT-7 §4）：黑名单 BLOCK / 晋升后 executed sell →
+    removed；连续 >DEMOTE_GAP_DAYS 个交易日未上 hot_stock ∪ movers 榜 →
+    demoted（降回 watch-only）。结果写 out["demoted"]/out["removed"]。
+    """
+    from data.fetcher import DEMOTE_GAP_DAYS, promoted_active_codes
+    from data import repo as _repo
+    active = promoted_active_codes(conn)
+    latest_td = _repo.latest_trade_date(conn)
+    bl = {}
+    try:
+        from risk.blacklist import check_blacklist
+        bl = check_blacklist(conn)
+    except Exception:  # noqa: BLE001
+        bl = {}
+    for code in active:
+        # 黑名单 BLOCK → removed
+        item = bl.get(code)
+        if item is not None and not item[0]:
+            _promote_close(conn, code, "removed",
+                           "blacklist: %s" % item[1][:120], out)
+            continue
+        # 晋升后 executed sell → removed（清仓即退出）
+        n_sell = conn.execute(
+            "SELECT COUNT(*) FROM decision WHERE code=? AND action='sell'"
+            " AND status='executed' AND run_date>=(SELECT promoted_since"
+            " FROM promoted_pool WHERE code=?)", (code, code)).fetchone()[0]
+        if n_sell:
+            _promote_close(conn, code, "removed",
+                           "晋升后卖出成交 %d 笔" % n_sell, out)
+            continue
+        # 连续 >DEMOTE_GAP_DAYS 个交易日未上榜 → demoted
+        last_hit = conn.execute(
+            "SELECT MAX(added_date) FROM dynamic_pool WHERE pool IN"
+            " ('hot_stock','movers') AND code=?", (code,)).fetchone()[0]
+        if latest_td and last_hit and last_hit < latest_td:
+            n_gap = conn.execute(
+                "SELECT COUNT(*) FROM trade_calendar WHERE date>? AND date<=?",
+                (last_hit, latest_td)).fetchone()[0]
+            if n_gap > DEMOTE_GAP_DAYS:
+                _promote_close(conn, code, "demoted",
+                               "连续 %d 个交易日未上热门/异动榜"
+                               "（最近上榜 %s）" % (n_gap, last_hit), out)
+
+
+def _promote_check_and_maintain(conn) -> dict:
+    """步骤2.7 热门池晋升检测与维护（出手率打磨批 5c/5d，ADR-OT-7）。
+
+    1) ensure_promoted_pool_table（幂等显式迁移，授权=裁决#8）；
+    2) 退出检测（先降后升，给新晋升腾容量）；
+    3) 晋升候选扫描（hot_stock 连续≥3 个 added_date / movers 当日 strength
+       ≥6.0）→ 全风控核（腾讯核名 verify_fn + blacklist + 容量 3）后晋升；
+    4) active 晋升票数据维护：stock_info ensure + fetch_daily 幂等增量
+       （fetcher.run 只抓 watchlist 86 只——203 只池外票零行教训）。
+
+    全程 fail-open：任何失败只 warning，不阻断盘后链。
+    """
+    out = {"promoted": [], "demoted": [], "removed": [], "skipped": []}
+    try:
+        from data.fetcher import ensure_promoted_pool_table, \
+            promote_candidates_from_pools, promoted_active_codes
+        from data import repo as _repo
+        ensure_promoted_pool_table(conn)
+        day = _repo.latest_trade_date(conn) or date.today().isoformat()
+
+        # 2) 先做退出检测（ADR"满了先降后升"）
+        _promote_exit_check(conn, out)
+
+        # 3) 晋升候选扫描（腾讯核名 verify_fn；网络失败 → 核名失败跳过）
+        def _verify(code):
+            from data.quotes import get_live_prices
+            q = get_live_prices([code], force=True).get(code)
+            if not q:
+                return False, "无实时行情"
+            nm = str(q.get("name") or "")
+            if "ST" in nm.upper() or nm.startswith(("N", "C")):
+                return False, "名称异常 %r" % nm
+            return True, nm
+
+        try:
+            results = promote_candidates_from_pools(conn, day, verify_fn=_verify)
+        except Exception as e:  # noqa: BLE001
+            log.warning("步骤2.7 晋升候选扫描 FAIL（继续）: %s", repr(e)[:140])
+            results = []
+        for r in results:
+            if r["outcome"] == "promoted":
+                out["promoted"].append(r)
+                log.warning("步骤2.7 热门池晋升：%s（%s）——已入临时宇宙"
+                            "（单票上限 0.10，人工 confirm 照常）",
+                            r["code"], r.get("detail", ""))
+                try:
+                    from risk.notify import notify
+                    notify("热门池晋升", "%s 已入晋升宇宙（source 见 "
+                           "promoted_pool）；单票上限 0.10，confirm 照常"
+                           % r["code"])
+                except Exception:  # noqa: BLE001
+                    pass
+            elif r["outcome"].startswith("skip_"):
+                out["skipped"].append(r)
+
+        # 4) active 晋升票数据回补（stock_info ensure + fetch_daily 增量）
+        if os.environ.get("AGSICKLE_DISABLE_FETCHER") != "1":
+            for code in promoted_active_codes(conn):
+                try:
+                    nm = conn.execute(
+                        "SELECT name FROM promoted_pool WHERE code=?",
+                        (code,)).fetchone()
+                    first = conn.execute(
+                        "SELECT MIN(trade_date) FROM daily_bar WHERE code=?",
+                        (code,)).fetchone()[0]
+                    conn.execute(
+                        "INSERT OR REPLACE INTO stock_info VALUES (?,?,?,?)",
+                        (code, (nm[0] if nm else "") or code, first,
+                         datetime.now().isoformat(timespec="seconds")))
+                    n = fetcher.fetch_daily(code, conn)
+                    if n:
+                        log.info("步骤2.7 晋升票回补 %s: +%d 行", code, n)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("步骤2.7 晋升票 %s 数据维护 FAIL（继续）: %s",
+                                code, repr(e)[:120])
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.error("步骤2.7 晋升检测 FAIL（不阻断）: %s", repr(e)[:160])
+        return out
+
+
+def _promote_close(conn, code: str, status: str, reason: str, out: dict) -> None:
+    from data.fetcher import demote_promoted
+    if demote_promoted(conn, code, reason, status=status):
+        out.setdefault(status, []).append({"code": code, "reason": reason})
+        log.warning("步骤2.7 晋升票%s：%s（%s）", status, code, reason)
+        try:
+            from risk.engine import record_event
+            record_event(conn, "promoted_pool_exit",
+                         "promoted_pool: %s → %s（%s）" % (code, status, reason))
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="盘后流水线：盯市 + 每日复盘报告（本周最后交易日/指定时含周报）")
     ap.add_argument("--date", default=None, dest="trade_date",
@@ -398,6 +537,20 @@ def main(argv=None) -> int:
                 log.info("步骤2.6 过期单清扫：expired %d 笔", r_sweep["expired"])
         except Exception as e:  # noqa: BLE001
             log.error("步骤2.6 过期单清扫 FAIL（继续）: %s", repr(e))
+
+        # 2.7 热门池晋升检测与维护（出手率打磨批 5c/5d，ADR-OT-7）：
+        # 晋升（hot 连续3日/movers 强度≥6 + 腾讯核名 + blacklist + 容量3）
+        # + 退出（5日未上榜 demoted / 卖出成交·黑名单 removed）+ active 票日线回补。
+        # fail-open，不阻断盘后链。
+        try:
+            r_promote = _promote_check_and_maintain(conn)
+            if r_promote["promoted"] or r_promote.get("demoted") \
+                    or r_promote.get("removed"):
+                log.info("步骤2.7 晋升检测：promoted=%d demoted=%d removed=%d",
+                         len(r_promote["promoted"]), len(r_promote.get("demoted") or []),
+                         len(r_promote.get("removed") or []))
+        except Exception as e:  # noqa: BLE001
+            log.error("步骤2.7 晋升检测 FAIL（继续）: %s", repr(e))
     finally:
         conn.close()
 

@@ -365,6 +365,46 @@ def _sec_watch_discipline(conn: sqlite3.Connection, trade_date: str) -> str:
     return "\n".join(lines)
 
 
+def _sec_promoted(conn: sqlite3.Connection, trade_date: str) -> str:
+    """晋升票观测节（出手率打磨批 5d，ADR-OT-7 §5）：active 晋升票清单 +
+    当日决策 + 盯市盈亏——一个月观察窗后据此复盘机制去留。"""
+    try:
+        rows = conn.execute(
+            "SELECT code, name, promoted_since, source, status FROM promoted_pool"
+            " ORDER BY status='active' DESC, promoted_since DESC").fetchall()
+    except Exception as e:  # noqa: BLE001
+        return f"（promoted_pool 读取失败：{type(e).__name__}: {e}）"
+    if not rows:
+        return "- 无晋升票（机制空转中，promoted_pool 为空）"
+    lines = ["| 代码 | 名称 | 入池日 | 来源 | 状态 | 当日决策 | 持仓盈亏 |",
+             "|---|---|---|---|---|---|---|"]
+    for code, name, since, source, status in rows:
+        decs = conn.execute(
+            "SELECT action || '×' || COUNT(*) FROM decision"
+            " WHERE run_date=? AND code=? GROUP BY action",
+            (trade_date, code)).fetchall()
+        dec_s = "、".join(r[0] for r in decs) if decs else "—"
+        pos = conn.execute(
+            "SELECT shares, cost FROM position WHERE code=?", (code,)).fetchone()
+        pnl_s = "—"
+        if pos and pos[0]:
+            bar = conn.execute(
+                "SELECT close_qfq, close FROM daily_bar WHERE code=?"
+                " ORDER BY trade_date DESC LIMIT 1", (code,)).fetchone()
+            if bar:
+                px = bar[0] if bar[0] is not None else bar[1]
+                if px:
+                    pnl = (float(px) - float(pos[1])) * int(pos[0])
+                    pnl_s = "%+.2f（%d 股）" % (pnl, int(pos[0]))
+        lines.append("| %s | %s | %s | %s | %s | %s | %s |" % (
+            code, name or "—", since, source or "—", status, dec_s, pnl_s))
+    n_active = sum(1 for r in rows if r[4] == "active")
+    lines.append("")
+    lines.append(f"- active 晋升票 {n_active}/3（容量上限 3，单票上限 0.10）；"
+                 "本节为晋升机制月度复盘数据源（2026-11-08 窗口末裁决去留）。")
+    return "\n".join(lines)
+
+
 def _sec_decisions(conn: sqlite3.Connection, trade_date: str) -> str:
     rows = conn.execute(
         "SELECT id, code, action, target_weight, confidence, reasons, status, created_at, "
@@ -547,6 +587,7 @@ def generate_daily_report(trade_date: Optional[str] = None,
             ("基准对比", lambda: _sec_benchmark(conn, trade_date, pnl.get("day_pnl"), pnl.get("prev_total"))),
             ("AI自我评估", lambda: _sec_self_review(conn, trade_date)),
             ("观察纪律", lambda: _sec_watch_discipline(conn, trade_date)),
+            ("晋升票", lambda: _sec_promoted(conn, trade_date)),
         ]:
             try:
                 sections.append((title, fn()))

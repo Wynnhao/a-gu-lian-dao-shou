@@ -171,6 +171,23 @@ def _watch_pool_active(conn: sqlite3.Connection) -> list:
              "days_left": WATCH_STREAK_LINE - int(r[3])} for r in rows]
 
 
+def _promoted_pool_active(conn: sqlite3.Connection) -> list:
+    """晋升临时宇宙 active 行（批次5，ADR-OT-7；表未建/为空 → []）。"""
+    try:
+        rows = conn.execute(
+            "SELECT p.code, p.name, p.promoted_since, p.source,"
+            " COALESCE(d.reason, '') FROM promoted_pool p"
+            " LEFT JOIN dynamic_pool d ON d.code = p.code"
+            " AND d.added_date = (SELECT MAX(added_date) FROM dynamic_pool"
+            "     WHERE pool IN ('hot_stock','movers') AND code = p.code)"
+            " WHERE p.status='active' ORDER BY p.promoted_since").fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [{"code": r[0], "name": r[1], "promoted_since": r[2],
+             "source": r[3], "reason": r[4] or "",
+             "single_cap": 0.10} for r in rows]
+
+
 def _money(v) -> str:
     return "n/a" if v is None else f"{float(v):,.2f}"
 
@@ -743,6 +760,12 @@ def build_bundle(run_date: Optional[str] = None,
         except Exception as e:
             bundle["watch_pool"] = []
             bundle["watch_pool_error"] = f"观察池读取失败：{type(e).__name__}: {e}"
+        # ---- 晋升临时宇宙（出手率打磨批 5，ADR-OT-7）----
+        try:
+            bundle["promoted_pool"] = _promoted_pool_active(c)
+        except Exception as e:
+            bundle["promoted_pool"] = []
+            bundle["promoted_pool_error"] = f"晋升池读取失败：{type(e).__name__}: {e}"
 
         # ---- 数据质量（W-C1：只统计 core 池；非 core 滞后折叠为计数）----
         # universe800 回补停更后全库 730 只"滞后票"≈1.4 万字符，把 45000 预算吃穿
@@ -1312,6 +1335,27 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120,
                          "新票入池前必须先移出一票（先出后进）。")
     else:
         lines.append("- 观察池为空（watch 决策落库时自动维护）")
+    lines.append("")
+
+    # 晋升临时宇宙（出手率打磨批 5，ADR-OT-7）
+    pp = bundle.get("promoted_pool") or []
+    lines += ["## 晋升票（临时宇宙，单票上限 0.10）", ""]
+    if bundle.get("promoted_pool_error"):
+        lines.append(f"- 读取失败：{bundle['promoted_pool_error']}")
+    elif pp:
+        lines.append("| 代码 | 名称 | 入池日 | 来源 | 单票上限 | 最近上榜理由 |")
+        lines.append("|---|---|---|---|---|---|")
+        for x in pp:
+            lines.append("| %s | %s | %s | %s | %.0f%% | %s |" % (
+                x["code"], x["name"] or "—", x["promoted_since"],
+                x["source"], x["single_cap"] * 100,
+                (x["reason"][:60] or "—")))
+        lines.append("")
+        lines.append("- 晋升票不在 core 信号口径内（无历史打分行），决策依据"
+                     "以实时行情/新闻/上榜理由为主，buy 需给足证据；"
+                     "连续 5 个交易日跌出热门/异动榜将自动降级为 watch-only。")
+    else:
+        lines.append("- 当前无晋升票")
     lines.append("")
 
     # 数据质量（W-C1：只列核心池滞后票；非 core 折叠计数；预算降级时整体折叠）

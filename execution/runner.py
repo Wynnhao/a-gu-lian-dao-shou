@@ -231,6 +231,20 @@ def kill_extend(conn: sqlite3.Connection, hours: float, reason: str = "") -> dic
 
 # ---------------------------------------------------------------- 上下文组装
 
+def _promoted_codes_failopen(conn: sqlite3.Connection, ctx_notes: list) -> set:
+    """晋升宇宙白名单（批次5b，ADR-OT-7 §3）：promoted_pool active 行。
+
+    fail-open：表未建/查询失败 → 空 set（晋升机制故障不阻断风控链），
+    失败便签写 ctx_notes（C-ARC-4 模式）。
+    """
+    try:
+        from data.fetcher import promoted_active_codes
+        return set(promoted_active_codes(conn))
+    except Exception as e:  # noqa: BLE001
+        ctx_notes.append(f"promoted_codes 读取失败（fail-open 空）: {type(e).__name__}")
+        return set()
+
+
 def build_context(conn: sqlite3.Connection, now: datetime,
                   live_quotes_override: Optional[Dict[str, dict]] = None) -> RiskContext:
     """组装风控上下文。
@@ -416,6 +430,7 @@ def build_context(conn: sqlite3.Connection, now: datetime,
         code_concepts=code_concepts,
         today_sold_codes=today_sold,
         watchlist_codes=wl_codes,
+        promoted_codes=_promoted_codes_failopen(conn, ctx_notes),  # 批次5b（ADR-OT-7 §3）
         position_cap=position_cap,
         atr_pct=atr_pct,
         ctx_notes=ctx_notes,

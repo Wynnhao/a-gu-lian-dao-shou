@@ -49,6 +49,8 @@ class RiskContext:
     atr_pct: Dict[str, float] = field(default_factory=dict)  # {code: ATR占比}（ATR 自适应止损）
     # ---- Sprint 1 任务 4：实时行情扩展（规则 21 条件② 死封判定） ----
     live_quotes: Dict[str, dict] = field(default_factory=dict)  # {code: quote_dict 含 ask1_vol/float_mv}
+    # ---- 出手率打磨批 5b（ADR-OT-7 §3）：晋升票单票上限 0.10（比 core 0.15 严） ----
+    promoted_codes: set = field(default_factory=set)  # promoted_pool active 行
     # ---- Sprint4 W-A9（P1-5）：latest_prices 的口径标记（build_context 填写） ----
     # "live"=实时快照价；"stale_close"=实时缺失回退的日线收盘（昨收冒充实价）。
     # 缺省空 dict = 旧调用方未标注 → 规则9 按原行为比对（向后兼容）。
@@ -336,7 +338,11 @@ def stop_loss_breaches(ctx: RiskContext, cfg: dict) -> List[Tuple[str, float]]:
 
 
 def rule_single_weight(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> None:
-    """规则6：单票权重（该票持仓市值+本次买入金额)/总权益 ≤ 上限（仅 buy）。"""
+    """规则6：单票权重（该票持仓市值+本次买入金额)/总权益 ≤ 上限（仅 buy）。
+
+    出手率打磨批 5b（ADR-OT-7 §3）：晋升票（ctx.promoted_codes）上限取
+    min(静态上限, 0.10)——临时宇宙成员比 core 更严。
+    """
     if decision.get("action") != "buy":
         return
     equity = float(ctx.total_equity or 0)
@@ -347,6 +353,8 @@ def rule_single_weight(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) 
     amount = float(order.get("price", 0) or 0) * _effective_shares(order, v)
     w = (_position_mv(ctx, str(decision.get("code") or "")) + amount) / equity
     cap = float(cfg.get("max_single_weight", 0.15))
+    if str(decision.get("code") or "") in (ctx.promoted_codes or set()):
+        cap = min(cap, 0.10)
     if w > cap + 1e-9:
         v.violations.append("单票权重 %.1f%% > 上限 %.1f%%" % (w * 100, cap * 100))
 

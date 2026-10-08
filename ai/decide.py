@@ -59,13 +59,16 @@ log.propagate = False
 # ---------------------------------------------------------------- 校验
 
 def validate(obj, blacklist: Optional[dict] = None,
-             earnings_events: Optional[dict] = None) -> Tuple[bool, Optional[dict], List[str]]:
+             earnings_events: Optional[dict] = None,
+             promoted_codes: Optional[set] = None) -> Tuple[bool, Optional[dict], List[str]]:
     """校验单条决策 -> (ok, normalized, errors)。
 
     - obj 须为 dict；action/code/target_weight/confidence/reasons 必填，risk_notes 默认 []。
     - blacklist 为 {code: (ok, reason)}（可选）：传入时拦截 ok=False 的黑名单票。
     - earnings_events 为 {code: {positive, negative, net, ...}}（可选，Fix-5）：
       该票近 3 日净分 ≥ +2 → confidence = min(1.0, confidence + 0.1)（normalize 阶段）。
+    - promoted_codes（出手率打磨批 5c，ADR-OT-7 §2）：晋升临时宇宙 active 码，
+      并入决策宇宙白名单（buy/sell/hold 放行，watch 本就放宽）。
     - normalized 只保留白名单键（多余键剔除）；buy/sell 保留规整后的 order，hold/watch 不带 order。
     """
     errors: List[str] = []
@@ -83,8 +86,13 @@ def validate(obj, blacklist: Optional[dict] = None,
     # 任意有效代码——动态池（异动/热门）票纳入评估用，无交易动作、不涉及资金
     if not (len(code) == 6 and code.isdigit()):
         errors.append("code 非法: %r（须为6位数字字符串）" % (obj.get("code"),))
-    elif action != "watch" and code not in WATCHLIST_CODES:
-        errors.append("code %s 不在 watchlist 内 %s" % (code, WATCHLIST_CODES))
+    elif action != "watch":
+        # 出手率打磨批 5c（ADR-OT-7 §2）：宇宙 = core ∪ promoted(active)——
+        # 每次实时合成（晋升是运行时动态态，模块级快照不含晋升票）
+        universe = set(WATCHLIST_CODES) | set(promoted_codes or set())
+        if code not in universe:
+            errors.append("code %s 不在 watchlist 内 %s"
+                          % (code, sorted(universe)))
 
     # 黑名单（传入 blacklist 时才校验；执行层风控引擎还会再拦一次）
     # P0-5：sell 单豁免"仅业绩预告负面"拦截（止损卖出不应被焊死，与 engine 同口径）
@@ -305,10 +313,19 @@ def save_decisions(conn: sqlite3.Connection, decisions, input_snapshot: str,
         log.warning("黑名单读取失败，本轮跳过黑名单校验: %s", repr(e))
         bl = {}
 
+    # 晋升临时宇宙白名单（出手率打磨批 5c，ADR-OT-7 §2）：实时读 promoted_pool
+    try:
+        from data.fetcher import promoted_active_codes
+        promoted = set(promoted_active_codes(conn))
+    except Exception as e:  # noqa: BLE001
+        promoted = set()
+        log.warning("晋升白名单读取失败（按空处理）: %s", repr(e))
+
     normalized_all: List[dict] = []
     failed: List[Tuple[int, List[str]]] = []
     for i, d in enumerate(decisions):
-        ok, norm, errs = validate(d, blacklist=bl, earnings_events=earnings_events)
+        ok, norm, errs = validate(d, blacklist=bl, earnings_events=earnings_events,
+                                  promoted_codes=promoted)
         if ok:
             normalized_all.append(norm)
         else:
