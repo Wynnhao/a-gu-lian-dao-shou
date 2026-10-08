@@ -96,7 +96,8 @@ def test_regime_no_data_is_noop():
 
 
 def test_regime_dual_shelter_close_only():
-    """二八皆弱（近20日双跌）→ 避险档 cap=0.2；无 H/L 时 RSRS 不参与。"""
+    """二八皆弱（近20日双跌）→ 避险档 cap=0.3（出手率打磨批 2026-10-08 裁决#7，
+    原缺省 0.2）；无 H/L 时 RSRS 不参与。"""
     conn = _mem_conn()
     n = 120
     flat = [1000.0] * (n - 20)
@@ -105,7 +106,7 @@ def test_regime_dual_shelter_close_only():
     _seed_index(conn, "000300", big)
     _seed_index(conn, "000905", small)
     out = compute_regime(conn, CFG)
-    assert abs(out["cap"] - 0.20) < 1e-9
+    assert abs(out["cap"] - 0.30) < 1e-9  # 裁决#7：cap_shelter 0.2→0.3
     assert out["tier"] == "避险"
     assert out["dual_mom"]["big"] < 0 and out["dual_mom"]["small"] < 0
     conn.close()
@@ -137,7 +138,7 @@ def test_regime_with_hl_has_rsrs_detail():
     _seed_index(conn, "000905", list(closes * 0.8))
     out = compute_regime(conn, CFG)
     assert out["rsrs"] is not None
-    assert out["cap"] is None or out["cap"] in (0.20, 0.50, 0.80)
+    assert out["cap"] is None or out["cap"] in (0.30, 0.50, 0.80)  # 裁决#7
     conn.close()
 
 
@@ -166,7 +167,7 @@ def test_vol_target_scales_down_in_high_vol():
 
 
 def test_position_cap_combines_min():
-    """组合输出 = min(regime cap, vol cap)：避险 0.2 + 波动 cap → 0.2。"""
+    """组合输出 = min(regime cap, vol cap)：避险 0.3 + 波动 cap → 0.3（裁决#7）。"""
     conn = _mem_conn()
     n = 120
     flat = [1000.0] * (n - 20)
@@ -177,7 +178,7 @@ def test_position_cap_combines_min():
         totals.append(totals[-1] * (1.022 if i % 2 == 0 else 0.9782))
     _seed_portfolio(conn, totals)
     out = position_cap(conn, CFG)
-    assert abs(out["cap"] - 0.20) < 1e-9
+    assert abs(out["cap"] - 0.30) < 1e-9  # 裁决#7：cap_shelter 0.2→0.3
     assert out["vol_target"]["cap"] is not None
     conn.close()
 
@@ -275,11 +276,11 @@ def test_regime_etf_share_no_move_returns_none():
 
 # ---------------- Fix-2：ETF 升/降档 min-after override ----------------
 # RSRS 的 OLS β 对构造方式敏感（渐变/跳变都会失真），改用确定性极强的
-# 二八避险（cap 0.2）与国债乘子（0.8×0.8=0.64）作基础 cap 载体，
+# 二八避险（cap 0.3，裁决#7 原 0.2）与国债乘子（0.8×0.8=0.64）作基础 cap 载体，
 # ETF override 语义与载体无关。
 
 def _seed_dual_shelter(conn):
-    """近 20 日大小盘双跌 → 二八避险档 cap=0.2（无 H/L → RSRS 不参与）。"""
+    """近 20 日大小盘双跌 → 二八避险档 cap=0.3（裁决#7；无 H/L → RSRS 不参与）。"""
     n = 120
     flat = [1000.0] * (n - 20)
     big = flat + [1000.0 * (1 - 0.01 * i) for i in range(1, 21)]
@@ -289,7 +290,7 @@ def _seed_dual_shelter(conn):
 
 
 def test_regime_etf_upgrades_shelter_to_half():
-    """W-B7：ETF 档位信号显式 no-op——即便表里有 +3% 历史行，二八避险 0.2
+    """W-B7：ETF 档位信号显式 no-op——即便表里有 +3% 历史行，二八避险 0.3
     不再被 override 提档（原 Fix-2 min-after override 已随数据源下线删除）。"""
     conn = _mem_conn()
     try:
@@ -299,7 +300,7 @@ def test_regime_etf_upgrades_shelter_to_half():
         assert r["dual_mom"]["big"] < 0 and r["dual_mom"]["small"] < 0
         assert r["etf_share"]["direction"] is None
         assert "no-op" in r["etf_share"]["signal"]
-        assert abs(r["cap"] - 0.20) < 1e-9   # cap 不被提档
+        assert abs(r["cap"] - 0.30) < 1e-9   # cap 不被提档（裁决#7 原 0.2）
         assert r["tier"] == "避险"
     finally:
         conn.close()

@@ -48,6 +48,7 @@ os.environ.setdefault("AGSICKLE_DISABLE_SPOT", "1")
 from common.config import core_codes  # noqa: E402
 from data.fetcher import DDL  # noqa: E402
 from ai import bundle as ai_bundle  # noqa: E402
+from ai import decide as ai_decide  # noqa: E402
 from ai import decide  # noqa: E402
 from review import daily as daily_mod  # noqa: E402
 from review import weekly as weekly_mod  # noqa: E402
@@ -252,6 +253,11 @@ def test_wc3_prompt_redline_semantics_present():
     assert "红线数据缺失" in rules
     assert "严禁臆造" in rules
     assert "数据版本未知" in rules
+    # 出手率打磨批（2026-10-08 裁决#6）：拥挤期 buy conf 阈值 0.7→0.65，
+    # 文案常量锁定——新旧值都不允许漂移（PROMPT_VERSION=2026-10.1）
+    assert "≥ 0.65" in rules
+    assert "0.7（否则" not in rules
+    assert ai_bundle.PROMPT_VERSION >= "2026-10"
     # 渲染层不再出现旧的"无条件 hold"语义
     conn = _mem()
     try:
@@ -262,6 +268,33 @@ def test_wc3_prompt_redline_semantics_present():
         assert bundle_missing_verdict_renders_guidance(b)
     finally:
         conn.close()
+
+
+@test
+def test_guardrail_values_20261008_synced():
+    """出手率打磨批（2026-10-08 裁决#5/6/7/9）常量锁定：config 新值、代码兜底
+    缺省、提示词文案三处一致——防 config 键缺失时静默回退旧口径（历史事故：
+    并行会话重写 config 丢字段，调用方静默落默认）。"""
+    import json as _json
+    base = Path(ai_bundle.__file__).resolve().parent.parent
+    cfg = _json.loads((base / "config.json").read_text(encoding="utf-8"))
+    # config 新值（放宽：#5/#7；收紧对冲：#9）
+    assert cfg["risk"]["min_confidence"] == 0.55
+    assert cfg["risk"]["max_single_weight"] == 0.15
+    assert cfg["risk"]["max_weekly_turnover"] == 1.5
+    assert cfg["regime"]["cap_shelter"] == 0.30
+    assert cfg["regime"]["cap_half"] == 0.5  # 裁决#7 明确不动项
+    # 模块快照常量跟随 config（import 期冻结）
+    assert ai_bundle.MAX_SINGLE_WEIGHT == 0.15
+    assert ai_decide.MIN_CONFIDENCE == 0.55
+    assert ai_decide.MAX_SINGLE_WEIGHT == 0.15
+    # 代码兜底缺省与 config 一致（防键缺失回退旧值）
+    engine_src = (base / "risk" / "engine.py").read_text(encoding="utf-8")
+    assert 'cfg.get("min_confidence", 0.55)' in engine_src
+    assert 'cfg.get("max_single_weight", 0.15)' in engine_src
+    assert 'cfg.get("max_weekly_turnover", 1.5)' in engine_src
+    regime_src = (base / "risk" / "regime.py").read_text(encoding="utf-8")
+    assert '"cap_shelter": 0.30' in regime_src
 
 
 def bundle_missing_verdict_renders_guidance(b: dict) -> bool:

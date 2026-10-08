@@ -622,15 +622,15 @@
     }
   },
   "risk": {
-    "max_single_weight": 0.15,
+    "max_single_weight": 0.2,
     "max_total_weight": 0.8,
     "max_positions": 5,
     "price_guard_pct": 0.02,
     "max_daily_trades": 3,
-    "max_weekly_turnover": 1.5,
+    "max_weekly_turnover": 2.0,
     "max_drawdown_kill": 0.08,
     "kill_stop_hours": 72,
-    "min_confidence": 0.55,
+    "min_confidence": 0.6,
     "lot_size": 100,
     "stop_loss_pct": 0.08,
     "atr_stop_mult": 2.0,
@@ -649,7 +649,7 @@
     "index_small": "000905",
     "dual_mom_window": 20,
     "cap_half": 0.5,
-    "cap_shelter": 0.3
+    "cap_shelter": 0.2
   },
   "vol_target": {
     "enabled": true,

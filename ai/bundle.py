@@ -44,10 +44,10 @@ WATCHLIST = core_watchlist(CFG)          # 策略可交易池（51 只）
 WATCHLIST_EXT = CFG.get("watchlist_extended", [])  # 仅供观察
 START_CASH = float(CFG.get("execution", {}).get("paper_start_cash", 1000000.0))
 PRICE_GUARD_PCT = float(CFG.get("risk", {}).get("price_guard_pct", 0.02))
-MAX_SINGLE_WEIGHT = float(CFG.get("risk", {}).get("max_single_weight", 0.20))
+MAX_SINGLE_WEIGHT = float(CFG.get("risk", {}).get("max_single_weight", 0.15))
 MAX_TOTAL_WEIGHT = float(CFG.get("risk", {}).get("max_total_weight", 0.80))
 
-PROMPT_VERSION = "2026-09.2"   # 固定文案/输出规则版本，落 decision.prompt_version 供迭代归因（2026-09.2：批次6 研究证据参考节合入）
+PROMPT_VERSION = "2026-10.1"   # 固定文案/输出规则版本，落 decision.prompt_version 供迭代归因（2026-10.1：出手率打磨批——规则8拥挤期 buy conf 0.7→0.65；批次3将再 bump 加第 12 条表态纪律）
 MD_BUDGET = 45000              # bundle.md 字符数软预算（超限降级新闻正文）
 NAME_OF = {str(w["code"]): str(w.get("name") or "") for w in WATCHLIST}
 
@@ -739,7 +739,7 @@ _OUTPUT_RULES = """## 决策输出要求（prompt_version={pv}）
 7. **遵守"市场环境总闸"**：当日全部买入的 target_weight 合计不得超过当前总仓位上限
    （见 regime 一节，当前 {captop}）；触及上限时优先输出减仓/持有，不要输出加仓。
 8. **因子拥挤熔断（Sprint 1 任务 5）**：当 bundle.factor_crowding.crowded=True 时，
-   buy 单 confidence 必须 ≥ 0.7（否则改 hold/watch），且 target_weight ≤ 5%（即使人工填更高，
+   buy 单 confidence 必须 ≥ 0.65（否则改 hold/watch），且 target_weight ≤ 5%（即使人工填更高，
    风控规则 20 也会自动压回 5%）。
 9. **业绩预告事件（Sprint 2 任务 2）**：当 bundle.earnings_events_latest[code].net ≤ -2 时，
    该票禁止 buy（即使其他信号看好）。
@@ -863,7 +863,7 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120,
             lines.append(f"- ⚠️ **拥挤熔断生效**：buy 单 target_weight > 5% 自动压回")
             lines.append(f"- μ60={fc.get('mu60')}, σ60={fc.get('sigma60')}, "
                          f"buckets={fc.get('n_buckets')}")
-            lines.append("- LLM 倾向 hold（confidence ≥ 0.7 才允许 buy）")
+            lines.append("- LLM 倾向 hold（confidence ≥ 0.65 才允许 buy）")
         else:
             lines.append(f"- 正常：{fc.get('reason', '')}")
         lines.append("")
@@ -1244,7 +1244,7 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120,
                                       guard=PRICE_GUARD_PCT,
                                       maxw=MAX_SINGLE_WEIGHT,
                                       captop=captop,
-                                      minconf=CFG.get("risk", {}).get("min_confidence", 0.60)))
+                                      minconf=CFG.get("risk", {}).get("min_confidence", 0.55)))
     lines.append("")
     return "\n".join(lines)
 

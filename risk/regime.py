@@ -54,7 +54,7 @@ _DEFAULTS = {
     "index_small": "000905",
     "dual_mom_window": 20,
     "cap_half": 0.50,          # 半配档（绝对总仓位）
-    "cap_shelter": 0.20,       # 避险档（绝对总仓位）
+    "cap_shelter": 0.30,       # 避险档（绝对总仓位；出手率打磨批 2026-10-08 裁决#7 0.20→0.30，与 config.json 同步——本值是 config 键缺失时的兜底，两处须一致）
     "tier_names": ("满配", "半配", "避险"),
 }
 _VOL_DEFAULTS = {

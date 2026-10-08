@@ -177,7 +177,7 @@ def rule_confidence(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) -> 
         conf = float(conf)
     except (TypeError, ValueError):
         conf = 0.0
-    floor = float(cfg.get("min_confidence", 0.60))
+    floor = float(cfg.get("min_confidence", 0.55))
     if conf < floor:
         v.report_only = True
         v.violations.append("置信度 %.2f < 下限 %.2f，降级为只出报告" % (conf, floor))
@@ -346,7 +346,7 @@ def rule_single_weight(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) 
     order = decision.get("order") or {}
     amount = float(order.get("price", 0) or 0) * _effective_shares(order, v)
     w = (_position_mv(ctx, str(decision.get("code") or "")) + amount) / equity
-    cap = float(cfg.get("max_single_weight", 0.20))
+    cap = float(cfg.get("max_single_weight", 0.15))
     if w > cap + 1e-9:
         v.violations.append("单票权重 %.1f%% > 上限 %.1f%%" % (w * 100, cap * 100))
 
@@ -444,7 +444,7 @@ def rule_weekly_turnover(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict
     amount = float(order.get("price", 0) or 0) * _effective_shares(order, v)
     add = amount / equity
     cur = float(ctx.week_turnover or 0)
-    cap = float(cfg.get("max_weekly_turnover", 2.0))
+    cap = float(cfg.get("max_weekly_turnover", 1.5))
     if cur + add > cap + 1e-9:
         v.violations.append(
             "周换手 %.0f%% + 本次 %.1f%% = %.1f%% > 上限 %.0f%%"
@@ -642,7 +642,7 @@ def rule_target_weight(decision: dict, ctx: RiskContext, cfg: dict, v: Verdict) 
     except (TypeError, ValueError):
         v.violations.append("目标权重非法：%r" % (decision.get("target_weight"),))
         return
-    cap = float(cfg.get("max_single_weight", 0.20))
+    cap = float(cfg.get("max_single_weight", 0.15))
     if tw < 0 or tw > cap + 1e-9:
         v.violations.append("目标权重 %.1f%% 越界（合法范围 0 ~ %.0f%%）" % (tw * 100, cap * 100))
 

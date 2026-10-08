@@ -22,8 +22,8 @@ from risk.blacklist import check_blacklist, is_earnings_only
 CFG = snapshot()  # 统一配置层（批1迁移：消除 import 冻结的裸 json.loads 坏味道）
 RISK_CFG = CFG.get("risk", {})
 WATCHLIST_CODES = core_codes(CFG)   # 策略可交易池（watchlist_core，51 只）；扩展观察池不可交易
-MAX_SINGLE_WEIGHT = float(RISK_CFG.get("max_single_weight", 0.20))
-MIN_CONFIDENCE = float(RISK_CFG.get("min_confidence", 0.60))
+MAX_SINGLE_WEIGHT = float(RISK_CFG.get("max_single_weight", 0.15))
+MIN_CONFIDENCE = float(RISK_CFG.get("min_confidence", 0.55))
 
 _ACTIONS = ("buy", "sell", "hold", "watch")
 
