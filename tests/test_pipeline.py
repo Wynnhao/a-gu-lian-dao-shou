@@ -794,15 +794,161 @@ def test_afternoon_review_bundle():
     assert statuses_in_blob["000333"] == "rejected", "000333 状态必须是 rejected"
 
     md_text = bundle_md.read_text(encoding="utf-8")
-    # 标题与 LLM 文案校验
+    # 标题与 LLM 文案校验（出手率打磨批裁决#2：重提改为系统自动，LLM 文案反转）
     assert "# 下午复核输入包" in md_text
     assert "12:30 以来" in md_text, "since 窗口必须是 12:30（非 midday 的 09:00）"
-    assert "不要重提中午已被规则4" in md_text, \
-        "LLM 输出要求第 2 条必须显式提示规则4 已拒绝的 buy 不要重提"
+    assert "规则4 拒单已由系统自动重提" in md_text, \
+        "LLM 输出要求第 2 条必须改为『规则4 拒单已由系统自动重提』"
+    assert "不要重提中午已被规则4" not in md_text, \
+        "旧『下午不重提』条款必须删除（裁决#2）"
+    assert "规则4 拒单重提（系统已处理）" in md_text, "重提结果节必须渲染"
     assert "13:30~14:50" in md_text, "LLM 输出要求必须给出可执行窗口"
     assert "全天决策执行情况" in md_text, "决策展示节标题必须叫『全天』而非『上午』"
     assert "#43" in md_text or "#2" in md_text, \
         "全天决策清单至少显示一条决策 id"
+    # 回放模式：重提步骤跳过（不产生真实 pending 单）
+    assert blob.get("resubmits") == [], "回放模式不得产生重提单"
+
+
+# ---------------- 出手率打磨批（2026-10-08 裁决#2）：规则4 拒单自动重提 ----------------
+
+def _seed_session_rejected_buy(conn, code: str = "000001", conf: float = 0.72,
+                               orig_price: float = 10.9, when: str = "12:30:00"):
+    """合成一条当日被规则4（非交易时段）拒绝的 buy：decision 行（rejected）
+    + risk_event(rule='risk_check', detail LIKE '非交易时段%')。返回原 id。"""
+    today = date.today().isoformat()
+    snap = json.dumps({"action": "buy", "code": code, "target_weight": 0.05,
+                       "confidence": conf, "reasons": ["理由一", "理由二"],
+                       "risk_notes": [],
+                       "order": {"side": "buy", "price": orig_price,
+                                 "shares": 400}}, ensure_ascii=False)
+    cur = conn.execute(
+        "INSERT INTO decision (run_date, trade_date, code, action, target_weight,"
+        " confidence, reasons, risk_notes, input_snapshot, status, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (today, today, code, "buy", 0.05, conf,
+         '["理由一","理由二"]', '[]', snap, "rejected",
+         today + "T" + when))
+    rid = int(cur.lastrowid)
+    conn.execute(
+        "INSERT INTO risk_event (ts, rule, detail, decision_id) VALUES (?,?,?,?)",
+        (today + "T" + when, "risk_check",
+         "非交易时段：%s %s 不在 周一~周五 09:30-11:30/13:00-15:00，拒绝买卖"
+         % (today, when), rid))
+    conn.commit()
+    return rid
+
+
+def test_resubmit_session_rejected_buy_success():
+    """裁决#2 用例①：12:30 被 rule_trading_session 拒的 buy，13:31 重提成功
+    ——新单挂人工闸门、input_snapshot 带 afternoon_resubmit_of、risk_event 留痕。"""
+    import pipeline.afternoon as afternoon_mod
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_TMP_ROOT / "resub_ok_orders")
+    orders.mkdir(exist_ok=True)
+    rid = _seed_session_rejected_buy(conn)
+    now = datetime.combine(_BASE, time(13, 31, 0))  # 下午连续竞价时段
+    live = {"000001": {"price": 11.0, "prev_close": 10.9, "name": "平安银行",
+                       "source": "mock"}}
+    ctx = runner.build_context(conn, now)
+    try:
+        out = afternoon_mod.resubmit_session_rejected_buys(
+            conn, live, ctx, now, orders_dir=orders)
+        assert len(out) == 1 and out[0]["orig_id"] == rid, out
+        assert out[0]["outcome"] == "resubmitted", out
+        # 新 decision 行带幂等标记
+        n = conn.execute(
+            "SELECT COUNT(*) FROM decision WHERE run_date=? AND action='buy'"
+            " AND id!=? AND input_snapshot LIKE ?",
+            (date.today().isoformat(), rid,
+             '%%"afternoon_resubmit_of": %d%%' % rid)).fetchone()[0]
+        assert n == 1, "必须落一条带 afternoon_resubmit_of 标记的新决策"
+        # 挂人工闸门（manual_gate=true → pending 文件）
+        assert len(runner.list_pending(orders)) == 1
+        # risk_event 留痕
+        ev = conn.execute(
+            "SELECT detail FROM risk_event WHERE rule='afternoon_resubmit'"
+            " ORDER BY id DESC LIMIT 1").fetchone()
+        assert ev and "重提成功" in ev[0], ev
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+        conn.close()
+
+
+def test_resubmit_skips_conf_below_and_drift():
+    """裁决#2 用例②③：conf 已降路径不重提（留痕）；漂移超 ±2% 价格保护线
+    路径不硬提（留痕）。"""
+    import pipeline.afternoon as afternoon_mod
+    conn = fresh_conn()
+    seed_market(conn)
+    rid_low = _seed_session_rejected_buy(conn, code="000001", conf=0.40,
+                                         orig_price=10.9)
+    rid_drift = _seed_session_rejected_buy(conn, code="000001", conf=0.72,
+                                           orig_price=10.0)
+    now = datetime.combine(_BASE, time(13, 31, 0))
+    live = {"000001": {"price": 11.0, "prev_close": 10.9, "name": "平安银行",
+                       "source": "mock"}}  # 对 10.0 原价漂移 +10% > 2%
+    ctx = runner.build_context(conn, now)
+    try:
+        out = afternoon_mod.resubmit_session_rejected_buys(conn, live, ctx, now)
+        by_id = {d["orig_id"]: d for d in out}
+        assert by_id[rid_low]["outcome"] == "skip_conf_below", by_id
+        assert by_id[rid_drift]["outcome"] == "skip_drift_over_guard", by_id
+        # 两条弃提都有 risk_event 留痕
+        n_ev = conn.execute(
+            "SELECT COUNT(*) FROM risk_event WHERE rule='afternoon_resubmit'"
+            " AND (detail LIKE '%%重提弃%%')").fetchone()[0]
+        assert n_ev >= 2, n_ev
+        # 无新决策落库
+        n_new = conn.execute(
+            "SELECT COUNT(*) FROM decision WHERE input_snapshot"
+            " LIKE '%%afternoon_resubmit_of%%'").fetchone()[0]
+        assert n_new == 0
+    finally:
+        conn.close()
+
+
+def test_resubmit_idempotent_and_non_session_reject():
+    """裁决#2 用例④⑤：重复执行幂等（第二遍 skip_already_resubmitted）；
+    非规则4 拒因的 buy 不复活（skip_not_session_rejected）。"""
+    import pipeline.afternoon as afternoon_mod
+    conn = fresh_conn()
+    seed_market(conn)
+    orders = Path(_TMP_ROOT / "resub_idem_orders")
+    orders.mkdir(exist_ok=True)
+    rid = _seed_session_rejected_buy(conn)
+    # 另一条 rejected buy 但无规则4 拒单记录（如黑名单拒）
+    conn.execute(
+        "INSERT INTO decision (run_date, trade_date, code, action, target_weight,"
+        " confidence, reasons, risk_notes, status, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (date.today().isoformat(), date.today().isoformat(), "000001", "buy",
+         0.05, 0.8, '["r"]', '[]', "rejected",
+         date.today().isoformat() + "T09:40:00"))
+    conn.commit()
+    now = datetime.combine(_BASE, time(13, 31, 0))
+    live = {"000001": {"price": 11.0, "prev_close": 10.9, "name": "平安银行",
+                       "source": "mock"}}
+    ctx = runner.build_context(conn, now)
+    try:
+        out1 = afternoon_mod.resubmit_session_rejected_buys(
+            conn, live, ctx, now, orders_dir=orders)
+        by_id1 = {d["orig_id"]: d for d in out1}
+        assert by_id1[rid]["outcome"] == "resubmitted", by_id1
+        # 非规则4 拒因的那条（id=rid+1）不复活
+        other = [d for d in out1 if d["orig_id"] != rid]
+        assert other and other[0]["outcome"] == "skip_not_session_rejected", other
+        # 第二遍：幂等跳过
+        out2 = afternoon_mod.resubmit_session_rejected_buys(
+            conn, live, ctx, now, orders_dir=orders)
+        by_id2 = {d["orig_id"]: d for d in out2}
+        assert by_id2[rid]["outcome"] == "skip_already_resubmitted", by_id2
+        # 仍只有一张 pending 单
+        assert len(runner.list_pending(orders)) == 1
+    finally:
+        shutil.rmtree(orders, ignore_errors=True)
+        conn.close()
 
 
 # ---------------- 批次3a（多agent审查 2026-09-21 P2/P1 清债）：执行域修复 ----------------
