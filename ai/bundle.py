@@ -991,7 +991,9 @@ def bundle_to_markdown(bundle: dict, news_content_len: int = 120,
         if by:
             delta = by.get("delta_20d_bp")
             delta_str = f"{delta:+.2f}bp" if isinstance(delta, (int, float)) else "n/a"
-            lines.append(f"- **10Y 国债收益率**：{by.get('yield', 'n/a'):.3f}% "
+            _yv = by.get("yield")
+            _y_str = f"{_yv:.3f}%" if isinstance(_yv, (int, float)) else "n/a"
+            lines.append(f"- **10Y 国债收益率**：{_y_str} "
                          f"（20 日变动 {delta_str}，{by.get('trade_date', '?')}，"
                          f"source={by.get('source', '?')}）")
             if isinstance(delta, (int, float)) and delta < -15:
