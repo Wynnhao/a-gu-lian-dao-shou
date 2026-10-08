@@ -1230,8 +1230,12 @@ def test_exec_breaker_propose_db_short_circuit_and_next_day_release():
         st = conn.execute("SELECT status FROM decision WHERE id=1").fetchone()[0]
         assert st == "proposed"                       # 未被处理，原状保留
         # 次一交易日自动解除：同一决策 propose 恢复正常走风控（闸门开启 → pending）。
-        # 推进 3 天（周末安全落到下周一~四），并为全池补当日 bar 防 health 降级。
-        later_dt = datetime.combine(_BASE + timedelta(days=3), time(10, 0))
+        # 推进 3 天（落周末则顺延到周一——_BASE 周四运行时 +3=周六），并为全池
+        # 补当日 bar 防 health 降级。
+        d_later = _BASE + timedelta(days=3)
+        while d_later.weekday() >= 5:
+            d_later += timedelta(days=1)
+        later_dt = datetime.combine(d_later, time(10, 0))
         later = later_dt.strftime("%Y-%m-%d")
         for code, (latest, _prev) in DEFAULT_PRICES.items():
             conn.execute(

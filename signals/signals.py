@@ -563,21 +563,32 @@ FC_SIGMA_HIGH = 0.02    # σ60 > 0.02 → 信号不稳
 FC_BUCKET_WINDOW = 12   # 近 12 个月 bucket
 FC_MIN_BUCKETS = 4      # 至少 4 个 bucket 才算可信
 # Fix-3 滞回状态机：退出需 μ 连续多次恢复（月度 bucket 更新慢，用调用计数而非自然日）
-FC_MU_RECOVER = 0.015   # μ60 ≥ 0.015 视为恢复（与触发阈值 0.005 之间构成滞回带）
+# 出手率打磨批（2026-10-08 裁决#1）：0.015→0.008——μ=0.012 生产实测落入旧滞回带
+# [0.005,0.015) 卡死 active 三周（出手窗口全被堵），收窄为 [0.005,0.008)
+FC_MU_RECOVER = 0.008   # μ60 ≥ 0.008 视为恢复（与触发阈值 0.005 之间构成滞回带）
 FC_COOLING_EXIT_CALLS = 5   # cooling 计满 5 次 compute_all → off
+# 出手率打磨批（裁决#1）超时兜底：active 持续 ≥10 个交易日 → 强制转 cooling。
+# 滞回带只能防"μ 未恢复却退不出"的一侧；μ 长期落在滞回带内时 active 无出口，
+# 10 交易日超时兜底保证熔断必有尽头（弱信号不受影响：cooling 中再 hit 自然回 active）。
+FC_ACTIVE_TIMEOUT_DAYS = 10
 # Fix-3 权重降级：拥挤期打分权重（按 score_reversal_lowvol_xs 现有逻辑重归一化）
 FC_DEGRADED_WEIGHTS = (0.20, 0.20, 0.15)
 
 
 def _crowding_next_state(prev: dict, mu: Optional[float], sigma: Optional[float],
-                         today: str) -> dict:
+                         today: str,
+                         trading_days_elapsed: Optional[int] = None) -> dict:
     """Fix-3 滞回状态机（纯函数）。
 
     - off → active：μ<FC_MU_LOW 且 σ>FC_SIGMA_HIGH（写 active_since）；
     - active → cooling：μ≥FC_MU_RECOVER（cooling_count=1）；
+    - active → cooling：trading_days_elapsed ≥ FC_ACTIVE_TIMEOUT_DAYS（超时兜底，
+      出手率打磨批裁决#1；返回带 timeout_force=True，调用方负责事件 note）；
     - cooling → active：μ 再跌破 FC_MU_LOW（cooling_count 清零，保留 active_since）；
     - cooling 计满 FC_COOLING_EXIT_CALLS 次 → off；
     - 滞回带 [FC_MU_LOW, FC_MU_RECOVER) 内：active 不翻转，cooling 计数不动。
+    trading_days_elapsed：active_since 距今的交易日数（含两端），由调用方按
+    trade_calendar 计数传入（日历不可用传 None → 不启用超时兜底，保守不误转）。
     返回 {"state": ..., "active_since": ..., "cooling_count": ...}。
     """
     state = prev.get("state") or "off"
@@ -590,6 +601,10 @@ def _crowding_next_state(prev: dict, mu: Optional[float], sigma: Optional[float]
         if recover:
             return {"state": "cooling", "active_since": active_since,
                     "cooling_count": 1}
+        if (trading_days_elapsed is not None
+                and trading_days_elapsed >= FC_ACTIVE_TIMEOUT_DAYS):
+            return {"state": "cooling", "active_since": active_since,
+                    "cooling_count": 1, "timeout_force": True}
         return {"state": "active",
                 "active_since": active_since or today, "cooling_count": 0}
     if state == "cooling":
@@ -635,6 +650,25 @@ def _record_crowding_state_event(conn: sqlite3.Connection, from_state: str,
                     repr(e))
 
 
+def _trading_days_between(conn: Optional[sqlite3.Connection], start: str,
+                          end: str) -> Optional[int]:
+    """[start, end] 含两端的 trade_calendar 行数（交易日数）。
+
+    日历对区间零覆盖（表空/超覆盖期）→ None：调用方不启用超时兜底。
+    部分覆盖只会低估天数 → 兜底保守延后，不会误触发。
+    """
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM trade_calendar WHERE date>=? AND date<=?",
+            (start, end)).fetchone()
+    except sqlite3.Error:
+        return None
+    n = int(row[0]) if row and row[0] is not None else 0
+    return n if n > 0 else None
+
+
 def _write_factor_crowding(conn: sqlite3.Connection, event_note: str = "") -> dict:
     """从 signal 表 + daily_bar 算 score 近 12 个月滚动 IC，维护 factor_crowding.json。
 
@@ -668,11 +702,12 @@ def _write_factor_crowding(conn: sqlite3.Connection, event_note: str = "") -> di
            "reason": ""}
 
     def _finish(state_change: bool = False, from_state: str = None,
-                mu: Optional[float] = None) -> None:
+                mu: Optional[float] = None, note: str = "") -> None:
         out["crowded"] = out["state"] in ("active", "cooling")
         if state_change and from_state is not None and conn is not None:
+            merged = " ".join(x for x in (event_note, note) if x)
             _record_crowding_state_event(conn, from_state, out["state"], mu,
-                                         note=event_note)
+                                         note=merged)
         _persist_factor_crowding(out)
 
     try:
@@ -728,13 +763,20 @@ def _write_factor_crowding(conn: sqlite3.Connection, event_note: str = "") -> di
         out["mu60"] = round(mu, 4)
         out["sigma60"] = round(sigma, 4)
         out["n_buckets"] = len(recent)
-        nxt = _crowding_next_state(prev, mu, sigma, today)
+        td_elapsed = None
+        if prev_state == "active" and prev.get("active_since"):
+            td_elapsed = _trading_days_between(conn, str(prev["active_since"]),
+                                               today)
+        nxt = _crowding_next_state(prev, mu, sigma, today,
+                                   trading_days_elapsed=td_elapsed)
         from_state = out["state"]
         out.update(nxt)
+        timeout_note = ("timeout-force（active 已 ≥%d 个交易日）"
+                        % FC_ACTIVE_TIMEOUT_DAYS) if nxt.get("timeout_force") else ""
         out["reason"] = (f"state={out['state']}：μ={mu:.4f}, σ={sigma:.4f}"
                          + ("（拥挤降权启用）" if out["state"] == "active" else ""))
         _finish(state_change=(from_state != out["state"]),
-                from_state=from_state, mu=out["mu60"])
+                from_state=from_state, mu=out["mu60"], note=timeout_note)
         return out
     except Exception as e:  # noqa: BLE001
         out["reason"] = f"计算失败：{type(e).__name__}: {e}（保留旧 state）"

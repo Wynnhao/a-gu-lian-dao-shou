@@ -165,6 +165,62 @@ def test_wb1_crowding_state_event_note():
             os.environ["AGSICKLE_SIGNALS_PROFILE"] = old_prof
 
 
+@test
+def test_crowding_timeout_force_path():
+    """超时兜底集成（出手率打磨批裁决#1）：active_since 距今 ≥10 个交易日且
+    μ 未恢复 → 强制转 cooling，risk_event note 带 timeout-force。"""
+    old = _sandbox_signal_eval()
+    old_prof = os.environ.get("AGSICKLE_SIGNALS_PROFILE")
+    os.environ["AGSICKLE_SIGNALS_PROFILE"] = "reversal_lowvol"
+    conn = _mem()
+    try:
+        # trade_calendar：2026-09-01 起含两端的 11 个交易日（跳周末）
+        days = ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04",
+                "2026-09-07", "2026-09-08", "2026-09-09", "2026-09-10",
+                "2026-09-11", "2026-09-14", "2026-09-15"]
+        conn.executemany("INSERT INTO trade_calendar (date) VALUES (?)",
+                         [(d,) for d in days])
+        sig._persist_factor_crowding({"state": "active",
+                                      "active_since": "2026-09-01",
+                                      "cooling_count": 0})
+        _seed_ic_env(conn,
+                     momentum_scores=[0.1 * i for i in range(6)],
+                     reversal_scores=[0.1 * (5 - i) for i in range(6)])
+        out = sig._write_factor_crowding(conn)
+        # reversal μ≈−1（未恢复）+ 11 个交易日 ≥ 阈值 10 → 超时强制 cooling
+        assert out["state"] == "cooling", out
+        row = conn.execute(
+            "SELECT detail FROM risk_event WHERE rule='factor_crowding_state'"
+            " ORDER BY id DESC LIMIT 1").fetchone()
+        assert row and "timeout-force" in row[0], row
+    finally:
+        conn.close()
+        _restore_signal_eval(old)
+        if old_prof is None:
+            os.environ.pop("AGSICKLE_SIGNALS_PROFILE", None)
+        else:
+            os.environ["AGSICKLE_SIGNALS_PROFILE"] = old_prof
+
+
+@test
+def test_trading_days_between_counts_calendar_rows():
+    """_trading_days_between：含两端计数；区间零覆盖/表空 → None（不启用兜底）。"""
+    conn = _mem()
+    try:
+        days = ["2026-09-01", "2026-09-02", "2026-09-03"]
+        conn.executemany("INSERT INTO trade_calendar (date) VALUES (?)",
+                         [(d,) for d in days])
+        assert sig._trading_days_between(conn, "2026-09-01", "2026-09-03") == 3
+        assert sig._trading_days_between(conn, "2026-09-01", "2026-09-01") == 1
+        assert sig._trading_days_between(conn, "2026-08-31", "2026-09-02") == 2
+        # 区间零覆盖 → None
+        assert sig._trading_days_between(conn, "2020-01-01", "2020-01-02") is None
+        # conn=None → None
+        assert sig._trading_days_between(None, "2026-09-01", "2026-09-03") is None
+    finally:
+        conn.close()
+
+
 # ============================================================
 # W-B4①：above_ma60 同口径（P2-1）
 # ============================================================

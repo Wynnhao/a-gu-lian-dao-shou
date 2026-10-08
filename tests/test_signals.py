@@ -654,16 +654,22 @@ def test_earnings_scan_text_no_pos_substring_collision():
 # ============================================================
 
 def test_crowding_hysteresis_state_machine():
-    """滞回状态机：触发 / 滞回带不翻转 / 清零回迁 / 计满退出。"""
+    """滞回状态机：触发 / 滞回带不翻转 / 清零回迁 / 计满退出。
+
+    出手率打磨批（2026-10-08 裁决#1）：FC_MU_RECOVER 0.015→0.008，
+    滞回带收窄为 [0.005, 0.008)——生产 μ=0.012 曾卡死 active 三周。
+    """
     from signals import signals as sig
+    assert sig.FC_MU_RECOVER == 0.008  # 常量锁定（裁决#1）
+    assert sig.FC_ACTIVE_TIMEOUT_DAYS == 10  # 常量锁定（裁决#1 超时兜底）
     # off + hit（μ<0.005 且 σ>0.02）→ active
     s = sig._crowding_next_state({"state": "off"}, 0.001, 0.05, "2026-09-17")
     assert s["state"] == "active" and s["active_since"] == "2026-09-17"
     assert s["cooling_count"] == 0
-    # active + μ 落滞回带 [0.005, 0.015) → 保持 active 不翻转
-    s = sig._crowding_next_state(s, 0.010, 0.03, "d2")
+    # active + μ 落滞回带 [0.005, 0.008) → 保持 active 不翻转
+    s = sig._crowding_next_state(s, 0.006, 0.03, "d2")
     assert s["state"] == "active"
-    # active + μ≥0.015 → cooling（count=1）
+    # active + μ≥0.008 → cooling（count=1）
     s = sig._crowding_next_state(s, 0.020, 0.01, "d3")
     assert s["state"] == "cooling" and s["cooling_count"] == 1
     # cooling + μ 再跌破 0.005 → 清零回 active（保留原 active_since）
@@ -675,8 +681,50 @@ def test_crowding_hysteresis_state_machine():
                                   "active_since": "d1"}, 0.020, 0.01, "d9")
     assert s["state"] == "off" and s["cooling_count"] == 0
     # off + μ 落滞回带 → 仍 off（滞回带不触发）
-    s = sig._crowding_next_state(s, 0.010, 0.03, "d10")
+    s = sig._crowding_next_state(s, 0.006, 0.03, "d10")
     assert s["state"] == "off"
+
+
+def test_crowding_dead_zone_mu012_flips_to_cooling():
+    """原死区用例反转（裁决#1）：μ=0.012（生产实测卡死值）在新恢复线 0.008 下
+    active → cooling 立即翻转，不再滞留。"""
+    from signals import signals as sig
+    s = sig._crowding_next_state(
+        {"state": "active", "active_since": "2026-09-17", "cooling_count": 0},
+        0.012, 0.1805, "2026-10-08")
+    assert s["state"] == "cooling" and s["cooling_count"] == 1
+    assert s["active_since"] == "2026-09-17"
+
+
+def test_crowding_timeout_force_to_cooling():
+    """超时兜底（裁决#1）：active 距今 ≥10 个交易日 → 强制 cooling
+    （timeout_force=True），<10 不翻转；trading_days_elapsed=None（日历不可用）
+    保守不翻转。"""
+    from signals import signals as sig
+    active = {"state": "active", "active_since": "2026-09-17",
+              "cooling_count": 0}
+    # 9 个交易日：滞回带内且未超时 → 仍 active
+    s = sig._crowding_next_state(active, 0.006, 0.03, "d9",
+                                 trading_days_elapsed=9)
+    assert s["state"] == "active"
+    # 10 个交易日（=阈值）→ 强制 cooling
+    s = sig._crowding_next_state(active, 0.006, 0.03, "d10",
+                                 trading_days_elapsed=10)
+    assert s["state"] == "cooling" and s["cooling_count"] == 1
+    assert s["timeout_force"] is True and s["active_since"] == "2026-09-17"
+    # 11 个交易日 → 同样强制
+    s = sig._crowding_next_state(active, 0.006, 0.03, "d11",
+                                 trading_days_elapsed=11)
+    assert s["state"] == "cooling" and s.get("timeout_force") is True
+    # None（日历不可用）→ 不启用兜底
+    s = sig._crowding_next_state(active, 0.006, 0.03, "d30",
+                                 trading_days_elapsed=None)
+    assert s["state"] == "active"
+    # 超时兜底不影响弱信号回活：cooling 中再 hit 仍回 active（active_since 保留）
+    s2 = sig._crowding_next_state(
+        {"state": "cooling", "active_since": "d1", "cooling_count": 2},
+        0.002, 0.05, "d12", trading_days_elapsed=99)
+    assert s2["state"] == "active" and s2["active_since"] == "d1"
 
 
 def test_crowding_weight_downgrade_changes_scores():

@@ -7,7 +7,7 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from data.fetcher import DDL, init_db, get_conn
 from data import macro
@@ -30,10 +30,22 @@ def _mem_conn() -> sqlite3.Connection:
     return conn
 
 
+def _mock_end_day() -> date:
+    """mock 数据末端：工作日用今天、周末回退最近周五。
+
+    末端必须落在 W-B8 新鲜度闸门（今日-7 天）内——曾硬编码 2026-09-16，
+    随真实日历推移被闸门判陈旧（测试腐坏，2026-10-08 修复批改为锚定今天）。
+    """
+    d = date.today()
+    if d.weekday() >= 5:
+        d -= timedelta(days=d.weekday() - 4)
+    return d
+
+
 def _mock_bond_zh_us_rate(n=25):
     """构造 akshare bond_zh_us_rate 返回值（DataFrame 含 10年 列）。"""
     import pandas as pd
-    dates = pd.date_range(end=datetime(2026, 9, 16), periods=n, freq="B")
+    dates = pd.date_range(end=_mock_end_day(), periods=n, freq="B")
     rows = []
     base = 2.50
     for i, d in enumerate(dates):
@@ -46,7 +58,7 @@ def _mock_bond_zh_us_rate(n=25):
 def _mock_fund_etf_fund_info_em(etf_code, n=25):
     """构造 akshare fund_etf_fund_info_em 返回值。"""
     import pandas as pd
-    dates = pd.date_range(end=datetime(2026, 9, 16), periods=n, freq="B")
+    dates = pd.date_range(end=_mock_end_day(), periods=n, freq="B")
     rows = []
     base = 1_000_000.0 if etf_code == "510300" else 800_000.0
     for i, d in enumerate(dates):

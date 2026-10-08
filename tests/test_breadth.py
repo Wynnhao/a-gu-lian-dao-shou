@@ -206,7 +206,10 @@ def test_rolling_zscore_matches_manual_formula():
 
 @test
 def test_rolling_zscore_std_zero_or_insufficient_returns_none():
-    """恒定历史（std=0）→ None；样本 <60 → (None, None)。"""
+    """恒定历史（std=0）→ None；样本 <20 → (None, None)。
+
+    出手率打磨批（2026-10-08 批次0）：Z_MIN_SAMPLES 60→20（生产表冷启动
+    约 3 个月才出值，composite 恒 None 预警死亡）。"""
     conn = _mem_conn()
     try:
         for i in range(250):
@@ -216,10 +219,10 @@ def test_rolling_zscore_std_zero_or_insufficient_returns_none():
         conn.commit()
         z, actual = breadth_mod._rolling_zscore(conn, "limit_up_count", 50.0, "d0250")
         assert z is None and actual is None
-        # 样本不足：只有 30 行历史 → 31 < 60 → None
+        # 样本不足：只有 15 行历史 → 16 < 20 → None
         conn2 = _mem_conn()
         try:
-            for i in range(30):
+            for i in range(15):
                 conn2.execute(
                     "INSERT INTO breadth_daily (date, limit_down_count) VALUES (?,?)",
                     (f"d{i:04d}", 5 + i))
@@ -233,11 +236,11 @@ def test_rolling_zscore_std_zero_or_insufficient_returns_none():
 
 
 @test
-def test_composite_cold_start_under_60_is_none():
-    """冷启动 <60 样本：composite=None（极端避险档不被假数据误触）。"""
+def test_composite_cold_start_under_20_is_none():
+    """冷启动 <20 样本：composite=None（极端避险档不被假数据误触）。"""
     conn = _mem_conn()
     try:
-        for i in range(58):
+        for i in range(18):
             conn.execute(
                 "INSERT INTO breadth_daily VALUES"
                 " (?, 30, 0.7, 10, 1.5, 0, NULL, 'em')", (f"d{i:04d}",))
@@ -251,8 +254,40 @@ def test_composite_cold_start_under_60_is_none():
 
 
 @test
+def test_composite_20_samples_yields_value_and_extreme_alert_fires():
+    """20 样本即出值（批次0 修复验证）：composite 非 None + 极端偏离
+    composite < -2 → compute_breadth_factor 真实触发 override_cap=0.1。
+
+    构造：历史 limit_up_count 恒 50（其余因子缺）、当日涨停=2 → z_up≈-3
+    → composite≈-3 < -2 → 极端避险。读侧按落库行判定（模拟采集后状态）。"""
+    conn = _mem_conn()
+    try:
+        for i in range(19):
+            conn.execute(
+                "INSERT INTO breadth_daily VALUES"
+                " (?, 50, NULL, 1, NULL, 0, NULL, 'em')", (f"d{i:04d}",))
+        conn.commit()
+        cur = {"limit_up_count": 2, "limit_down_count": 1}
+        composite, z_window = breadth_mod._composite_from_z(conn, cur, "d0019")
+        assert composite is not None
+        assert z_window == 20  # 19 历史 + 当日
+        assert composite < -2.0  # 涨停骤减 → 极端负面
+        # 落库当日行（fetch_breadth_daily 同型），读侧从表读 composite
+        conn.execute(
+            "INSERT INTO breadth_daily VALUES"
+            " (?, 2, NULL, 1, NULL, 0, ?, 'em|z_window=20')", ("d0019", composite))
+        conn.commit()
+        from signals import breadth as sig_breadth
+        bf = sig_breadth.compute_breadth_factor(conn)
+        assert bf["composite"] == composite
+        assert bf["override_cap"] == 0.1, bf
+    finally:
+        conn.close()
+
+
+@test
 def test_composite_warmup_uses_actual_window_and_weights_renorm():
-    """60~249 样本冷启动：用实际窗口算 z；daily_bar 空 → nhl 缺列权重重归一化
+    """20~249 样本冷启动：用实际窗口算 z；daily_bar 空 → nhl 缺列权重重归一化
     （0.3+0.3+0.2)/0.8，composite 与手算一致；source 标注 z_window。"""
     import numpy as np
     conn = _mem_conn()

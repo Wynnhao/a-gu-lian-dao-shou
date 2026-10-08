@@ -287,7 +287,10 @@ def test_next_exec_date_calendar_end_falls_back_weekend():
 
 def test_postclose_scan_friday_run_date_is_monday():
     """P2③：周五盘后扫描 run_date=下周一（原为周六→周一 09:14 failsafe 按
-    run_date==today 查不到该单、跨日闸拒，连续跌停退出晚 3 天）。"""
+    run_date==today 查不到该单、跨日闸拒，连续跌停退出晚 3 天）。
+
+    本测试只测 run_date 日历导航（now 显式传参）；health gate 按真实系统日
+    判滞后与夹具绝对日期冲突（日期腐坏雷，2026-10-08 修复批短路之）。"""
     from execution import runner as _runner
     conn = _mem_conn()
     # 绝对日期夹具：2026-09-25 是周五；周四收 100 → 周五收 90（-10% 跌停）
@@ -306,7 +309,9 @@ def test_postclose_scan_friday_run_date_is_monday():
     conn.commit()
     orders_dir = Path(tempfile.mkdtemp(prefix="agsickle_lh_orders_"))
     orig_orders_dir = _runner.ORDERS_DIR
+    orig_health = _runner.health_check
     _runner.ORDERS_DIR = orders_dir
+    _runner.health_check = lambda c, today=None: []
     try:
         r = limit_halt.run_postclose_scan(conn, now=datetime(2026, 9, 25, 15, 30, 0))
         assert r["proposed"] == ["600519"], r
@@ -316,6 +321,7 @@ def test_postclose_scan_friday_run_date_is_monday():
             "周五盘后应急单 run_date 应顺延到下周一，而非周六"
     finally:
         _runner.ORDERS_DIR = orig_orders_dir
+        _runner.health_check = orig_health
         conn.close()
 
 
@@ -340,7 +346,9 @@ def test_postclose_scan_holiday_eve_uses_calendar():
     conn.commit()
     orders_dir = Path(tempfile.mkdtemp(prefix="agsickle_lh_orders_"))
     orig_orders_dir = _runner.ORDERS_DIR
+    orig_health = _runner.health_check
     _runner.ORDERS_DIR = orders_dir
+    _runner.health_check = lambda c, today=None: []  # 只测 run_date 导航（防日期腐坏）
     try:
         r = limit_halt.run_postclose_scan(conn, now=datetime(2026, 9, 24, 15, 30, 0))
         assert r["proposed"] == ["600519"], r
@@ -350,6 +358,7 @@ def test_postclose_scan_holiday_eve_uses_calendar():
             "中秋前最后交易日盘后应急单 run_date 应为节后首个交易日 09-28"
     finally:
         _runner.ORDERS_DIR = orig_orders_dir
+        _runner.health_check = orig_health
         conn.close()
 
 def test_stuck_increment_and_five_day_event():

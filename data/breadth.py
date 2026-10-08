@@ -273,7 +273,11 @@ _Z_WEIGHTS = (
     ("new_high_minus_new_low", 0.20, +1.0),
 )
 Z_WINDOW = 250          # z-score 历史窗口
-Z_MIN_SAMPLES = 60      # 样本 <60 → z 不可信返回 None
+# 出手率打磨批（2026-10-08 批次0）：60→20——生产表 2026-09-17 起采集，60 样本
+# 需约 3 个月冷启动，期间 composite 恒 None（P1-1 极端避险预警实质死亡）。
+# 20 样本（约 1 个月）即出值，冷启动期 source 带 z_window=N 标注；
+# std=0 → None 的保护不变，极端档误触风险由 W-B6 新鲜度闸门兜底。
+Z_MIN_SAMPLES = 20      # 样本 <20 → z 不可信返回 None
 
 
 def _rolling_zscore(conn: sqlite3.Connection, col: str, cur: float,
